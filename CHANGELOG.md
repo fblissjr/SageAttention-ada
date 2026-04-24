@@ -12,11 +12,22 @@ sage-attention-adjacent correctness problems, start here.
 
 ### CUDA kernels have no general attention-mask support
 
-Not a bug to patch — a feature that was never implemented. The Python
-wrappers `sageattn_qk_int8_pv_fp16_cuda` and `sageattn_qk_int8_pv_fp8_cuda`
-accept `attn_mask` via `**kwargs` but never pass it through to the C++
-layer. The C++ `MaskMode` enum only has `{kNone, kCausal}`. Masks are
-silently dropped on all CUDA code paths.
+Not a bug to patch — a feature that was never implemented, and
+inherited from the `thu-ml/SageAttention` origin by every downstream
+fork. The Python wrappers `sageattn_qk_int8_pv_fp16_cuda` and
+`sageattn_qk_int8_pv_fp8_cuda` accept `attn_mask` via `**kwargs` but
+never pass it through to the C++ layer. The C++ `MaskMode` enum only
+has `{kNone, kCausal}`. Masks are silently dropped on all CUDA code
+paths.
+
+The same pattern exists in `sageattention3_blackwell/sageattn3/api.py`:
+`sageattn3_blackwell(q, k, v, attn_mask=None, ...)` declares the
+parameter but never references it; the Blackwell kernel layer
+(`csrc/blackwell/`) only exposes `is_causal` + sliding-window-causal
+via `window_size_left/right`. So the mask gap is present across sage
+2.x AND sage 3 — the Triton kernel
+(`sageattn_qk_int8_pv_fp16_triton`) remains the only numerically
+correct mask path in the entire lineage.
 
 Observable effect on LTX-2.3 shapes (bf16, heads=32, head_dim=64,
 seq_q=31776, varying seq_kv with ~30-position text-padding tail):
@@ -143,11 +154,18 @@ then, this is closed.
 ### Changed
 
 - `setup.py` -- `_qattn_sm80` is now also built when compute
-  capability 8.9 (Ada) is detected, not only 8.0/8.6/8.7. The SM80
-  kernel is forward-compatible to Ada via CUDA backward-compat, so
-  Ada-only boxes can now run `sageattn_qk_int8_pv_fp16_cuda` (the
-  fp16 fallback path) without needing to force
-  `TORCH_CUDA_ARCH_LIST=8.0;...` from the outside.
+  capability 8.9 (Ada) is detected. Framed as a regression fix from
+  `woct0rdho/SageAttention`: thu-ml's setup.py gates the SM80
+  extension on `HAS_SM80 or HAS_SM86 or HAS_SM89 or HAS_SM90 or
+  HAS_SM100 or HAS_SM120 or HAS_SM121` (Ampere + Ada + Hopper +
+  Blackwell), but woct0rdho's refactor collapsed that to a tuple
+  gate `("8.0", "8.6", "8.7")` — which silently drops Ada, Hopper,
+  AND Blackwell. Ada-only source builds on woct0rdho's fork lose
+  `sageattn_qk_int8_pv_fp16_cuda` (the fp16 fallback path); Hopper
+  and Blackwell source builds lose it too. We only added `"8.9"`
+  because that's the arch we test and care about here — if you run
+  this fork on Hopper or Blackwell and want the fp16 fallback built
+  from source, widen the tuple to match thu-ml's coverage.
 - `README.md` -- reduced to attribution only (immediate fork:
   `woct0rdho/SageAttention`; original: `thu-ml/SageAttention`) plus a
   short build pointer. Windows-specific installation prose and wheel

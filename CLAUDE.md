@@ -136,15 +136,29 @@ the squashed history is the canonical state. `origin/main` still
 carries the pre-squash 196-commit upstream history; the next push
 will need `git push --force-with-lease origin main`.
 
-## The consumer on the other side
+## The consumers on the other side
 
-A downstream ComfyUI custom-node patches the model's attention with a
-sage kernel. It defaults to `auto_mask_aware`: masked calls go to
-Triton (route around the CUDA mask bug), unmasked go to the
-user-chosen kernel (default fp8++).
+Two consumer paths matter:
 
-That node is where routing policy lives. Sage-fork stays primitive --
-kernels only, no policy.
+1. **KJNodes (`kijai/ComfyUI-KJNodes`)** -- the general path most
+   ComfyUI users hit. `PathchSageAttentionKJ` is a dropdown of sage
+   modes. On `auto` it calls sage's top-level `sageattn()` dispatcher,
+   which routes masked calls to Triton internally -- so it dodges the
+   CUDA mask-path gap transparently. Explicitly overriding to
+   `_cuda` / `sageattn3*` modes bypasses the dispatcher and exposes
+   the bug. The second node, `LTX2MemoryEfficientSageAttentionPatch`,
+   only patches LTX's `attn1` (self-attn), which doesn't carry a mask
+   in LTX -- so scope alone makes it safe.
+
+2. **Our own downstream ComfyUI custom-node** -- patches the model's
+   attention with explicit routing. Defaults to `auto_mask_aware`:
+   masked calls go to Triton (route around the CUDA mask bug),
+   unmasked go to the user-chosen kernel (default fp8++). Different
+   tradeoff from KJ: lets callers pick a fast non-Triton kernel for
+   the unmasked half while staying correct on masked calls.
+
+Routing policy lives in the consumer nodes. Sage-fork stays
+primitive -- kernels only, no policy.
 
 ## If we ever need to fix a sage bug ourselves
 
