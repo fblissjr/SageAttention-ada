@@ -55,6 +55,12 @@ cd /path/to/sage-fork
 
 Build is 60–90s on an 8-core box with MAX_JOBS=8. Longer if you don't cap.
 
+Confirm the editable install is live (path should point at our source tree):
+
+```bash
+${VIRTUAL_ENV}/bin/python -c "import sageattention, os; print(os.path.dirname(sageattention.__file__))"
+```
+
 Post-build, run `${VIRTUAL_ENV}/bin/python tests/test_sageattn_ltx_shapes.py`
 once before the first production LTX gen. Side effect: populates
 Triton's on-disk autotune cache for every LTX shape the test
@@ -85,9 +91,12 @@ using `SDPBackend.EFFICIENT_ATTENTION` as the reference (MATH backend
 OOMs at LTX self-attn scale -- ~120 GiB for the full matrix).
 Soft-warns when mean_rtol > 0.10. Measures five sage kernels
 (fp16_cuda, fp16_triton, fp8_cuda, fp8_cuda++, auto) and three torch
-SDPA backends (FLASH, EFFICIENT, CUDNN) in the same run -- the torch
-rows are the regression guard for "did a torch upgrade close the sage
-perf gap?" questions. First call with a new shape tuple pays one-time
+SDPA backends (FLASH, EFFICIENT, CUDNN) in the same run, plus an
+`fp8++vs.triton` cross-kernel rtol row on unmasked shapes (sanity
+check that AudioLoopHelper's mix-routed fp8++ + triton in one forward
+pass doesn't introduce a discontinuity beyond each kernel's own noise
+floor; expected ~0.10, warns >0.15). Torch rows are the regression
+guard for "did a torch upgrade close the sage perf gap?" questions. First call with a new shape tuple pays one-time
 triton autotune warmup (~100ms per tuple); triton caches to disk so
 subsequent runs are fast. Expect the first run after `./build.sh` to
 be ~0.5-1s slower than subsequent ones.
@@ -121,6 +130,12 @@ Our additions and modifications (tracked in CHANGELOG.md):
 - `setup.py:152` -- one-line tuple change so `_qattn_sm80` builds on
   sm89 boxes (was gated on 8.0/8.6/8.7 only; Ada is forward-compat to
   SM80).
+- `sageattention/core.py::sageattn_warmup(shapes, kernels=...)` --
+  public API that fires one-shot dispatches per (kernel, shape) to
+  prime Triton's JIT + autotune cache. Cuts ~1s first-call latency on
+  sm89 to ~2ms post-warm. Defaults to the Triton kernel only (CUDA
+  kernels are build-time compiled, no warmup benefit). Consumer nodes
+  call this at model-patch time.
 - `sageattention/triton/attn_qk_int8_per_block.py` -- `@triton.autotune`
   over `num_warps` and `num_stages`. Zero immediate perf delta on
   sm89 + LTX shapes (hardcoded config was already optimal) but
@@ -183,6 +198,23 @@ kernel defect blocks the LTX workflow:
 We deliberately have no CI. Verify by running the LTX-shape test and
 the full downstream-consumer pytest suite on this box before trusting
 a change.
+
+## Linter / pyright noise to ignore
+
+Every edit to `sageattention/` or `tests/` triggers these false
+positives:
+
+- `Import "torch" could not be resolved` -- pyright's default scan
+  env doesn't have torch; our ComfyUI venv does. Runtime is fine.
+- `"q_int8" / "k_int8" / "lse_correction" / "sm80_compile" is
+  possibly unbound` in `core.py` around lines 325, 594, 598, 601 --
+  pre-existing upstream control-flow pyright can't prove. Not
+  introduced by any edit here. Ignore.
+- `"sageattn_*" is not accessed` in `__init__.py` -- public
+  re-exports; pyright doesn't model star-import consumers.
+
+If pyright flags something inside code we actually added and it
+looks substantive, investigate. Otherwise skip.
 
 ## fp16 matmul accumulation flag
 
