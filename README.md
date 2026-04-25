@@ -30,6 +30,7 @@ Two things:
 - `tests/spike_torch_compile.py` — re-runnable 30-min spike measuring whether `torch.compile` around sage produces bounded mean-relative-error AND a speedup. Current verdict on torch 2.11: keep the consumer-side `torch.compiler.disable()`. Re-run after torch upgrades.
 - `tests/repros/` — minimal standalone repros for defects in this fork's kernels we haven't fixed yet.
 - `sageattention/core.py::sageattn_warmup(shapes, kernels=...)` — public API to prime Triton's JIT autotune cache. Cuts ~1s first-call latency on sm89 to ~2ms post-warm.
+- `sageattention.get_last_dispatched_kernel() -> str | None` — public helper exposing which kernel the most recent `sageattn*` call on this thread dispatched to, as a stable short string (`fp16_triton`, `fp8_cuda++`, etc.; full set in `KNOWN_KERNEL_NAMES`). Lets a consumer's per-call tracer record sage's actual routing decision instead of mirroring the dispatch table. Read immediately after the call (thread-local, not contextvar-aware).
 - `sageattention/triton/attn_qk_int8_per_block.py` — added `@triton.autotune` over `(num_warps, num_stages)`. Measured no-op on sm89 today (the hardcoded config was already optimal); structural value is forward-compat to future kernel / triton / shape shifts.
 - `build.sh` — editable-install wrapper that targets the active `VIRTUAL_ENV`, pins `uv pip install --python ${VIRTUAL_ENV}/bin/python`, caps `MAX_JOBS` at 8.
 
