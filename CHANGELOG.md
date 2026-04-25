@@ -246,16 +246,7 @@ raw JSONL is sufficient.
 - `internal/bench_env_2026-04-25.txt` -- env snapshot
   (torch 2.11.0+cu130, triton 3.6.0, sage editable, RTX 4090 / sm89, CUDA 13.0)
   locking the version surface so later phase deltas are real perf changes.
-
-### Changed
-
-- Self-attn-large baseline drift: 19.67 ms (recorded 2026-04-23 on torch+cu128)
-  to 19.95 ms (2026-04-25 on torch+cu130). ~1.4% drift, within run-to-run
-  noise. Going forward the regression yardstick is 19.95 ms. Other shapes
-  drifted by similar magnitudes; cross-attn rtol fingerprints
-  (CUDA-mask-bug signature) are unchanged from prior characterization.
-
-
+- `build.sh` -- local build wrapper that targets whichever venv is
   active via `VIRTUAL_ENV`, pins `uv pip install --python
   ${VIRTUAL_ENV}/bin/python`, compiles for Ampere + Ada
   (`TORCH_CUDA_ARCH_LIST=8.0;8.6;8.9`) by default, and verifies the
@@ -309,6 +300,11 @@ raw JSONL is sufficient.
 
 ### Changed
 
+- Self-attn-large baseline drift: 19.67 ms (recorded 2026-04-23 on torch+cu128)
+  to 19.95 ms (2026-04-25 on torch+cu130). ~1.4% drift, within run-to-run
+  noise. Going forward the regression yardstick is 19.95 ms. Other shapes
+  drifted by similar magnitudes; cross-attn rtol fingerprints
+  (CUDA-mask-bug signature) are unchanged from prior characterization.
 - `setup.py` -- `_qattn_sm80` is now also built when compute
   capability 8.9 (Ada) is detected. Framed as a regression fix from
   `woct0rdho/SageAttention`: thu-ml's setup.py gates the SM80
