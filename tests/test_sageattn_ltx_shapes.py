@@ -2,8 +2,8 @@
 """Measure sage accuracy + speed on LTX-2.3's actual attention shapes.
 
 Runs each installed sage kernel against torch SDPA (EFFICIENT_ATTENTION
-backend) at the shapes that appear in the LTX-2.3 audio-loop video-gen
-workflow (head_dim=64, heads=32, typical video/text sequence lengths).
+backend) at the shapes that appear in LTX-2.3 video-gen workflows
+(head_dim=64, heads=32, typical video/text sequence lengths).
 
 Why EFFICIENT_ATTENTION and not MATH: the MATH backend materializes the
 full Sq x Skv attention matrix, which is ~120 GiB at the LTX self-attn
@@ -18,7 +18,7 @@ The point is to answer:
   * How much accuracy does fp8++ cost vs SDPA on LTX's real shapes?
   * Is cross-attention (with mask) where the loss is concentrated?
   * How much speed does fp16_cuda cost relative to fp8++?
-  * Do fp16_triton and fp8++ agree with each other? (The AudioLoopHelper
+  * Do fp16_triton and fp8++ agree with each other? (A mask-aware
     consumer mixes them in one forward pass -- masked -> triton,
     unmasked -> fp8++. If they diverge more than their individual noise
     floors permit, that's a finding worth flagging.)
@@ -94,10 +94,10 @@ SHAPES = [
 ]
 
 
-# The two modes whose outputs AudioLoopHelper mixes in one forward pass
-# (triton for masked, fp8++ for unmasked). Used downstream in the cross-kernel
-# consistency check -- any typo in these labels would silently disable that
-# check, so they're pulled out as constants.
+# The two modes a mask-aware consumer typically mixes in one forward pass
+# (triton for masked, fp8++ for unmasked). Used in the cross-kernel
+# consistency check -- any typo in these labels would silently disable
+# that check, so they're pulled out as constants.
 TRITON_LABEL = "fp16_triton"
 FP8PP_LABEL = "fp8_cuda++"
 
@@ -345,11 +345,11 @@ def main():
             if label in (TRITON_LABEL, FP8PP_LABEL):
                 cached_outs[label] = out
 
-        # Cross-kernel consistency: AudioLoopHelper routes masked calls to
-        # triton and unmasked to fp8++ in one forward pass; do those two
-        # kernels agree beyond the noise floor their individual errors
-        # can explain? Unmasked shapes only -- on masked shapes the CUDA
-        # path is known-broken, so divergence is the bug itself.
+        # Cross-kernel consistency: a mask-aware consumer routes masked
+        # calls to triton and unmasked to fp8++ in one forward pass; do
+        # those two kernels agree beyond the noise floor their individual
+        # errors can explain? Unmasked shapes only -- on masked shapes
+        # the CUDA path is known-broken, so divergence is the bug itself.
         #
         # Threshold 0.15: fp16_triton ~0.04 vs SDPA and fp8++ ~0.09 vs SDPA;
         # quadrature combination ~= sqrt(0.04^2 + 0.09^2) ~= 0.098 is the

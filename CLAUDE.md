@@ -56,10 +56,10 @@ Relevant pieces for us:
 
 ## Install / build
 
-Always active-venv. Never bare `python`. If `VIRTUAL_ENV` is unset in the
-shell, the live ComfyUI venv is at `~/ComfyUI/.venv` (uv-managed); use
-`${venv}/bin/python` directly. `python -m pip freeze` fails on uv venvs
-(no pip module) -- use `VIRTUAL_ENV=<venv> <venv>/bin/uv pip freeze`
+Always active-venv. Never bare `python`. Use `${VIRTUAL_ENV}/bin/python`
+or `${VENV}/bin/python` directly when `VIRTUAL_ENV` isn't exported in
+the shell. `python -m pip freeze` fails on uv-managed venvs (no pip
+module installed) -- use `VIRTUAL_ENV=<venv> <venv>/bin/uv pip freeze`
 for env snapshots.
 
 ```bash

@@ -6,21 +6,20 @@
 #   - archive both logs under internal/log/
 #
 # Usage:
-#   ./tests/run_all.sh              # uses ${VIRTUAL_ENV} if set, else autodetects
-#   VENV=/path/to/.venv ./tests/run_all.sh   # explicit override
+#   source /path/to/venv/bin/activate && ./tests/run_all.sh
+#   VENV=/path/to/.venv ./tests/run_all.sh    # explicit override
 
-set -e
+set -euo pipefail
 
-# Resolve the venv. Prefer explicit $VENV, then $VIRTUAL_ENV, then guess
-# ~/ComfyUI/.venv (the typical local location for the editable install).
+# Resolve the venv. Prefer explicit $VENV, fall back to $VIRTUAL_ENV.
+# No further fallback: pinning a default path here would either leak a
+# private path into a public repo or pick the wrong venv silently.
 if [ -n "${VENV:-}" ]; then
     VENV_DIR="${VENV}"
 elif [ -n "${VIRTUAL_ENV:-}" ]; then
     VENV_DIR="${VIRTUAL_ENV}"
-elif [ -d "${HOME}/ComfyUI/.venv" ]; then
-    VENV_DIR="${HOME}/ComfyUI/.venv"
 else
-    echo "error: no venv found. Set \$VENV or \$VIRTUAL_ENV." >&2
+    echo "error: no venv found. Either activate a venv or set \$VENV explicitly." >&2
     exit 1
 fi
 
@@ -84,4 +83,4 @@ echo
 echo "done. summary:"
 echo "  env:     ${ENV_FILE}"
 echo "  bench:   ${BENCH_LOG}  ($(grep -c '^===' "${BENCH_LOG}" || echo 0) shapes)"
-echo "  spike:   ${SPIKE_LOG}  ($(grep -E '^(verdict|final)' "${SPIKE_LOG}" | head -1))"
+echo "  spike:   ${SPIKE_LOG}  ($(grep -E '^(verdict|final)' "${SPIKE_LOG}" | tail -1))"

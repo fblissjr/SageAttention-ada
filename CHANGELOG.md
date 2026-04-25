@@ -152,7 +152,7 @@ improvement on Q (for a skewed model) yields ~8-10% end-to-end.
 **Trigger to reopen:**
 - LTX's actual Q DC offset measured at |DC|/std > 0.5 in production.
   (Would require instrumenting the LTX model's Q projections;
-  AudioLoopHelper could capture this if telemetry grows that far.)
+  a downstream consumer could capture this if its telemetry grows that far.)
 - A visible artifact in fp8++ output that isn't explained by bf16
   activations, fp8 weight quant, or VAE.
 - A future workload with shorter-bit Q quantization (fp4 or below)
@@ -231,33 +231,37 @@ when someone says "this used to be faster."
 **Trigger to act:** any version bump in the list above, OR a measured >5%
 shape-level drift on a routine workflow gen.
 
-### Session-level attention telemetry summary (AudioLoopHelper side)
+### Session-level attention telemetry summary (consumer side)
 
 Cross-repo backlog item, tracked here because it feeds sage-fork's
 mask-kernel work (the "is triton cross-attn a bottleneck?" trigger
-above). AudioLoopHelper's `nodes_sage.py` already writes a per-call
-JSONL row (shape, mode, effective_mode, elapsed_us, fell_back) when
-`AUDIOLOOPHELPER_SAGE_TRACE` is set. The raw data is there but not
-aggregated -- nobody can currently say "triton cross-attn is X% of
-gen wall time" with numbers, which is exactly what the B2 trigger
-needs.
+above). A consumer-side sage-routing node typically writes a per-call
+JSONL row (shape, mode, effective_mode, elapsed_us, fell_back) when an
+opt-in trace env var is set. Raw per-call data is straightforward; the
+aggregation question is "what percent of gen wall time is masked-triton?"
+which is exactly what the mask-kernel trigger above needs.
 
-**Shape of the work (AudioLoopHelper side):** emit a one-line
-summary at gen-end: median/p90 elapsed_us for masked-triton calls,
-total call count, and that median as a % of total gen time if
-measurable. No new telemetry plumbing required -- just aggregation
-over the existing JSONL rows.
+**Shape of the work (consumer side):** emit a one-line summary at
+gen-end: median/p90 elapsed_us for masked-triton calls, total call
+count, and that median as a percent of total gen time if measurable.
+No new telemetry plumbing required -- just aggregation over the
+existing JSONL rows.
 
-**Trigger to act:** when someone on AudioLoopHelper wants to justify
-backing a sage-fork kernel push with data. Until someone asks, the
-raw JSONL is sufficient.
+**Trigger to act:** when a downstream consumer wants to justify backing
+a sage-fork kernel push with data. Until then the raw JSONL is
+sufficient.
 
 ## [Unreleased]
 
 ### Added
 
-- `tests/test_sageattn_ltx_shapes.py` -- three Phase 1 instrumentation
-  additions for the optimization plan:
+- `tests/run_all.sh` -- one-shot validation runner. Resolves the venv
+  from `$VENV` or `$VIRTUAL_ENV`, snapshots the env to
+  `internal/bench_env_<today>.txt`, runs `tests/test_sageattn_ltx_shapes.py`
+  + `tests/spike_torch_compile.py` in sequence, archives both logs to
+  `internal/log/`, prints a one-line summary. `set -euo pipefail`.
+- `tests/test_sageattn_ltx_shapes.py` -- three bench instrumentation
+  additions:
   * FlashInfer fp16 prefill row (optional; SKIPs cleanly when not installed).
     Predicted to lag sage fp8++ on sm89 because CUTLASS lacks native fp8 below
     sm90 -- this row is the empirical close-out for the question.
@@ -306,8 +310,8 @@ raw JSONL is sufficient.
   torch-SDPA-could-displace-sage scenario is retired by measurement.
   Companion to the one-shape `tests/test_sageattn.py`.
   Also reports a `fp8++vs.triton` cross-kernel consistency row on
-  unmasked shapes: the AudioLoopHelper consumer mixes fp8++ (unmasked)
-  and triton (masked) in one forward pass, so measuring their pairwise
+  unmasked shapes: a mask-aware consumer mixes fp8++ (unmasked) and
+  triton (masked) in one forward pass, so measuring their pairwise
   rtol tells us whether that mixing introduces a secondary numerical
   issue beyond each kernel's independent noise floor. Measured on RTX
   4090: mean_rtol ~0.10 across self-attn shapes -- essentially equal
@@ -334,14 +338,22 @@ raw JSONL is sufficient.
 
 ### Changed
 
+- `README.md` and `CLAUDE.md` -- reframed to be consumer-agnostic.
+  Sage is a general PyTorch attention library; this fork compiles
+  cleanly into any consumer (ComfyUI custom nodes via KJNodes,
+  diffusers pipelines, raw PyTorch). README now lists what's actually
+  in the fork beyond the upstream (bench harness, compile spike,
+  warmup API, autotune addition); CLAUDE.md TLDR states the two
+  purposes (editable install + experimentation/measurement surface)
+  without coupling to a specific downstream node.
 - Self-attn-large baseline drift: 19.67 ms (recorded 2026-04-23 on torch+cu128)
   to 19.95 ms (2026-04-25 on torch+cu130). ~1.4% drift, within run-to-run
   noise. Going forward the regression yardstick is 19.95 ms. Other shapes
   drifted by similar magnitudes; cross-attn rtol fingerprints
   (CUDA-mask-bug signature) are unchanged from prior characterization.
-- `tests/spike_torch_compile.py` -- 30-min Phase 5 spike measuring whether
-  the consumer-side `torch.compiler.disable()` around sage is still
-  warranted on torch 2.11. Both `mode='reduce-overhead'` (CUDA Graphs)
+- `tests/spike_torch_compile.py` -- re-runnable spike measuring whether
+  a consumer's `torch.compiler.disable()` wrapper around sage is still
+  warranted on the current torch version. Both `mode='reduce-overhead'` (CUDA Graphs)
   and `mode='default'` (inductor without CUDA Graphs) compiled cleanly
   but produced output with mean_rtol 0.0279 vs eager -- 2.8% drift, well
   above the 1% tolerance. Verdict: keep the disable. The 2.8% drift is

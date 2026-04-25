@@ -1,11 +1,10 @@
-"""Phase 5 spike: does torch.compile around sage still need to be disabled?
+"""Spike: does torch.compile around sage still need to be disabled?
 
-The downstream consumer (an AudioLoopHelper sage-routing node) wraps every
-sage call in `torch.compiler.disable()` per a comment claiming "sage
-fork's torch.compile support is recent and thin." That decision was made
-on a prior torch version. This spike re-tests on the current torch (2.11)
-to either confirm the disable is still warranted or open a follow-up
-phase to remove it.
+A downstream consumer wraps every sage call in `torch.compiler.disable()`
+per a comment claiming "sage fork's torch.compile support is recent and
+thin." That decision was made on a prior torch version. This spike
+re-tests on the current torch to either confirm the disable is still
+warranted or open a follow-up to remove it.
 
 What the spike does, for one canonical LTX self-attn shape:
 
