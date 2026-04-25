@@ -76,6 +76,13 @@ SHAPES = [
     # non-++ callers, this shape characterizes how much precision the
     # non-LTX user loses.
     Shape("synthetic_wide_v_self_attn",    1, 32,  8192,  8192, 64, False, v_std=5.0),
+    # Image-gen representative self-attn shape (Flux/Z-Image-class). 1024^2
+    # output / 16^2 VAE compression -> ~4096 image tokens; head_dim=128 and
+    # heads=24 are the Flux-1-dev family defaults. Used to confirm sage's
+    # speedup story still holds on image-gen head_dim=128 workloads, not just
+    # LTX's head_dim=64. If sage doesn't win here, the consumer-side router
+    # would need a per-model-class branch.
+    Shape("image_gen_self_attn_4096_h24_d128", 1, 24, 4096, 4096, 128, False),
 ]
 
 
@@ -104,6 +111,24 @@ TORCH_MODE_SPECS = [
     ("torch_flash",  SDPBackend.FLASH_ATTENTION),
     ("torch_eff",    SDPBackend.EFFICIENT_ATTENTION),
     ("torch_cudnn",  SDPBackend.CUDNN_ATTENTION),
+]
+
+# FlashInfer fp16 prefill, optional. Predicted to lag sage fp8++ on sm89
+# because CUTLASS lacks native fp8 below sm90 -- FlashInfer's fp8 paths are
+# Hopper-shaped. We measure fp16 anyway: if it beats torch_flash's fp16, it
+# becomes a tracked fp16 fallback for paths sage can't run.
+FLASHINFER_MODE_SPECS = [
+    ("flashinfer_fp16", "single_prefill_with_kv_cache"),
+]
+
+# SpargeAttention: training-free sparse attention from the same lab as sage,
+# explicitly built on sage 2 ("sparse computation is orthogonal to
+# quantization"). API has no attn_mask, so masked shapes are skipped. topk
+# controls how many tile groups are kept; 0.5 = compute half the attention.
+# Pass = rtol no worse than 1.5x sage fp8++ rtol on the same shape AND
+# wall-clock measurably faster.
+SPARGE_MODE_SPECS = [
+    ("sparge_topk0.5", 0.5),
 ]
 
 
@@ -178,6 +203,47 @@ def dispatch_torch(backend: SDPBackend) -> Callable:
     return _fn
 
 
+def dispatch_flashinfer(api_name: str) -> Callable:
+    """Return a callable for a FlashInfer prefill API. Layout conversion:
+    sage's HND is (B, H, S, D); FlashInfer NHD is (S, H, D). Batch size 1
+    only -- DiTs run one sample per forward, so this matches our use."""
+    import flashinfer
+
+    fn = getattr(flashinfer, api_name)
+
+    def _fn(q, k, v, mask):
+        if mask is not None:
+            raise NotImplementedError(
+                "FlashInfer prefill paths don't accept arbitrary boolean masks "
+                "in this configuration; skip masked shapes."
+            )
+        # (1, H, S, D) -> (S, H, D) for NHD layout
+        q_n = q.squeeze(0).transpose(0, 1).contiguous()
+        k_n = k.squeeze(0).transpose(0, 1).contiguous()
+        v_n = v.squeeze(0).transpose(0, 1).contiguous()
+        out = fn(q_n, k_n, v_n, kv_layout="NHD")
+        # (Sq, H, D) -> (1, H, Sq, D)
+        return out.transpose(0, 1).unsqueeze(0).contiguous()
+
+    return _fn
+
+
+def dispatch_sparge(topk: float) -> Callable:
+    """Return a callable for SpargeAttention top-k unmasked self-attention.
+    Sparge inherits sage's mask gap (no attn_mask kwarg), so masked shapes
+    must be skipped at the call site, not here."""
+    from spas_sage_attn import spas_sage2_attn_meansim_topk_cuda
+
+    def _fn(q, k, v, mask):
+        if mask is not None:
+            raise NotImplementedError(
+                "SpargeAttention has no attn_mask support (inherits sage's gap)."
+            )
+        return spas_sage2_attn_meansim_topk_cuda(q, k, v, topk=topk, is_causal=False)
+
+    return _fn
+
+
 def measure_mode(
     mode_fn: Callable, q, k, v, mask, out_ref: torch.Tensor,
 ) -> tuple[Metrics, torch.Tensor]:
@@ -207,6 +273,8 @@ def main():
     label_width = max(
         max(len(name) for name, _, _ in MODE_SPECS),
         max(len(name) for name, _ in TORCH_MODE_SPECS),
+        max(len(name) for name, _ in FLASHINFER_MODE_SPECS),
+        max(len(name) for name, _ in SPARGE_MODE_SPECS),
     )
     print_header(label_width)
 
@@ -293,6 +361,30 @@ def main():
             # Torch backends reference themselves against SDPA-EFFICIENT, so
             # rtol can be ~0 (one of them IS the reference). Don't warn.
             _print_result(label, m, warn_rtol=False)
+
+        # FlashInfer fp16 prefill -- optional, masked shapes skipped.
+        for label, api_name in FLASHINFER_MODE_SPECS:
+            try:
+                mode_fn = dispatch_flashinfer(api_name)
+                m, _ = measure_mode(mode_fn, q, k, v, mask, out_ref)
+            except Exception as exc:
+                print(f"    {label:<{label_width}}  SKIP ({type(exc).__name__}: {str(exc)[:80]})")
+                continue
+            _print_result(label, m, warn_rtol=False)
+
+        # SpargeAttention -- unmasked only, training-free top-k sparse.
+        for label, topk in SPARGE_MODE_SPECS:
+            try:
+                mode_fn = dispatch_sparge(topk)
+                m, _ = measure_mode(mode_fn, q, k, v, mask, out_ref)
+            except Exception as exc:
+                print(f"    {label:<{label_width}}  SKIP ({type(exc).__name__}: {str(exc)[:80]})")
+                continue
+            # Soft-warn at the same threshold as sage modes; the gate criterion
+            # in the optimization plan is "rtol <= 1.5x sage fp8++ rtol on the
+            # same shape," which is a post-hoc analysis on these numbers, not
+            # an in-loop check.
+            _print_result(label, m)
 
     print()
     if warnings:
