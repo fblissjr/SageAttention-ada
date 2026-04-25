@@ -3,10 +3,24 @@
 ## TLDR
 
 Local fork of `woct0rdho/SageAttention` (itself a fork of
-`thu-ml/SageAttention`) used as an editable install for ComfyUI +
-LTX-2.3 video generation on RTX 4090 (sm89 / Ada). History was
-squashed at 2026-04-23: assume `main` is ours; upstream is not pulled
-from anymore.
+`thu-ml/SageAttention`). Two purposes:
+
+1. **Editable install** for any PyTorch project that wants sage on
+   sm89 / RTX 40xx / Ada. ComfyUI is one common consumer, but the
+   fork is consumer-agnostic: anything that imports `sageattention`
+   or replaces `torch.nn.functional.scaled_dot_product_attention`
+   picks it up. The packaging-regression fix in setup.py is the
+   load-bearing reason this fork exists at all.
+2. **Experimentation and measurement surface** for sm89 attention
+   kernel decisions. The LTX-shape bench harness
+   (`tests/test_sageattn_ltx_shapes.py`), torch.compile spike, and
+   periodic upstream survey live here so kernel-side decisions
+   (autotune coverage, mask-kernel work, FlashInfer / SpargeAttn
+   comparisons) can be made with numbers. Consumers handle their own
+   routing policy; the fork stays primitive (kernels + bench).
+
+History was squashed at 2026-04-23: assume `main` is ours; upstream is
+not pulled from anymore.
 
 We care about exactly one GPU: **sm89 / RTX 40xx / Ada**. Other archs
 compile and run (the code is upstream's), but we don't test or debug
@@ -103,7 +117,7 @@ Soft-warns when mean_rtol > 0.10. Measures five sage kernels
 (fp16_cuda, fp16_triton, fp8_cuda, fp8_cuda++, auto) and three torch
 SDPA backends (FLASH, EFFICIENT, CUDNN) in the same run, plus an
 `fp8++vs.triton` cross-kernel rtol row on unmasked shapes (sanity
-check that AudioLoopHelper's mix-routed fp8++ + triton in one forward
+check that a consumer's mix-routed fp8++ + triton in one forward
 pass doesn't introduce a discontinuity beyond each kernel's own noise
 floor; expected ~0.10, warns >0.15). Torch rows are the regression
 guard for "did a torch upgrade close the sage perf gap?" questions. First call with a new shape tuple pays one-time
@@ -269,6 +283,6 @@ model becomes a goal.
 
 - `README.md` -- attribution (woct0rdho, thu-ml).
 - `CHANGELOG.md` -- our diff from upstream, plus Known issues.
-- The downstream consumer (a ComfyUI custom-node) owns routing policy,
-  tracing telemetry, and workflow integration. Its own CLAUDE.md has
-  the LTX-2.3 audio-loop patch-chain analysis and test matrix.
+- A downstream ComfyUI consumer (any custom node patching attention)
+  owns routing policy, tracing telemetry, and workflow integration.
+  Sage-fork stays primitive: kernels and the bench harness only.
