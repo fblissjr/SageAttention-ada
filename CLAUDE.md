@@ -183,6 +183,18 @@ tests once we do fix them.
   pre-commit and commit-msg hooks hard-block the leak class; they're
   installed in this repo and run automatically. If a hook fires, edit
   the file to remove the absolute portion -- do not bypass.
+  Belt-and-suspenders manual scan before every commit (catches strings
+  the hook's regex doesn't, e.g. consumer-project names):
+  `git add <files> && git diff --cached | grep -nE '/home/|~/dev|~/ComfyUI|fbliss|/Users/'`  <!-- path-privacy: ignore -->
+  -- empty output = clean. (The scan-pattern line above is itself a
+  documented regex source; the trailing token tells the path-privacy
+  hook to skip it.)
+- **Session logs append, never overwrite.** `internal/log/log_<date>.md`
+  is gitignored and may already exist when a new session starts on
+  the same day (see today's file with multiple `## Update N — ...`
+  sections). Append a new `## Update N — <topic> (<time-of-day>)`
+  section at the bottom rather than rewriting the file. Earlier-in-day
+  work is the audit trail across sibling sessions.
 
 ## What's ours vs what's upstream
 
@@ -203,16 +215,25 @@ Our additions and modifications (tracked in CHANGELOG.md):
   sm89 to ~2ms post-warm. Defaults to the Triton kernel only (CUDA
   kernels are build-time compiled, no warmup benefit). Consumer nodes
   call this at model-patch time.
-- `sageattention.get_last_dispatched_kernel() -> str | None` -- public
-  helper exposing which kernel the most recent `sageattn*` call on
-  this thread dispatched to, as a stable short string (`fp16_triton`,
-  `fp8_cuda++`, etc.; full set in `KNOWN_KERNEL_NAMES`). Lets
-  consumer tracers record sage's routing decision instead of
-  mirroring the dispatch table or treating it as opaque. Backed by a
+- `sageattention.get_last_dispatched_kernel() -> Optional[KernelName]`
+  -- public helper exposing which kernel the most recent `sageattn*`
+  call on this thread dispatched to, as a stable short string
+  (`fp16_triton`, `fp8_cuda++`, etc.; full set in
+  `KNOWN_KERNEL_NAMES`, type alias in `KernelName`). Lets consumer
+  tracers record sage's routing decision instead of mirroring the
+  dispatch table or treating it as opaque. Backed by a
   `threading.local()` set inside each entry point's dispatch branch.
   Read immediately after the sage call -- thread-local, not
   contextvar-aware. Test:
-  `tests/test_dispatched_kernel_telemetry.py`.
+  `tests/test_dispatched_kernel_telemetry.py`. **Adding a new kernel
+  variant requires three coupled edits in `core.py`:** a new
+  `KERNEL_*` string constant, the matching entry in the
+  `KNOWN_KERNEL_NAMES` frozenset, and the matching string in the
+  `KernelName = Literal[...]` alias. Forgetting the Literal silently
+  breaks consumer type-checking but not runtime; forgetting the
+  frozenset silently breaks consumer `assert kernel in
+  KNOWN_KERNEL_NAMES` validators. The constant + set + Literal trio
+  is the public contract.
 - `sageattention/triton/attn_qk_int8_per_block.py` -- `@triton.autotune`
   over `num_warps` and `num_stages`. Zero immediate perf delta on
   sm89 + LTX shapes (hardcoded config was already optimal) but
