@@ -215,7 +215,7 @@ Our additions and modifications (tracked in CHANGELOG.md):
   "did a torch upgrade close the sage perf gap?"
 - `tests/repros/repro_cuda_mask_kernel.py` -- minimal repro for the
   CUDA mask-path missing-feature documented in CHANGELOG.
-- `CHANGELOG.md` -- local divergence + Known kernel bugs + Open work.
+- `CHANGELOG.md` -- versioned divergence + Known kernel bugs + Backlog + Decision log + Recurring process items.
 - `README.md` -- minimal; attribution only.
 - `CLAUDE.md` -- this file.
 
@@ -260,8 +260,8 @@ kernel defect blocks the LTX workflow:
 3. Mask-handling code is in the `pybind_sm*.cpp` files (PyTorch entry
    points) and the `.cu` files (kernel body).
 4. Rebuild via `./build.sh` and re-run the repro.
-5. Add a CHANGELOG entry under `[Unreleased] / Fixed` with the repro
-   reference.
+5. Add a CHANGELOG entry under the latest version block (Fixed
+   subsection) with the repro reference.
 
 We deliberately have no CI. Verify by running the LTX-shape test and
 the full downstream-consumer pytest suite on this box before trusting
@@ -289,8 +289,8 @@ looks substantive, investigate. Otherwise skip.
 Every wall-clock comparison in `test_sageattn_ltx_shapes.py` is pinned
 to the version surface in `internal/bench_env_<date>.txt`. After any
 torch/triton/CUDA/sage-rev bump, re-run the test and resnapshot. Trigger
-doc + drift threshold: `CHANGELOG.md` / Open work / "Bench env
-re-snapshot."
+doc + drift threshold: `CHANGELOG.md` / Recurring process items /
+"Bench env re-snapshot."
 
 ## fp16 matmul accumulation flag
 

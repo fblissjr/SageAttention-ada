@@ -22,7 +22,7 @@ Two things:
 
 1. **One-line packaging-regression fix** for Ada (RTX 40xx) source builds. `woct0rdho`'s setup.py refactor narrowed the SM80 build gate to `(8.0, 8.6, 8.7)` and silently dropped Ada / Hopper / Blackwell. We add `8.9` back so `_qattn_sm80` (carrying `sageattn_qk_int8_pv_fp16_cuda` -- the fp16 fallback) builds again on RTX 4090. Prebuilt wheels include every `.so`; this only matters for source builds.
 
-2. **Experimentation and measurement surface** for sm89 attention. The fork is the place where new sage-adjacent ideas (autotune coverage, mask-kernel work, FlashInfer / SpargeAttention comparisons, torch.compile compatibility, head_dim coverage for new model classes) get measured before they ship anywhere. See [`CHANGELOG.md`](./CHANGELOG.md) for the divergence list, Known kernel bugs (CUDA mask path missing across sage 2.x and sage 3 Blackwell), and Open work.
+2. **Experimentation and measurement surface** for sm89 attention. The fork is the place where new sage-adjacent ideas (autotune coverage, mask-kernel work, FlashInfer / SpargeAttention comparisons, torch.compile compatibility, head_dim coverage for new model classes) get measured before they ship anywhere. See [`CHANGELOG.md`](./CHANGELOG.md) for the version-by-version divergence record, Known kernel bugs (CUDA mask path missing across sage 2.x and sage 3 Blackwell), the open Backlog with explicit triggers to act, and the Decision log of investigations that closed.
 
 ## What's in here beyond the upstream
 
