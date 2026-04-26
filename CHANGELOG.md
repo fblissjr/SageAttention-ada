@@ -252,6 +252,59 @@ sufficient.
 
 ## Versions
 
+### v0.4.0 -- 2026-04-26  (end-to-end gen-time bench harness)
+
+Closes the load-bearing "kernel ms is not gen ms" gap that the
+v0.3.x perf-research framework explicitly flagged. Until this lands,
+every claim about sage-fork's perf impact was theoretical -- we
+measured 19.95 ms on the primary kernel row but never showed that
+translated into a real DiT render moving from X seconds to Y.
+
+#### Added
+
+- **`tests/bench_e2e_ltx.py`** -- end-to-end gen-wall-time bench via
+  ComfyUI's HTTP API. Submits an LTX (or Flux / Z-Image) render
+  workflow N times sage-on, N times sage-disabled, captures wall
+  time per run, reads the consumer's sage trace JSONL (when
+  `AUDIOLOOPHELPER_SAGE_TRACE=auto`), and reports:
+  - median wall time per arm
+  - speedup ratio: `wall_off / wall_on`
+  - attention-fraction-of-step on the sage arm
+  - interpretation: ≥ 1.5× = sage load-bearing on this workload,
+    1.10–1.50× = helps but not dominant, < 1.10× = wash, < 0.95× =
+    regression
+  
+  Prereqs: ComfyUI running, launched with the trace env var, and an
+  API-format workflow JSON (saved via UI → Workflow → Save (API
+  Format)). The script does not convert UI-format workflows -- the
+  conversion is JS-side in ComfyUI's frontend; reimplementing adds
+  enough complexity that one click in the UI is the better tradeoff.
+  Mode toggle is via the `inputs.mode` field on the
+  `AudioLoopHelperSageAttention` node, found by class_type so it's
+  resilient to id renumbering across workflow versions.
+
+- **Backlog entry** in `internal/PLAN.md`: "Simplify e2e bench
+  correlation once consumer ships RUN_ID + prompt_id." Tracks an
+  upcoming consumer-side change that bundles per-session artifacts
+  under `data/runs/${RUN_ID}/` and stamps `prompt_id` on each sage
+  trace row. When that lands, the bench drops ts-windowing entirely
+  (~30 lines deleted; fence-post bugs eliminated; parallel-queue
+  resilient). Until then ts-windowing is the correlation primitive.
+
+#### Why this matters more than the kernel-level work that preceded it
+
+The v0.3.x work fixed a real correctness bug (dispatcher mask
+routing) and built measurement infrastructure (K-probe row,
+soft-warn, telemetry helper). All of that is real but downstream
+of an unverified premise: that kernel-level speedup translates to
+gen-level speedup at all. This bench is the first instrument that
+can verify (or disprove) that premise.
+
+If the first execution shows speedup < 1.10×, the framework's
+"kernel ms ≠ gen ms" caveat fires for real and the kernel-side
+research priorities reset. If ≥ 1.5×, sage-fork's reason to exist
+is empirically grounded for the first time.
+
 ### v0.3.1 -- 2026-04-26  (mask-gap follow-ups: soft-warn + K-ratio probe)
 
 Two follow-ups graded against the load-bearing-metric framework added
