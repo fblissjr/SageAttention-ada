@@ -15,6 +15,13 @@ that exists to do two things:
 The kernels themselves are upstream's. We measure on sm89 / RTX 4090
 only; other archs compile and run but are not validated here.
 
+For the high-level scope statement (what this fork is, what it
+isn't, the single metric, what we might be wrong about), see
+[`VISION.md`](./VISION.md). For the operational philosophy and
+day-to-day perf-research framework, see
+[`CLAUDE.md`](./CLAUDE.md) "Performance research: the load-bearing
+metric."
+
 ## Build
 
 ```bash

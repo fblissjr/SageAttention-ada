@@ -590,8 +590,21 @@ model becomes a goal.
 
 ## Related
 
-- `README.md` -- attribution (woct0rdho, thu-ml).
-- `CHANGELOG.md` -- our diff from upstream, plus Known issues.
+- `VISION.md` -- canonical scope doc. What this fork is, what it
+  isn't, the single load-bearing metric, what we might be wrong
+  about. Rare edits; update when the fork's philosophy shifts.
+- `README.md` -- what changed vs upstream, what was measured, what
+  tradeoffs come with using it. The longer per-feature explanation
+  surface; cross-linked from VISION.md.
+- `CHANGELOG.md` -- versioned divergence + Known kernel bugs +
+  Backlog + Decision log + Recurring process items. Source of truth
+  for closed decisions.
+- `internal/PLAN.md` (gitignored) -- live operational doc: current
+  state, active backlog with triggers, cross-repo coupling,
+  experiment log (TSV), the research loop. Edit every session.
+  Mirrors CHANGELOG's Backlog and Recurring sections in active
+  form. Pairs with `internal/log/log_<date>.md` (narrative session
+  notes) and `internal/audit_<date>.md` (durable findings).
 - A downstream ComfyUI consumer (any custom node patching attention)
   owns routing policy, tracing telemetry, and workflow integration.
   Sage-fork stays primitive: kernels and the bench harness only.

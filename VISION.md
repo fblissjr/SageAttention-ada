@@ -49,10 +49,9 @@ items" / "Periodic upstream survey" for the schedule.
 - **A `torch.compile` target.** Verified 2026-04-25 on torch 2.11:
   compile-around-sage produces ~2.8% rtol drift with no measurable
   speedup. Consumers should keep `torch.compiler.disable()` around
-  sage calls. Trigger to revisit:
+  sage calls. Revisit when a future torch release makes
   [`tests/spike_torch_compile.py`](./tests/spike_torch_compile.py)
-  reports bounded rtol AND a measurable speedup on a future torch
-  release.
+  show bounded rtol AND a measurable speedup.
 - **An upstream tracker.** Squashed 2026-04-23. Quarterly survey
   (`CHANGELOG.md` Recurring process items) catches kernel-side
   bugfixes from `thu-ml` or regressions from `woct0rdho`; everything
@@ -97,8 +96,8 @@ in [`setup.py`](./setup.py) line 152 to match thu-ml's coverage.
 - **Correctness before perf.** v0.3.0's silent-mask-drop took a
   10-line dispatcher fix and a regression test. The native CUDA mask
   kernel — days of kernel work for at most ~2× speedup at sub-ms
-  cross-attn — stays deferred with the K=1.68 measurement behind the
-  deferral.
+  cross-attn — stays deferred, with the K=1.68 measurement
+  supporting the deferral.
 - **Measurement before decision.** Deferrals carry concrete
   reopen-numbers, not vague "trigger fires." The
   `cross_attn_unmasked_kv226_kratio_probe` row exists specifically
@@ -115,34 +114,13 @@ in [`setup.py`](./setup.py) line 152 to match thu-ml's coverage.
 
 ## Where this gets used
 
-Sage is a general PyTorch attention library. Public surface:
-
-- **`sageattention.sageattn(q, k, v, ...)`** — top-level dispatcher.
-  Routes by `(arch, CUDA version, mask presence)`. On sm89 + CUDA ≥
-  12.8 unmasked, lands on `sageattn_qk_int8_pv_fp8_cuda` with
-  `pv_accum_dtype="fp32+fp16"`. With `attn_mask` passed, routes to
-  `sageattn_qk_int8_pv_fp16_triton` regardless of arch (the only
-  mask-correct path). Most consumers should call this and let
-  dispatch decide.
-- **Per-kernel exports** — `sageattn_qk_int8_pv_fp16_cuda`,
-  `sageattn_qk_int8_pv_fp8_cuda`, `sageattn_qk_int8_pv_fp16_triton`,
-  `sageattn_qk_int8_pv_fp8_cuda_sm90`. Bypass the dispatcher; the
-  caller picks. Hand-picking a `_cuda` kernel with `attn_mask` will
-  emit a soft warning (the kernel silently drops the mask; the
-  output is numerically wrong).
-- **`sageattention.sageattn_warmup(shapes, kernels=...)`** — primes
-  Triton's JIT + autotune cache. Cuts ~1 s first-call latency to
-  ~2 ms post-warm. Optional; CUDA kernels don't need it (build-time
-  compiled).
-- **`sageattention.get_last_dispatched_kernel() -> str | None`** —
-  thread-local helper exposing which kernel the most recent
-  `sageattn*` call dispatched to. Stable short names enumerated in
-  `KNOWN_KERNEL_NAMES`; type alias `KernelName`. Lets a consumer's
-  per-call tracer record the actual kernel instead of mirroring the
-  dispatch table.
-
-[`README.md`](./README.md) carries the longer per-feature
-explanations and the measured numbers.
+Four public entry points: `sageattn()` (the top-level dispatcher,
+which routes by `(arch, CUDA version, mask presence)` on sm89 + CUDA
+≥ 12.8), per-kernel exports for callers that want to bypass the
+dispatcher, `sageattn_warmup()` for priming Triton's JIT cache, and
+`get_last_dispatched_kernel()` for consumer tracers. See
+[`README.md`](./README.md) "Where it gets used" for signatures,
+scopes, and the mask-handling caveats on hand-picked kernels.
 
 ## What we might be wrong about
 
