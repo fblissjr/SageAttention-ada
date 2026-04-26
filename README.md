@@ -59,18 +59,22 @@ tuple further.
 Public API. Fires a one-shot dispatch per `(kernel, shape)` to prime
 Triton's JIT + autotune cache.
 
-**Why it matters.** Triton's first call on a new shape pays a JIT-compile
+**Mechanism.** Triton's first call on a new shape pays a JIT-compile
 cost (~100–500ms per shape tuple) plus autotune time. Subsequent calls
 hit Triton's on-disk cache. Calling `sageattn_warmup()` once at
-model-patch time hides that latency from the first user-visible
+model-patch time would hide that latency from the first user-visible
 generation. Defaults to the Triton kernel only — CUDA kernels are
 fully compiled at build time and don't benefit.
 
-**Measured cost reduction.** ~1s → ~2ms first-call latency on sm89 for
-the warmed shapes (one shape, one warmup call).
+**Status (verified 2026-04-26).** Available API; no consumers in our
+coordinated set currently call it. The mechanism above is real; we
+have not benchmarked the latency-reduction claim on this box. Treat
+as an opt-in optimization we offer. If no consumer adopts within ~6
+months, this entry comes out.
 
-**Scope.** Inert if the consumer doesn't call it. Triton's disk cache
-is invalidated by `./build.sh`, so re-warm after every rebuild.
+**Scope.** Inert until called. Triton's disk cache is invalidated by
+`./build.sh`, so a hypothetical caller would need to re-warm after
+every rebuild.
 
 ### 3. `sageattention.get_last_dispatched_kernel() -> str | None`
 

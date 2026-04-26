@@ -143,6 +143,12 @@ be ~0.5-1s slower than subsequent ones.
 fork's kernels that we haven't fixed yet. They double as regression
 tests once we do fix them.
 
+GPU OOM mid-test usually means contention, not a real bug. Check
+`nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader`
+before debugging — a sibling process (e.g. ComfyUI loading a model)
+likely holds the VRAM Triton autotune needs (~256 MiB for the small
+telemetry test; multiple GiB for the LTX bench).
+
 ## Conventions
 
 - Python: **always uv**. Never `pip`, never bare `python3`. Build
@@ -192,6 +198,24 @@ tests once we do fix them.
   sections). Append a new `## Update N — <topic> (<time-of-day>)`
   section at the bottom rather than rewriting the file. Earlier-in-day
   work is the audit trail across sibling sessions.
+- **Local-machine config in `internal/local_config.json`** (gitignored).
+  Resolution order for any test/script that needs host:port or local
+  paths: CLI arg > env var > `local_config.json` > hard error pointing
+  at the runbook. Don't hardcode local-machine values in committed
+  code; this is the documented escape hatch. Established 2026-04-26
+  by `tests/bench_e2e_ltx.py`; schema in
+  `internal/runbook_bench_e2e_ltx.md`.
+- **`coderef/` is gitignored** alongside `internal/`. Used as a local
+  working area for symlinks/clones of consumer source trees we want to
+  grep against (verifying our public-API claims, reading their
+  scratch.md, etc.). Repo cloners won't have it; that's by design.
+- **Verify aspirational doc claims against actual code.** Twice in one
+  session (dispatcher mask routing, `sageattn_warmup` "consumers call
+  it") a public-API doc claimed "X is used by Y" or "dispatcher does
+  Z" — both turned out to be aspirational, not implemented. One
+  `grep -r "<api_name>" coderef/` for consumer call sites + a quick
+  read of the dispatch code catches this in seconds. Audit trail in
+  `internal/audit_2026-04-26.md`.
 
 ## What's ours vs what's upstream
 
@@ -208,10 +232,15 @@ Our additions and modifications (tracked in CHANGELOG.md):
   SM80).
 - `sageattention/core.py::sageattn_warmup(shapes, kernels=...)` --
   public API that fires one-shot dispatches per (kernel, shape) to
-  prime Triton's JIT + autotune cache. Cuts ~1s first-call latency on
-  sm89 to ~2ms post-warm. Defaults to the Triton kernel only (CUDA
-  kernels are build-time compiled, no warmup benefit). Consumer nodes
-  call this at model-patch time.
+  prime Triton's JIT + autotune cache. Defaults to the Triton kernel
+  only (CUDA kernels are build-time compiled, no warmup benefit).
+  **Status (verified 2026-04-26):** available API; no consumers in
+  our coordinated set currently call it. The mechanism (Triton
+  autotune cache hit on subsequent calls) is real; the "~1s → ~2ms"
+  perf claim circulating in earlier docs was the documented
+  mechanism, not a measured number from our box. Treat as an opt-in
+  optimization we offer; remove from this list if no consumer adopts
+  it within ~6 months.
 - `sageattention.get_last_dispatched_kernel() -> Optional[KernelName]`
   -- public helper exposing which kernel the most recent `sageattn*`
   call on this thread dispatched to, as a stable short string
