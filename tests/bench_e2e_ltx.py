@@ -85,6 +85,7 @@ What's deliberately NOT measured here
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import statistics
 import sys
@@ -92,6 +93,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 import orjson
@@ -104,6 +106,13 @@ DEFAULT_RUNS = 3
 DEFAULT_SAGE_MODE = "auto_mask_aware"
 DEFAULT_BASELINE_MODE = "disabled"
 SAGE_NODE_CLASS = "AudioLoopHelperSageAttention"
+
+# Speedup-ratio interpretation thresholds. Single source of truth -- the
+# CHANGELOG v0.4.0 entry and runbook reference these by value, so when a
+# threshold moves, grep these constants to find every callout.
+SPEEDUP_LOAD_BEARING = 1.50  # >= : sage carries the workload, kernel research justified
+SPEEDUP_HELPS = 1.10         # >= : sage helps but isn't dominant
+SPEEDUP_WASH_FLOOR = 0.95    # >= : noise band; below = real regression
 
 # Local-config file (gitignored). Lets an operator pin host / workflow
 # paths once on this box without committing them. See
@@ -233,18 +242,13 @@ def find_sage_node_id(prompt: dict) -> str:
 
 
 def set_sage_mode(prompt: dict, mode: str) -> dict:
-    """Return a deep-ish copy of `prompt` with the sage node's mode set.
+    """Return a copy of `prompt` with the sage node's `mode` input set.
 
-    Copies only the node we touch -- the rest is shared by reference,
-    which is fine because we re-serialize the whole prompt per submit.
+    Deep-copy is correct at this scale (~20-50 nodes, small dicts) --
+    micro-optimizations don't pay off against a 30-90s render.
     """
-    out = {k: dict(v) if isinstance(v, dict) else v for k, v in prompt.items()}
-    sage_id = find_sage_node_id(out)
-    sage_node = dict(out[sage_id])
-    sage_inputs = dict(sage_node.get("inputs", {}))
-    sage_inputs["mode"] = mode
-    sage_node["inputs"] = sage_inputs
-    out[sage_id] = sage_node
+    out = copy.deepcopy(prompt)
+    out[find_sage_node_id(out)]["inputs"]["mode"] = mode
     return out
 
 
@@ -294,19 +298,17 @@ def sum_attn_us_in_window(trace_path: Path, ts_min: float, ts_max: float) -> tup
 # Run loop
 # ---------------------------------------------------------------------------
 
+@dataclass
 class RunResult:
-    __slots__ = ("mode", "wall_s", "ts_start", "ts_end", "prompt_id",
-                 "attn_calls", "attn_total_ms")
-
-    def __init__(self, mode: str, wall_s: float, ts_start: float, ts_end: float,
-                 prompt_id: str):
-        self.mode = mode
-        self.wall_s = wall_s
-        self.ts_start = ts_start
-        self.ts_end = ts_end
-        self.prompt_id = prompt_id
-        self.attn_calls: int = 0
-        self.attn_total_ms: float = 0.0
+    mode: str
+    wall_s: float
+    ts_start: float
+    ts_end: float
+    prompt_id: str
+    # Filled in post-hoc by attach_attn_times(); zero on the off-arm
+    # (no sage trace by design).
+    attn_calls: int = 0
+    attn_total_ms: float = 0.0
 
 
 def run_one(host: str, prompt: dict, mode: str, run_idx: int, client_id: str) -> RunResult:
@@ -386,13 +388,13 @@ def report(results_on: list[RunResult], results_off: list[RunResult],
 
     print()
     print("Interpretation:")
-    if speedup >= 1.5:
+    if speedup >= SPEEDUP_LOAD_BEARING:
         print(f"  Sage is load-bearing on this workload "
               f"({speedup:.2f}x speedup). Kernel-side perf research justified.")
-    elif speedup >= 1.10:
+    elif speedup >= SPEEDUP_HELPS:
         print(f"  Sage helps but isn't dominant ({speedup:.2f}x). "
               f"Kernel improvements translate at ~{(speedup - 1) / 1:.0%} per kernel-x.")
-    elif speedup >= 0.95:
+    elif speedup >= SPEEDUP_WASH_FLOOR:
         print(f"  Sage is a wash on this workload ({speedup:.2f}x). "
               f"Attention isn't the bottleneck end-to-end -- look elsewhere.")
     else:
@@ -466,8 +468,6 @@ def main() -> int:
         print(f"ERROR: ComfyUI not reachable at http://{host}: {exc}", file=sys.stderr)
         return 1
 
-    # Snapshot trace file BEFORE the run so we know which file is the
-    # "current session" (ComfyUI rotates to a new file only on restart).
     trace_path_before = latest_trace_file(args.trace_dir)
     if trace_path_before is None:
         print(f"WARN: no sage trace file found in {args.trace_dir}.")
@@ -488,12 +488,9 @@ def main() -> int:
         results_off.append(run_one(host, prompt, args.baseline_mode, run_idx, client_id))
         time.sleep(args.inter_run_sleep)
 
-    # Re-resolve the trace file in case it rotated (it shouldn't have, but if
-    # ComfyUI restarted mid-bench we'd want the latest).
+    # Re-resolve in case ComfyUI restarted mid-bench and rotated the file.
     trace_path = latest_trace_file(args.trace_dir) if args.trace_dir.is_dir() else None
     attach_attn_times(results_on, trace_path)
-    # Off-arm has no sage trace by design (sage is bypassed).
-
     report(results_on, results_off, trace_path)
     return 0
 
