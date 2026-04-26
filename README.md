@@ -35,7 +35,7 @@ the build details.
 
 ## What this fork changes vs upstream
 
-Five concrete additions/changes. Everything else in the tree is
+Seven concrete additions/changes. Everything else in the tree is
 unmodified upstream code.
 
 ### 1. `setup.py:152` — sm89 added to the SM80 build gate
@@ -121,6 +121,48 @@ several GB per parallel job on the `_qattn_sm89` kernel and uncapped
 parallelism OOMs an 8-core box.
 
 **Scope.** Pure ergonomics; no kernel-side effect.
+
+### 6. `sageattn()` dispatcher mask-routing fix (v0.3.0)
+
+`sageattention/core.py::sageattn` now extracts `attn_mask` from
+`**kwargs` before the arch branch and short-circuits to
+`sageattn_qk_int8_pv_fp16_triton` when non-None. Pre-fix the
+dispatcher routed purely by arch and silently dropped the mask, so
+`sageattn(q, k, v, attn_mask=m)` produced numerically wrong output
+on every CUDA arch.
+
+**Why it matters.** End-to-end rtol on LTX cross-attn-with-mask at
+kv=226 went from 0.4405 (broken: mask dropped, fp8++ ran unmasked)
+to 0.0391 (correct: routed to fp16_triton). Pinned by
+`tests/test_dispatched_kernel_telemetry.py::test_sageattn_dispatcher_routes_masked_calls_to_triton`.
+v0.3.1 added a soft-warn when consumers bypass the dispatcher and
+hand-pick a `_cuda` kernel with a non-None mask, so the same bug
+class can't reach the CUDA path silently.
+
+**Scope.** Behavior change for any consumer that passes `attn_mask`
+to `sageattn()`. Strictly an improvement — pre-fix, those calls
+were silently wrong; post-fix, they route to the only mask-correct
+kernel.
+
+### 7. `tests/bench_e2e_ltx.py` — end-to-end gen-time harness (v0.4.0)
+
+Submits a ComfyUI workflow via the HTTP API N times sage-on, N
+times sage-disabled, reports wall-time speedup and
+attention-fraction-of-step. Closes the documented "kernel ms is not
+gen ms" gap that the rest of the fork's measurement was theoretical
+against.
+
+**Why it matters.** Until this runs against a real LTX render,
+every claim about sage-fork's perf impact is theoretical. The
+kernel-level bench shows fp8++ at 19.95 ms is 2.62× faster than
+torch_flash at the primary shape — but kernel ms is not gen ms.
+The e2e bench answers "does any of this fork's work make a real
+DiT render faster?" with a number.
+
+**Scope.** Requires ComfyUI running with
+`AUDIOLOOPHELPER_SAGE_TRACE=auto` and an API-format workflow JSON.
+Host resolved from CLI / `$COMFYUI_HOST` / `internal/local_config.json`
+(no hardcoded default; see `internal/runbook_bench_e2e_ltx.md`).
 
 ## What we measured
 
@@ -216,13 +258,14 @@ measurable speedup."
 
 **You give up:**
 
-- **Mask correctness on every CUDA path.** The `_cuda` kernels' Python
-  wrappers accept `attn_mask` via `**kwargs` but never forward it —
-  the C++ `MaskMode` enum only has `{kNone, kCausal}`. The top-level
-  `sageattn()` dispatcher does **not** redirect masked calls to
-  Triton: it dispatches purely on arch and drops `attn_mask` along
-  with the rest of `**kwargs`. A consumer that needs masked attention
-  must explicitly call `sageattn_qk_int8_pv_fp16_triton`. Repro:
+- **Mask correctness on hand-picked `_cuda` kernels.** The `_cuda`
+  kernels' wrappers accept `attn_mask` via `**kwargs` but never
+  forward it — the C++ `MaskMode` enum only has `{kNone, kCausal}`.
+  Calling `sageattn_qk_int8_pv_fp8_cuda(q, k, v, attn_mask=m)`
+  directly emits a soft warning and produces numerically wrong
+  output. The top-level `sageattn()` dispatcher routes masked calls
+  to `sageattn_qk_int8_pv_fp16_triton` automatically (since v0.3.0),
+  so consumers calling the dispatcher are safe. Repro:
   [`tests/repros/repro_cuda_mask_kernel.py`](./tests/repros/repro_cuda_mask_kernel.py).
 - bf16/fp16 input only. No fp32 input path.
 - `torch.compile` around sage. The consumer must wrap calls in
@@ -243,9 +286,11 @@ Sage is a general PyTorch attention library. Any consumer that imports
 picks this fork up via the editable install. Public API:
 
 - `sageattention.sageattn(q, k, v, ...)` — top-level dispatcher.
-  Routes by `(arch, CUDA version)`. **Does not route by mask.** On
-  sm89 + CUDA ≥ 12.8 this lands on `sageattn_qk_int8_pv_fp8_cuda`
-  with `pv_accum_dtype="fp32+fp16"` (SageAttention2++).
+  Routes by `(arch, CUDA version, mask presence)`. On sm89 + CUDA ≥
+  12.8 unmasked: `sageattn_qk_int8_pv_fp8_cuda` with
+  `pv_accum_dtype="fp32+fp16"`. With `attn_mask` passed: routes to
+  `sageattn_qk_int8_pv_fp16_triton` regardless of arch (the only
+  mask-correct path).
 - Per-kernel exports: `sageattn_qk_int8_pv_fp16_cuda`,
   `sageattn_qk_int8_pv_fp8_cuda`, `sageattn_qk_int8_pv_fp16_triton`,
   `sageattn_qk_int8_pv_fp8_cuda_sm90`.
