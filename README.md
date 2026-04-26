@@ -281,44 +281,11 @@ are upstream's), but the bench harness, the rtol baselines, and the
 
 ## Where it gets used
 
-Sage is a general PyTorch attention library. Any consumer that imports
-`sageattention` or replaces `torch.nn.functional.scaled_dot_product_attention`
-picks this fork up via the editable install. Public API:
-
-- `sageattention.sageattn(q, k, v, ...)` — top-level dispatcher.
-  Routes by `(arch, CUDA version, mask presence)`. On sm89 + CUDA ≥
-  12.8 unmasked: `sageattn_qk_int8_pv_fp8_cuda` with
-  `pv_accum_dtype="fp32+fp16"`. With `attn_mask` passed: routes to
-  `sageattn_qk_int8_pv_fp16_triton` regardless of arch (the only
-  mask-correct path).
-- Per-kernel exports: `sageattn_qk_int8_pv_fp16_cuda`,
-  `sageattn_qk_int8_pv_fp8_cuda`, `sageattn_qk_int8_pv_fp16_triton`,
-  `sageattn_qk_int8_pv_fp8_cuda_sm90`.
-- `sageattention.sageattn_warmup(shapes, kernels=...)` — optional;
-  primes Triton's JIT + autotune cache.
-- `sageattention.get_last_dispatched_kernel() -> str | None` —
-  optional; tells a tracer which kernel just ran.
-
-Routing policy (which kernel for which call) is the consumer's
-responsibility. Sage-fork stays primitive.
-
-## Files in this fork worth knowing about
-
-- [`CHANGELOG.md`](./CHANGELOG.md) — version-by-version divergence,
-  Known kernel bugs, Backlog with explicit triggers to act, Decision
-  log of investigations that closed without action, Recurring
-  process items.
-- [`CLAUDE.md`](./CLAUDE.md) — fork navigation guide and conventions.
-- [`tests/test_sageattn_ltx_shapes.py`](./tests/test_sageattn_ltx_shapes.py)
-  — LTX-shape accuracy + speed harness. Measures every installed sage
-  kernel + three torch SDPA backends + (when installed) FlashInfer
-  fp16 prefill + SpargeAttention top-k=0.5.
-- [`tests/test_sageattn_image_shapes.py`](./tests/test_sageattn_image_shapes.py)
-  — same harness, head_dim ∈ {120, 128} shapes (Z-Image-Turbo,
-  Flux-class).
-- [`tests/spike_torch_compile.py`](./tests/spike_torch_compile.py) —
-  re-runnable torch.compile spike.
-- [`tests/repros/`](./tests/repros/) — minimal standalone repros for
-  defects we haven't fixed yet.
-- [`tests/run_all.sh`](./tests/run_all.sh) — env snapshot + LTX bench
-  + image bench + compile spike, in one command.
+Any consumer that imports `sageattention` or replaces
+`torch.nn.functional.scaled_dot_product_attention` picks this fork
+up via the editable install. The four public entry points
+(`sageattn()` dispatcher, per-kernel exports, `sageattn_warmup`,
+`get_last_dispatched_kernel`) are described under "What this fork
+changes vs upstream" above and in [`CLAUDE.md`](./CLAUDE.md) "The
+consumer surface." Routing policy is the consumer's responsibility;
+sage-fork stays primitive.
