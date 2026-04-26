@@ -297,6 +297,151 @@ sufficient.
 
 ## Versions
 
+### v0.3.1 -- 2026-04-26  (mask-gap follow-ups: soft-warn + K-ratio probe)
+
+Two follow-ups graded against the load-bearing-metric framework added
+to CLAUDE.md this session. Both pass the "ship now" bar; one
+deliberate deferral got grounded in actual measurement instead of
+hand-wave.
+
+#### Added
+
+- **Soft-warn from CUDA wrappers when `attn_mask` is passed.**
+  `sageattn_qk_int8_pv_fp16_cuda`, `sageattn_qk_int8_pv_fp8_cuda`,
+  and `sageattn_qk_int8_pv_fp8_cuda_sm90` now call a shared helper
+  (`_warn_if_mask_passed_to_cuda_kernel`) that emits a one-time
+  `warnings.warn` per source location when a non-None `attn_mask`
+  reaches the wrapper. The dispatcher routes masked calls to triton
+  automatically since v0.3.0; this guard catches consumers that
+  bypass the dispatcher and hand-pick a `_cuda` kernel directly.
+  Soft (warn, not raise) so consumers who defensively pass
+  `attn_mask=None` aren't penalized -- the warn fires only on real
+  masks. Python's default warning filter dedupes by source line, so
+  long iteration loops emit one warning total per location, not one
+  per call. Test:
+  `tests/test_dispatched_kernel_telemetry.py::test_hand_picked_cuda_kernel_warns_when_mask_passed`.
+  This was the deferred Solution C from v0.3.0's audit; ship-now
+  reasoning recorded in the audit doc.
+- **K-ratio probe row in the LTX bench.** New shape
+  `cross_attn_unmasked_kv226_kratio_probe` in
+  `tests/test_sageattn_ltx_shapes.py`. Same shape as
+  `cross_attn_text_kv226` (the typical LTX text-encoder padded length)
+  but with no mask. Lets us read off
+  `K = triton_masked_ms / fp8++_unmasked_ms` directly from the bench
+  output. K is the speedup ceiling for the deferred Backlog item
+  "Add mask support to the sm80/sm89 CUDA kernels"; without a probe
+  row, K was unmeasurable and the trigger could never fire. **First
+  measurement (RTX 4090 / sm89 / CUDA 13.0 / torch 2.11):** K ≈ 1.68
+  at kv=226 (triton 0.79 ms vs fp8++ unmasked 0.47 ms), K ≈ 2.0 at
+  kv=1024. Both below the framework's 5x trigger; the deferred kernel
+  work stays deferred, with an actual number behind it now.
+
+#### Changed
+
+- **CLAUDE.md "Performance research" section** -- the
+  unmasked-vs-masked timing-gap framework item now names the K-probe
+  row and records the measurement (see Added). Re-measure after any
+  kernel-side change that lands on the unmasked cross-attn path.
+
+#### Verified, no action
+
+- **Dispatcher fix end-to-end.** Re-running the LTX bench post-fix
+  shows `auto` rows on every masked cross-attn shape now matching
+  the `fp16_triton` row to the precision the bench prints
+  (mean_rtol 0.0392 / median_ms 0.79 at kv=226; same pattern at
+  kv ∈ {32, 64, 128, 512, 1024}). Pre-fix `auto` would have mirrored
+  `fp8_cuda++`'s broken fingerprint exactly.
+
+#### Still deferred (with concrete reopen-trigger)
+
+- **D: tighten `**kwargs` to explicit named parameters.** Re-evaluated
+  this session; bigger than initially scoped. The dispatcher
+  legitimately needs `**kwargs` for forward-compat (kernel-specific
+  knobs like `pv_accum_dtype` that callers may want to override).
+  Tightening per-kernel signatures creates a real conflict with
+  dispatcher-forwarded kwargs. Real API design question with no
+  current pain. Trigger unchanged: next time we touch these
+  signatures for an unrelated reason.
+- **Native CUDA-kernel mask support.** K-probe measurement (above)
+  shows K ≈ 1.68-2.0 across the LTX cross-attn kv range. Days of
+  kernel work for at most ~2x speedup on a path that's already
+  sub-millisecond per call. Trigger is now grounded in a concrete
+  per-bench measurement: re-evaluate when K > 5x at a shape a
+  consumer actually hits.
+
+### v0.3.0 -- 2026-04-26  (dispatcher mask routing -- correctness fix)
+
+Closes the load-bearing inconsistency between what the fork documented
+and what the dispatcher did. README and CLAUDE.md had claimed for
+months that `sageattn()` "routes masked calls to the Triton kernel
+transparently." The code routed purely by GPU arch and silently
+dropped `attn_mask` on every CUDA path. A consumer-side workaround
+covered the gap in practice; this version moves the fix to the right
+layer (the dispatcher) so every consumer gets it without re-implementing.
+
+Audit trail in `internal/audit_2026-04-26.md` (gitignored) -- captures
+how the gap was missed, the alternatives considered, and the
+revisit-triggers for the deferred items (loud-raise on hand-picked
+CUDA kernels with masks; tightening the `**kwargs` surface; native
+CUDA-kernel mask support).
+
+#### Fixed
+
+- **`sageattention/core.py::sageattn`** -- the top-level dispatcher
+  now extracts `attn_mask` from `**kwargs` before the arch branch and
+  short-circuits to `sageattn_qk_int8_pv_fp16_triton` when it's
+  non-None, regardless of GPU arch. Unmasked calls dispatch by arch
+  exactly as before. `is_causal=True` still dispatches by arch (CUDA
+  kernels handle causal natively via `MaskMode::kCausal`); only
+  `attn_mask` triggers the triton route. Side effect: `**kwargs` is
+  now forwarded to every per-kernel call, so non-mask kwargs
+  (`smooth_k`, `qk_quant_gran`, etc.) stop being silently swallowed.
+- **End-to-end accuracy delta on cross-attn-with-mask shapes** (LTX
+  cross-attn kv=226 example): `sageattn(q, k, v, attn_mask=m)` mean
+  rtol drops from 0.4405 (broken: mask dropped, ran fp8++ unmasked)
+  to 0.0391 (correct: routed to fp16_triton). Bare
+  `sageattn_qk_int8_pv_fp8_cuda` still shows 0.44 -- the underlying
+  CUDA-kernel mask gap is unchanged; this version routes around it,
+  not through it. Known kernel bugs entry stays.
+
+#### Added
+
+- `tests/test_dispatched_kernel_telemetry.py::test_sageattn_dispatcher_routes_masked_calls_to_triton`
+  -- enforces the new routing rule. Calls `sageattn()` with a
+  text-padding-tail mask and asserts
+  `get_last_dispatched_kernel() == 'fp16_triton'`. Failed red on the
+  pre-fix dispatcher (recorded `'fp8_cuda++'`); passes green after
+  the fix. Lives next to the existing dispatcher test so the next
+  reader sees both the masked and unmasked invariants enforced
+  side by side.
+
+#### Changed
+
+- **CLAUDE.md "The consumer surface"** -- the dispatcher's mask
+  behavior is now described as a real implementation with a test
+  reference, not as an aspirational claim. Cross-link to the audit
+  doc + the new test added.
+- **README.md** -- rewrite covering what changed, why, what was
+  measured, and what tradeoffs the fork carries. The mask-gap
+  language now describes the post-fix behavior (dispatcher routes;
+  hand-picked CUDA kernels still drop). No-hype framing, numbers
+  cited from `internal/log/log_2026-04-25.md` and the bench harness
+  output.
+
+#### Why this wasn't done sooner
+
+The mask gap was discovered 2026-04-23 via the LTX-shape harness's
+cross-attn rtol scaling signature. A consumer-side workaround
+(downstream ComfyUI node patching the model's attention with a
+mask-aware router) landed the same week because that was the fastest
+path to a correct render. README + CLAUDE.md picked up an aspirational
+"the dispatcher does this transparently" framing that drifted
+unchallenged because no test enforced it. The fix here is small (~10
+lines) and would have landed earlier if the dispatcher's mask
+behavior had been pinned by a test from day one. The new test in this
+version exists specifically to prevent the same kind of doc/code
+drift from happening again.
+
 ### v0.2.0 -- 2026-04-25  (bench instrumentation, image-shape split, telemetry tooling)
 
 A coherent chunk of measurement-surface work: the LTX-shape harness gained

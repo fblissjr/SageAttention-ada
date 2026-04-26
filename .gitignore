@@ -177,6 +177,7 @@ cython_debug/
 
 # personal internal notes (not for sharing)
 internal/
+coderef/
 
 # personal claude notes (not for sharing)
 .claude.local.md

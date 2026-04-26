@@ -266,26 +266,40 @@ will need `git push --force-with-lease origin main`.
 
 Sage exposes two surfaces to downstream consumers:
 
-1. **`sageattn()` top-level dispatcher.** Picks a kernel based on the
-   detected arch + CUDA version. On sm89 + CUDA >= 12.8: lands on
-   `sageattn_qk_int8_pv_fp8_cuda` with `pv_accum_dtype="fp32+fp16"`
-   (sage 2++). Routes masked calls to the Triton kernel transparently,
-   which is the only mask-correct path (see CHANGELOG / Known kernel
-   bugs). Most consumers should call this and let dispatch decide.
+1. **`sageattn()` top-level dispatcher.** Picks a kernel based on
+   `(detected arch, CUDA version, mask presence)`. On sm89 + CUDA >=
+   12.8 with no mask: lands on `sageattn_qk_int8_pv_fp8_cuda` with
+   `pv_accum_dtype="fp32+fp16"` (sage 2++). With `attn_mask` passed:
+   routes to `sageattn_qk_int8_pv_fp16_triton` regardless of arch,
+   because that's the only mask-correct path (see CHANGELOG / Known
+   kernel bugs). Implementation: `sageattention/core.py::sageattn`
+   pulls `attn_mask` out of `**kwargs` before the arch branch and
+   short-circuits to triton when non-None. The mask-routing claim is
+   enforced by a test
+   (`tests/test_dispatched_kernel_telemetry.py::test_sageattn_dispatcher_routes_masked_calls_to_triton`)
+   that fails the moment the dispatcher reverts to arch-only routing.
+   **Most consumers should just call this and let dispatch decide.**
 2. **Specific kernel exports** -- `sageattn_qk_int8_pv_fp16_cuda`,
    `sageattn_qk_int8_pv_fp8_cuda`, `sageattn_qk_int8_pv_fp16_triton`,
    etc. Bypass the dispatcher; the caller picks. **Masked attention
    only works with `_fp16_triton`**; passing `attn_mask` to a `_cuda`
    kernel silently drops the mask and produces numerically wrong
-   output. A consumer that mixes masked + unmasked calls in one
-   forward should either route by mask presence (use `_fp16_triton`
-   when `attn_mask is not None`, anything else otherwise) or just
-   call the dispatcher.
+   output. The CUDA wrappers accept `attn_mask` via `**kwargs` (a
+   pre-existing upstream signature shape) but never read it. If a
+   consumer is hand-picking a CUDA kernel and also passing a mask,
+   that's a consumer bug -- the dispatcher is the safe default.
 
-Routing policy is the consumer's responsibility. Sage-fork stays
-primitive: kernels only, no policy. We validate the bench harness
-here; we test the policy interaction in private downstream consumer
-repos that aren't part of this fork.
+The dispatcher's mask-routing fix landed v0.3.0 (2026-04-26). Prior
+to that the dispatcher routed purely by arch and silently dropped
+`attn_mask` -- the docs claimed otherwise but the code didn't match.
+See `internal/audit_2026-04-26.md` for the audit trail. If we ever
+add a kernel-side mask implementation (Backlog item), the dispatcher
+gets a second look: it's possible we'd want `attn_mask` to land on
+the native CUDA path for some shapes once the mask kernel exists.
+
+Beyond mask routing, sage-fork stays primitive. The bench harness
+lives here; consumer-facing routing policy beyond the mask gap (e.g.
+shape-specific kernel preference) belongs in the consumer.
 
 ## If we ever need to fix a sage bug ourselves
 
@@ -320,6 +334,220 @@ positives:
 
 If pyright flags something inside code we actually added and it
 looks substantive, investigate. Otherwise skip.
+
+## Performance research: the load-bearing metric
+
+When you're trying to make this fork perform better, ALL perf
+decisions on the sm89 box are graded against one row of one test:
+
+```
+tests/test_sageattn_ltx_shapes.py
+  shape: self_attn_large_704x704x497  (B=1, H=32, Sq=Skv=31776, D=64, no mask, bf16)
+  mode:  fp8_cuda++
+  -> primary perf metric: median_ms (today: 19.95 ms)
+  -> accuracy guard:      mean_rtol ≤ 0.10 (today: ~0.097)
+```
+
+Anything else you might want to measure is secondary, useful as a
+guard against side effects, or explicitly ignored — see below.
+
+### Why this is the metric (the load-bearing reasoning)
+
+The chain matters; if any link breaks, the metric moves.
+
+1. **LTX self-attn at 31776×31776 dominates real gen wall-time.**
+   On LTX-2.3 video gen, this single attention shape accounts for
+   the overwhelming majority of attention cost per step. Cross-attn
+   kv ≤ 1024 is sub-millisecond per call; image-gen shapes
+   (head_dim ∈ {120, 128}) are 1-2 ms. The 31776×31776 row is where
+   milliseconds compound into seconds of gen time.
+2. **`fp8_cuda++` is what `sageattn()` picks on sm89 + CUDA ≥ 12.8
+   unmasked.** That's the consumer's actual hot path — the
+   dispatcher routes there for self-attn after the v0.3.0 mask-aware
+   fix. Optimizing a kernel that the dispatcher doesn't pick is
+   research that doesn't ship.
+3. **The fp8++ kernel is where every plausible perf change lands.**
+   Edits to `csrc/qattn/sm89_qk_int8_sv_f8_*.cu`,
+   `sageattention/quant.py` (per-block / per-warp INT8 quant), the
+   fp8 V-quant `scale_max` in `core.py:772-774`, or the SM89 PV
+   accumulator variants all show up on this row. Triton-side
+   changes show up only on the cross-attn rows.
+4. **The README's "<0.1 mean rtol" promise is the accuracy ceiling.**
+   If a perf change pushes mean_rtol > 0.10, the fork's documented
+   accuracy floor is gone. That's not a tradeoff to make silently;
+   it's a re-pitching of the fork.
+
+### How we measure it
+
+`tests/test_sageattn_ltx_shapes.py` is the only thing you need to
+run. The bench's `time_median_ms` does 1 warmup + median over 3 runs
+to kill within-session noise; absolute median_ms is the
+within-session signal you optimize against during a research sitting.
+
+For comparing across sessions (after a torch / triton / CUDA / driver
+bump, or after a cold boot), use the **`torch_flash / sage_fp8++`
+ratio** instead of absolute time (today: 2.62x). The ratio
+normalizes against driver-thermal drift, which is on the order of
+1-2% across cold boots even with no code changes — see CHANGELOG's
+cu128→cu130 transition note. If absolute fp8++ time drifts but the
+ratio holds, it's the box, not the code.
+
+Bench env (torch / triton / CUDA / sage rev) pinned to
+`internal/bench_env_<date>.txt`; resnapshot after any version bump
+per "Bench env discipline" below.
+
+### How we detect unintended side effects
+
+The harness already prints every check side-by-side in one run. Read
+all of these every time you change a kernel — don't tunnel-vision on
+the primary row.
+
+- **All 5 sage kernels + 3 torch backends on every shape.** A change
+  that helps fp8++ but hurts fp16_cuda or fp16_triton means you
+  shifted a knob that's shared between code paths; either intentional
+  or a foot-gun.
+- **The cross-attn-with-mask kv sweep (32, 64, 128, 226, 512, 1024).**
+  Catches regressions in the masked path. Pre-v0.3.0 the dispatcher
+  silently dropped masks here; now it routes to triton. The triton
+  row's rtol should stay ≈0.04 across the sweep; CUDA rows stay
+  pinned at the documented mask-bug fingerprint (0.94→0.13).
+- **The cross-kernel `fp8++ vs triton` rtol row** (unmasked shapes
+  only). Should sit ≈0.10 — quadrature of each kernel's independent
+  ~0.04 / ~0.09 vs SDPA. If it spikes above 0.15, a kernel-internal
+  numerical change broke the cross-kernel agreement, even if neither
+  kernel's solo rtol-vs-SDPA changed.
+- **Image-gen shapes** in `tests/test_sageattn_image_shapes.py`
+  (head_dim=120 Z-Image, head_dim=128 Flux). A kernel change keyed on
+  head_dim=64 might silently break the non-power-of-2 d=120 path.
+- **Dispatcher telemetry** (`tests/test_dispatched_kernel_telemetry.py`).
+  Verifies routing invariants — the `auto` row matching the wrong
+  kernel name post-change is the v0.3.0 mask-routing regression
+  signal in primitive form.
+- **`tests/run_all.sh`** runs all of the above in one shot. Use it
+  before declaring a perf change done.
+
+### How we use the metric to pick what to try next
+
+The bench output is also a diagnostic for where to spend the next
+research hour. Five patterns to look for:
+
+1. **Where kernels disagree on rtol, the gap is the optimization
+   target.** If fp8_cuda++ shows 0.097 rtol at 19.95ms and fp16_cuda
+   shows 0.04 rtol at ~22ms, the 0.057 rtol delta is "FP8
+   quantization cost." The research question becomes: is there a
+   variant of fp8 quant (scale_max, granularity, per-block Q mean,
+   etc.) that closes some of that gap at similar speed? If you
+   measure two fp8 variants and they're indistinguishable in rtol,
+   you're at the FP8 information floor and should look elsewhere.
+2. **Where kernels agree, you're at the numeric floor — stop
+   optimizing the kernel and look elsewhere.** Two kernels with
+   different code paths producing the same number means the
+   underlying numerics, not the implementation, is the bottleneck.
+   Move up the stack: torch.compile around sage, fusion with
+   adjacent ops, model-side activation reformulation.
+3. **Speedup-ratio degradation tells you which torch path got
+   better.** If `torch_flash / sage_fp8++` drops from 2.62x to 1.8x
+   on a future torch release, torch closed gap somewhere — check
+   the `torch_flash`, `torch_eff`, `torch_cudnn` row that improved
+   most and figure out what changed. That's where fp8++ is leaving
+   perf on the table.
+4. **Outliers in the kv sweep are kernel-boundary effects.** A
+   cross-attn rtol that breaks the smooth `1/seq_kv` trend at one
+   specific kv is a block-size or autotune-config artifact. Target
+   the outlier with a focused experiment; don't change global
+   defaults.
+5. **The unmasked-vs-masked timing gap quantifies the deferred CUDA
+   mask kernel.** Today triton is the only mask-correct path; if
+   `triton @ kv=N` is K× slower than `fp8++ @ kv=N` (unmasked) at
+   the same shape, K is the speedup ceiling for the deferred Backlog
+   item "Add mask support to the sm80/sm89 CUDA kernels." If K < 2x,
+   the kernel work probably isn't worth days of effort. If K > 5x at
+   shapes the consumer actually hits, the trigger fires. The probe
+   row `cross_attn_unmasked_kv226_kratio_probe` in
+   `tests/test_sageattn_ltx_shapes.py` exists specifically so K is
+   measurable -- it pairs with `cross_attn_text_kv226` (same shape,
+   masked) so K = triton_masked_ms / fp8++_unmasked_ms is just two
+   numbers from the bench output. **Measured 2026-04-26:** K ≈ 1.68
+   at kv=226, K ≈ 2.0 at kv=1024 -- both below the 5x trigger, so
+   the deferred kernel work is not perf-justified today. Re-measure
+   after every kernel-side optimization that lands on the unmasked
+   cross-attn path; if fp8++ at small kv gets meaningfully faster,
+   K grows and the trigger could fire even with no triton change.
+
+### What we explicitly ignore — and the trigger that would change that
+
+These rows print every run; we don't optimize against them today.
+Each one comes with a re-evaluation trigger so we don't keep
+ignoring them after the world changes.
+
+- **`fp8++ vs triton` cross-kernel rtol row as a perf signal.**
+  It's a consistency check, not a speed measurement. **Trigger to
+  care:** the row spikes above 0.15, indicating mixed-route
+  consumer forward passes are now seeing a discontinuity beyond
+  combined-noise.
+- **Cross-attn-with-mask perf rows.** Triton at sub-millisecond is
+  already fast enough that perf wins on this path don't move real
+  gen time. **Trigger to care:** a downstream consumer's per-call
+  JSONL trace, aggregated over a real production gen, reports
+  masked-triton as >5% of total gen wall-time. (See CHANGELOG
+  Recurring process items / "Session-level attention telemetry
+  summary.")
+- **Image-gen perf rows.** Already 1.7-2.1x faster than `torch_flash`
+  on Flux + Z-Image-Turbo; not the hot path for the sm89 box's
+  primary workload. **Trigger to care:** a new model class lands
+  with shapes that show < 1.3x speedup, or a consumer reports image
+  gen wall-time is now attention-bound.
+- **`torch_eff` and `torch_cudnn` rows.** Regression telemetry for
+  "is sage still load-bearing as a fork?" — not a perf signal for
+  sage changes. **Trigger to care:** sage's speedup ratio drops below
+  1.5x on the primary row, which triggers a "is the fork still worth
+  maintaining?" review rather than a perf experiment.
+- **Spike `tests/spike_torch_compile.py` perf delta.** Verdict on
+  torch 2.11: keep the consumer-side `torch.compiler.disable()`.
+  **Trigger to care:** re-run after any torch upgrade; the spike
+  itself records the reopen condition (bounded rtol AND measurable
+  speedup).
+
+### What we might be wrong about (the framework is V1)
+
+This metric reflects the workload mix on this box as of 2026-04-26.
+We may be wrong in ways that take time to surface; record the
+disconfirming evidence rather than wait for it to be obvious.
+
+- **The "LTX self-attn dominates" assumption is workload-specific.**
+  If a new model class with fundamentally different attention
+  patterns (very short autoregressive seq, sliding-window, MQA/GQA
+  with very different head ratios) becomes the primary use case, the
+  load-bearing shape moves and the metric should be re-derived.
+  Disconfirming signal: a downstream-consumer telemetry summary
+  showing a non-LTX-class shape consuming > 30% of gen attention
+  time.
+- **Mean rtol is a proxy for "does the output look right," not the
+  truth.** A perf change that improves mean_rtol but visibly
+  degrades a real render fails the spirit of the guard. We don't
+  currently have a perceptual eval in this repo (it'd be a new
+  bench, probably keyed on per-frame structural similarity vs an
+  fp32 reference render). If we ever ship a kernel change that
+  passes the rtol guard but causes a consumer-reported visual
+  regression, the rtol guard isn't the right floor and we need to
+  add the perceptual layer.
+- **Kernel ms is not gen ms.** A 2x kernel speedup is invisible
+  end-to-end if attention is already < 50% of step time. We don't
+  measure end-to-end here (it's downstream-consumer telemetry); a
+  refinement would be a `gen_wall_time / attention_kernel_time`
+  ratio captured per-render, so kernel improvements get an
+  end-to-end translation factor. Until then, a "this saved 5ms per
+  call" claim should be paired with "and we observed a real LTX gen
+  go from X seconds to Y seconds" before ranking high.
+- **The "find next experiment" framework above is forward-looking;
+  we haven't run a perf experiment through it yet.** The first time
+  we use it to pick a direction and either succeed or fail, the
+  framework gets refined. Treat the five patterns as starting
+  hypotheses, not validated playbook.
+
+If any of the above bullets fires (disconfirming signal observed),
+update this section and record the change in the session log so the
+re-derivation is auditable later.
 
 ## Bench env discipline
 

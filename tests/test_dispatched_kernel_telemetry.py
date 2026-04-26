@@ -77,6 +77,29 @@ def test_sageattn_dispatcher_records_fp8_pp_on_sm89():
     print(f"ok  sageattn() dispatcher recorded {got!r}")
 
 
+def test_sageattn_dispatcher_routes_masked_calls_to_triton():
+    # The CUDA kernels silently drop attn_mask (pybind never wired the
+    # parameter through; MaskMode enum only has {kNone, kCausal}). The
+    # Triton kernel is the only mask-correct path. The dispatcher must
+    # route masked calls there regardless of arch -- and this is the
+    # test that enforces the "sageattn() handles the mask gap so
+    # consumers don't have to" claim from CLAUDE.md / README. If this
+    # test fails, the dispatcher reverted to arch-only routing and
+    # masked calls produce silently wrong output.
+    _reset_dispatch_for_test()
+    q, k, v = _make_qkv()
+    mask = torch.ones(q.shape[0], q.shape[1], q.shape[2], k.shape[2],
+                       device=q.device, dtype=torch.bool)
+    mask[..., -16:] = False  # the typical text-padding-tail shape
+    _ = sageattn(q, k, v, attn_mask=mask, is_causal=False)
+    got = get_last_dispatched_kernel()
+    assert got == KERNEL_FP16_TRITON, (
+        f"sageattn() with attn_mask must route to {KERNEL_FP16_TRITON!r} "
+        f"(only mask-correct path), got {got!r}"
+    )
+    print(f"ok  sageattn() masked call routed to {got!r}")
+
+
 def test_direct_triton_call_records_fp16_triton():
     _reset_dispatch_for_test()
     q, k, v = _make_qkv()
@@ -113,6 +136,70 @@ def test_fp8_cuda_variant_records_correct_subname():
         f"{KERNEL_FP8_CUDA_FP32!r}, got {got!r}"
     )
     print(f"ok  fp8_cuda(fp32+fp32) variant recorded {got!r}")
+
+
+def test_sageattn_dispatcher_honors_pv_accum_dtype_override():
+    # Regression test: v0.3.1 added **kwargs forwarding from the
+    # dispatcher to per-kernel calls. Without care, a consumer passing
+    # `pv_accum_dtype="fp32+fp32"` would TypeError ("got multiple
+    # values for keyword argument") because the dispatcher's explicit
+    # pv_accum_dtype= collides with the same key in **kwargs.
+    # The dispatcher uses kwargs.setdefault so consumer overrides win
+    # cleanly; this test pins that behavior.
+    _reset_dispatch_for_test()
+    q, k, v = _make_qkv()
+    _ = sageattn(q, k, v, is_causal=False, pv_accum_dtype="fp32+fp32")
+    got = get_last_dispatched_kernel()
+    assert got == KERNEL_FP8_CUDA_FP32, (
+        f"sageattn(pv_accum_dtype='fp32+fp32') on sm89 should override "
+        f"the dispatcher's default and record "
+        f"{KERNEL_FP8_CUDA_FP32!r}, got {got!r}"
+    )
+    print(f"ok  sageattn() honors pv_accum_dtype override -> {got!r}")
+
+
+def test_hand_picked_cuda_kernel_warns_when_mask_passed():
+    # The dispatcher routes masked calls to triton automatically. A
+    # consumer that bypasses the dispatcher and hand-picks a _cuda
+    # kernel directly (e.g. for benchmarking, or because they're
+    # mirroring a known shape decision) should get a loud warning if
+    # they ALSO pass attn_mask -- the kernel silently drops it and
+    # the output is numerically wrong. Soft warn (warnings.warn) so
+    # consumers that defensively pass attn_mask=None aren't penalized.
+    import warnings as _w
+
+    _reset_dispatch_for_test()
+    q, k, v = _make_qkv()
+    mask = torch.ones(q.shape[0], q.shape[1], q.shape[2], k.shape[2],
+                       device=q.device, dtype=torch.bool)
+    mask[..., -16:] = False
+
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        _ = sageattn_qk_int8_pv_fp8_cuda(
+            q, k, v, is_causal=False, attn_mask=mask, pv_accum_dtype="fp32+fp32",
+        )
+    masked_warns = [w for w in caught if "attn_mask" in str(w.message)]
+    assert len(masked_warns) >= 1, (
+        f"hand-picked _cuda kernel + non-None attn_mask must warn; "
+        f"caught warnings: {[str(w.message) for w in caught]}"
+    )
+    print(f"ok  hand-picked _cuda kernel warns on non-None attn_mask "
+          f"({len(masked_warns)} warning emitted)")
+
+    # And conversely: passing attn_mask=None must NOT warn (the
+    # defensive-None-pass case the soft-warn is designed to spare).
+    with _w.catch_warnings(record=True) as caught_none:
+        _w.simplefilter("always")
+        _ = sageattn_qk_int8_pv_fp8_cuda(
+            q, k, v, is_causal=False, attn_mask=None, pv_accum_dtype="fp32+fp32",
+        )
+    masked_warns_none = [w for w in caught_none if "attn_mask" in str(w.message)]
+    assert len(masked_warns_none) == 0, (
+        f"hand-picked _cuda kernel + attn_mask=None must NOT warn; "
+        f"caught: {[str(w.message) for w in caught_none]}"
+    )
+    print(f"ok  hand-picked _cuda kernel + attn_mask=None does not warn")
 
 
 def test_thread_isolation():
@@ -159,9 +246,12 @@ def main() -> int:
     test_helper_is_exported_from_package()
     test_initial_value_is_none()
     test_sageattn_dispatcher_records_fp8_pp_on_sm89()
+    test_sageattn_dispatcher_routes_masked_calls_to_triton()
     test_direct_triton_call_records_fp16_triton()
     test_direct_fp16_cuda_call_records_fp16_cuda()
     test_fp8_cuda_variant_records_correct_subname()
+    test_sageattn_dispatcher_honors_pv_accum_dtype_override()
+    test_hand_picked_cuda_kernel_warns_when_mask_passed()
     test_thread_isolation()
     print()
     print("all dispatched-kernel telemetry tests passed.")

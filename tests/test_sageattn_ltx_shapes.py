@@ -69,6 +69,16 @@ SHAPES = [
     Shape("cross_attn_text_kv226",         1, 32, 31776,   226, 64, True),
     Shape("cross_attn_text_kv512",         1, 32, 31776,   512, 64, True),
     Shape("cross_attn_text_kv1024",        1, 32, 31776,  1024, 64, True),
+    # K-ratio probe for the deferred "native CUDA mask kernel" Backlog
+    # item. Same shape as cross_attn_text_kv226 (the typical LTX
+    # text-encoder padded length) but with no mask -- lets us read
+    # K = triton_masked_ms / fp8_cuda++_unmasked_ms at production-
+    # relevant kv. The framework in CLAUDE.md says K > 5x at shapes
+    # the consumer hits is the trigger to invest days of kernel work;
+    # without this row the trigger can never fire because we'd have
+    # no number to compare. CLAUDE.md / "Performance research" /
+    # "How we use the metric to pick what to try next" item 5.
+    Shape("cross_attn_unmasked_kv226_kratio_probe", 1, 32, 31776, 226, 64, False),
     # Non-LTX generality check: wide-V distribution stresses fp8 range.
     # Relevant for the v-scale default question (core.py:772): the
     # sm89 fp8_cuda path uses scale_max=448 by default; the ++ variant

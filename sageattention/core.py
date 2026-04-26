@@ -123,6 +123,34 @@ def _reset_dispatch_for_test() -> None:
         del _dispatch_state.last
 
 
+def _warn_if_mask_passed_to_cuda_kernel(kwargs: dict, kernel_label: str) -> None:
+    """Soft-warn when a consumer hand-picks a CUDA kernel and passes a
+    non-None `attn_mask`. The CUDA kernels in this lineage silently
+    drop masks (pybind layer never wires them through; the C++
+    `MaskMode` enum only handles `{kNone, kCausal}`), so the call
+    runs unmasked and produces numerically wrong output. The
+    dispatcher `sageattn()` routes masked calls to the Triton kernel
+    automatically as of v0.3.0; this guard catches consumers that
+    bypass the dispatcher and pick a `_cuda` kernel directly with a
+    mask. Soft warning (not raise) so consumers that defensively pass
+    `attn_mask=None` aren't penalized -- the warn fires only when the
+    mask is real. Python's default warning filter dedupes by source
+    line, so a long iteration loop emits one warning total per
+    process+location. Reference: internal/audit_2026-04-26.md."""
+    mask = kwargs.get("attn_mask")
+    if mask is not None:
+        # Frames: warnings.warn (1) -> _warn_if_mask_passed_to_cuda_kernel (2)
+        # -> the per-kernel wrapper body (3) -> the consumer's call site (4).
+        warnings.warn(
+            f"{kernel_label}: attn_mask was passed but this kernel does "
+            f"not implement masked attention -- the mask is silently "
+            f"dropped and the output is numerically wrong. Use "
+            f"sageattn_qk_int8_pv_fp16_triton for masked calls, or call "
+            f"sageattn() and let the dispatcher route by mask presence.",
+            stacklevel=4,
+        )
+
+
 def get_cuda_version():
     version = torch.version.cuda
     major, minor = version.split('.')
@@ -203,30 +231,63 @@ def sageattn(
     - ``num_qo_heads`` must be divisible by ``num_kv_heads``.
     - The tensors `q`, `k`, and `v` must have the dtype ``torch.float16`` or ``torch.bfloat16``
     - All tensors must be on the same cuda device.
+    - If `attn_mask` is passed (non-None), the call is routed to the
+      Triton kernel regardless of GPU arch. The CUDA kernels in this
+      lineage (sage 2.x sm80/sm89, sage 3 Blackwell) silently drop
+      `attn_mask` -- their pybind layer never wires it through and the
+      C++ `MaskMode` enum only handles `{kNone, kCausal}`. The Triton
+      kernel `sageattn_qk_int8_pv_fp16_triton` is the only mask-correct
+      path; this dispatcher routes there so consumers don't have to
+      re-implement that decision. `is_causal=True` is unaffected and
+      continues to dispatch by arch (CUDA kernels handle causal mode
+      natively via `MaskMode::kCausal`).
     """
-        
+
+    # Route masked calls to the only mask-correct kernel. attn_mask
+    # arrives via **kwargs because the upstream signature exposes it
+    # there; we explicitly extract it so the rest of the function can
+    # forward the remaining kwargs without double-passing.
+    attn_mask = kwargs.pop("attn_mask", None)
+    if attn_mask is not None:
+        return sageattn_qk_int8_pv_fp16_triton(
+            q, k, v,
+            tensor_layout=tensor_layout, is_causal=is_causal,
+            attn_mask=attn_mask, sm_scale=sm_scale, return_lse=return_lse,
+            **kwargs,
+        )
+
+    # Use setdefault so any kernel-specific kwarg the consumer passed
+    # explicitly (e.g. pv_accum_dtype, qk_quant_gran) wins over the
+    # dispatcher's default. Without this, dispatcher-set kwargs would
+    # collide with the same key in **kwargs and raise TypeError on
+    # forwarding -- a bug introduced by the v0.3.1 kwargs-forwarding
+    # change. Override-wins matches Python's standard "caller-explicit
+    # beats callee-default" convention.
     arch = _cuda_archs[q.device.index]
     if arch == "sm75":
-        return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse)
+        return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, **kwargs)
     elif arch in {"sm80", "sm86", "sm87"}:
-        return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
+        kwargs.setdefault("pv_accum_dtype", "fp32")
+        return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, **kwargs)
     elif arch == "sm89":
         if get_cuda_version() < (12, 8):
-            pv_accum_dtype = "fp32+fp32"
+            kwargs.setdefault("pv_accum_dtype", "fp32+fp32")
         else:
             # SageAttention2++
-            pv_accum_dtype = "fp32+fp16"
-        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype=pv_accum_dtype)
+            kwargs.setdefault("pv_accum_dtype", "fp32+fp16")
+        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, **kwargs)
     elif arch == "sm90":
-        return sageattn_qk_int8_pv_fp8_cuda_sm90(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp32")
+        kwargs.setdefault("pv_accum_dtype", "fp32+fp32")
+        return sageattn_qk_int8_pv_fp8_cuda_sm90(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, **kwargs)
     elif arch in {"sm100", "sm120", "sm121"}:
         if get_cuda_version() < (12, 8):
             # sm120 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm120.
-            pv_accum_dtype = "fp32"
+            kwargs.setdefault("pv_accum_dtype", "fp32")
         else:
             # SageAttention2++
-            pv_accum_dtype = "fp32+fp16"
-        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype=pv_accum_dtype)
+            kwargs.setdefault("pv_accum_dtype", "fp32+fp16")
+        kwargs.setdefault("qk_quant_gran", "per_warp")
+        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, **kwargs)
     else:
         raise ValueError(f"Unsupported CUDA architecture: {arch}")
 
@@ -607,6 +668,8 @@ def sageattn_qk_int8_pv_fp16_cuda(
     assert q.device == k.device == v.device, "All tensors must be on the same device."
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
 
+    _warn_if_mask_passed_to_cuda_kernel(kwargs, "sageattn_qk_int8_pv_fp16_cuda")
+
     _tensor_layout = 0 if tensor_layout == "NHD" else 1
     _is_caual = 1 if is_causal else 0
     _qk_quant_gran = 3 if qk_quant_gran == "per_thread" else 2
@@ -786,6 +849,8 @@ def sageattn_qk_int8_pv_fp8_cuda(
     assert q.device == k.device == v.device, "All tensors must be on the same device."
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
 
+    _warn_if_mask_passed_to_cuda_kernel(kwargs, "sageattn_qk_int8_pv_fp8_cuda")
+
     _tensor_layout = 0 if tensor_layout == "NHD" else 1
     _is_caual = 1 if is_causal else 0
     _qk_quant_gran = 3 if qk_quant_gran == "per_thread" else 2
@@ -962,6 +1027,8 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
     assert qk_quant_gran in ["per_warp", "per_thread"], "qk_quant_gran must be either 'per_warp' or 'per_thread'."
     assert q.device == k.device == v.device, "All tensors must be on the same device."
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
+
+    _warn_if_mask_passed_to_cuda_kernel(kwargs, "sageattn_qk_int8_pv_fp8_cuda_sm90")
 
     _tensor_layout = 0 if tensor_layout == "NHD" else 1
     _is_caual = 1 if is_causal else 0
