@@ -214,8 +214,23 @@ telemetry test; multiple GiB for the LTX bench).
   it") a public-API doc claimed "X is used by Y" or "dispatcher does
   Z" — both turned out to be aspirational, not implemented. One
   `grep -r "<api_name>" coderef/` for consumer call sites + a quick
-  read of the dispatch code catches this in seconds. Audit trail in
-  `internal/audit_2026-04-26.md`.
+  read of the dispatch code catches this in seconds. **Use `coderef/`
+  proactively as a verification surface, not just reactively at
+  audit time.** Audit trail in `internal/audit_2026-04-26.md`.
+- **Run `/simplify` after every substantive arc, not just at session
+  end.** Three passes one session caught: a real `TypeError` in
+  v0.3.1 kwargs forwarding, two SIGPIPE-under-pipefail bugs in bash
+  hooks, and several stale doc claims (mask routing, warmup API, two
+  `start.sh` references). Bug-density on a fresh diff is high enough
+  that one /simplify per coherent arc earns its cost.
+- **Record priors before measurement.** For any non-trivial
+  measurement (bench-fire, perceptual eval, ablation), commit the
+  expected result in writing before the measurement runs. "Did the
+  number confirm or surprise?" extracts more learning than "what was
+  the number?" The bilateral pre-bench briefing exercise this
+  session produced two priors (literature-estimate vs Amdahl-from-
+  exec-log); the more grounded one won, both sides aligned. Without
+  the commit-before-measuring step, post-hoc rationalization wins.
 
 ## What's ours vs what's upstream
 
@@ -605,6 +620,19 @@ disconfirming evidence rather than wait for it to be obvious.
 If any of the above bullets fires (disconfirming signal observed),
 update this section and record the change in the session log so the
 re-derivation is auditable later.
+
+### Pre-trigger briefing pattern
+
+For any user-gated trigger (currently: e2e bench run, perceptual
+data from downstream Phase 2.1), stage a pre-trigger brief BEFORE
+the trigger fires. Lives at `internal/brief_pre_<trigger>.md`
+(gitignored). Forces a state-audit that catches doc drift the
+regular audit pass misses — this caught a stale `start.sh` claim
+in `internal/runbook_bench_e2e_ltx.md` that would have misled an
+operator at bench-fire time. Format: recorded prior (commit before
+measuring, per the framework's "what we might be wrong about" item
+3), output expectations, durable context the other side would
+otherwise re-derive at trigger time.
 
 ## Bench env discipline
 
