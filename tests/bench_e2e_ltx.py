@@ -303,12 +303,43 @@ def set_sage_mode(prompt: dict, mode: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def sum_attn_us_in_window(trace_path: Path, ts_min: float, ts_max: float) -> tuple[int, float]:
-    """Sum elapsed_us over sage rows whose ts falls within [ts_min, ts_max].
+def sum_attn_us_for_prompt(trace_path: Path, prompt_id: str) -> tuple[int, float]:
+    """Sum elapsed_us over sage rows tagged with this prompt_id.
 
-    Returns (call_count, total_elapsed_us). Inclusive boundaries -- a row
-    on either edge belongs to this run; half-open windows misattribute the
-    first/last attention call of every prompt.
+    Preferred correlation primitive (consumer's commit 6a3be19 stamps
+    prompt_id on every trace row). No fence-post errors at run
+    boundaries; safe under parallel queue execution.
+
+    Returns (call_count, total_elapsed_us).
+    """
+    total_us = 0.0
+    n = 0
+    with trace_path.open("rb") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = orjson.loads(line)
+            except orjson.JSONDecodeError:
+                continue
+            if row.get("prompt_id") != prompt_id:
+                continue
+            elapsed = row.get("elapsed_us")
+            if elapsed is None:
+                continue
+            total_us += float(elapsed)
+            n += 1
+    return n, total_us
+
+
+def sum_attn_us_in_window(trace_path: Path, ts_min: float, ts_max: float) -> tuple[int, float]:
+    """Legacy correlation: ts-windowing fallback for traces that predate
+    the consumer's prompt_id stamp (commit 6a3be19, 2026-04-26).
+
+    Inclusive boundaries -- a row on either edge belongs to this run.
+    Susceptible to fence-post errors and parallel-queue misattribution;
+    use prompt_id correlation when rows carry it.
     """
     total_us = 0.0
     n = 0
@@ -371,14 +402,50 @@ def run_one(host: str, prompt: dict, mode: str, run_idx: int, client_id: str) ->
     return RunResult(mode, wall_s, ts_start, ts_end, pid)
 
 
-def attach_attn_times(results: list[RunResult], trace_path: Path | None) -> None:
-    """For each run, sum attention elapsed_us within its wall window."""
+def _trace_has_prompt_id(trace_path: Path) -> bool:
+    """Probe: does this trace file carry per-row prompt_id?
+
+    True when ANY non-event row has a `prompt_id` field. Lets the bench
+    auto-pick the correlation primitive without an explicit flag --
+    consumer commit 6a3be19 (2026-04-26) added the field, but older
+    trace files on disk may not have it yet.
+    """
+    with trace_path.open("rb") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = orjson.loads(line)
+            except orjson.JSONDecodeError:
+                continue
+            if row.get("event") in {"header", "summary"}:
+                continue
+            return "prompt_id" in row
+    return False
+
+
+def attach_attn_times(results: list[RunResult], trace_path: Path | None) -> str:
+    """For each run, fill in attn_calls + attn_total_ms from the sage trace.
+
+    Returns the correlation primitive used: "prompt_id" (preferred) or
+    "ts_window" (legacy fallback). Caller surfaces this in the report
+    so a reader can tell which mode was active.
+    """
     if trace_path is None or not trace_path.is_file():
-        return
+        return "none"
+    if _trace_has_prompt_id(trace_path):
+        for r in results:
+            n, total_us = sum_attn_us_for_prompt(trace_path, r.prompt_id)
+            r.attn_calls = n
+            r.attn_total_ms = total_us / 1000.0
+        return "prompt_id"
+    # Pre-6a3be19 traces: fall back to ts windowing.
     for r in results:
         n, total_us = sum_attn_us_in_window(trace_path, r.ts_start, r.ts_end)
         r.attn_calls = n
         r.attn_total_ms = total_us / 1000.0
+    return "ts_window"
 
 
 # ---------------------------------------------------------------------------
@@ -386,10 +453,12 @@ def attach_attn_times(results: list[RunResult], trace_path: Path | None) -> None
 # ---------------------------------------------------------------------------
 
 def report(results_on: list[RunResult], results_off: list[RunResult],
-            trace_path: Path | None) -> None:
+            trace_path: Path | None, correlation: str = "none") -> None:
     print()
     print("=== Summary ===")
-    print(f"trace file: {trace_path if trace_path else '(not found; wall-time only)'}")
+    print(f"trace file:     {trace_path if trace_path else '(not found; wall-time only)'}")
+    print(f"correlation:    {correlation}  "
+          f"({'preferred' if correlation == 'prompt_id' else 'legacy fallback' if correlation == 'ts_window' else 'no trace'})")
     print()
 
     def _arm_line(label: str, runs: list[RunResult], with_attn: bool) -> str:
@@ -543,8 +612,8 @@ def main() -> int:
     # In RUN_ID mode the path is deterministic; in legacy mode we
     # re-glob in case ComfyUI restarted mid-bench and rotated the file.
     trace_path = resolve_trace_path(run_id, args.trace_dir)
-    attach_attn_times(results_on, trace_path)
-    report(results_on, results_off, trace_path)
+    correlation = attach_attn_times(results_on, trace_path)
+    report(results_on, results_off, trace_path, correlation)
     return 0
 
 
