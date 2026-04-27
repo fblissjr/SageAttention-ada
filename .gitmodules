@@ -1,3 +1,0 @@
-[submodule "sageattention3_blackwell/cutlass"]
-	path = sageattention3_blackwell/cutlass
-	url = https://github.com/NVIDIA/cutlass.git
