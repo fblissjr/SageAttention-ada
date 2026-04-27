@@ -100,6 +100,7 @@ from __future__ import annotations
 import argparse
 import copy
 import os
+import re
 import statistics
 import sys
 import time
@@ -147,13 +148,42 @@ LEGACY_TRACE_DIR = CONSUMER_ROOT / "internal" / "analysis" / "runs" / "sage"
 # `${run_id}` placeholder filled at resolution time.
 RUN_ID_TRACE_TEMPLATE = CONSUMER_ROOT / "data" / "runs" / "{run_id}" / "sage.jsonl"
 
+# RUN_ID format produced by the consumer's start_experiment.sh:
+# `${ISO8601_UTC_compact}_${rand4_hex}`, e.g. `20260427T185316Z_82f0`.
+# We match it strictly so non-RUN_ID directories under data/runs/
+# (smoke/, backups, scratch dirs) don't get picked up as the latest run.
+_RUN_ID_DIR_PATTERN = re.compile(r"^\d{8}T\d{6}Z_[0-9a-f]{4}$")
+
 
 def resolve_run_id(cli_run_id: str | None) -> str | None:
-    """CLI > env. None means "legacy glob path"."""
+    """Resolve the RUN_ID for trace correlation.
+
+    Priority:
+    1. CLI flag (`--run-id`).
+    2. `$RUN_ID` env var (set when bench shares the ComfyUI shell).
+    3. Most-recently-modified `data/runs/<RUN_ID>/` dir matching the
+       consumer's ISO_rand4 format. Catches the common case where the
+       bench is invoked from a fresh terminal that didn't inherit the
+       env var. Without this fallback the bench silently legacy-globs
+       and finds yesterday's trace -- the wrong-answer foot-gun
+       AudioLoopHelper claude flagged 2026-04-27.
+    4. None (caller falls back to legacy `sage_*.jsonl` glob).
+    """
     if cli_run_id:
         return cli_run_id
     env_run_id = os.environ.get("RUN_ID", "").strip()
-    return env_run_id or None
+    if env_run_id:
+        return env_run_id
+    runs_dir = CONSUMER_ROOT / "data" / "runs"
+    if runs_dir.is_dir():
+        candidates = sorted(
+            (p for p in runs_dir.iterdir()
+             if p.is_dir() and _RUN_ID_DIR_PATTERN.match(p.name)),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )
+        if candidates:
+            return candidates[0].name
+    return None
 
 
 def resolve_trace_path(run_id: str | None, legacy_trace_dir: Path) -> Path | None:
