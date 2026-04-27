@@ -58,6 +58,16 @@ from pathlib import Path
 import orjson
 
 
+# Synthetic kernel-name prefix used for rows where consumer policy
+# short-circuited sage entirely (e.g. AudioLoopHelper's
+# skip_under_seq_len). A downstream filter `dispatched_kernel ==
+# "fp8_cuda++"` would silently miss these rows otherwise; the prefix
+# makes the asymmetry visible at the field level. Match with
+# `kernel.startswith(SKIPPED_KERNEL_PREFIX)` to find policy-skipped
+# rows; everything else is a real sage dispatch.
+SKIPPED_KERNEL_PREFIX = "skipped:"
+
+
 @dataclass
 class ShapeAggregate:
     shape: tuple[int, ...]
@@ -149,7 +159,7 @@ def parse_traces(
                 if row.get("skipped"):
                     reason = str(row.get("skip_reason") or "unknown")
                     skip_reason_counts[reason] = skip_reason_counts.get(reason, 0) + 1
-                    kernel = f"skipped:{reason}"
+                    kernel = f"{SKIPPED_KERNEL_PREFIX}{reason}"
                     kernel_source_counts["sage_telemetry"] += 1
                 else:
                     skip_reason_counts["not_skipped"] += 1

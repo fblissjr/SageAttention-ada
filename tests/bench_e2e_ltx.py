@@ -154,6 +154,36 @@ RUN_ID_TRACE_TEMPLATE = CONSUMER_ROOT / "data" / "runs" / "{run_id}" / "sage.jso
 # (smoke/, backups, scratch dirs) don't get picked up as the latest run.
 _RUN_ID_DIR_PATTERN = re.compile(r"^\d{8}T\d{6}Z_[0-9a-f]{4}$")
 
+# A sage trace this fresh implies ComfyUI's in-process caches (model
+# load, Triton JIT, per-node cache) are still warm from the prior
+# render. Threshold is intentionally generous; cost of false-positive
+# (skip warmup when cold) > cost of false-negative (warm when warm).
+_WARM_TRACE_AGE_SECONDS = 30 * 60
+
+
+def _recent_sage_trace_indicates_warm() -> bool:
+    """True if any RUN_ID dir under coderef/.../data/runs/ has a
+    non-empty sage.jsonl with mtime < _WARM_TRACE_AGE_SECONDS.
+    Defensive: returns False on any I/O error so a broken filesystem
+    doesn't silently skip warmup."""
+    runs_dir = CONSUMER_ROOT / "data" / "runs"
+    if not runs_dir.is_dir():
+        return False
+    threshold = time.time() - _WARM_TRACE_AGE_SECONDS
+    try:
+        for entry in runs_dir.iterdir():
+            if not entry.is_dir() or not _RUN_ID_DIR_PATTERN.match(entry.name):
+                continue
+            trace = entry / "sage.jsonl"
+            if not trace.is_file():
+                continue
+            stat = trace.stat()
+            if stat.st_size > 0 and stat.st_mtime > threshold:
+                return True
+    except OSError:
+        return False
+    return False
+
 
 def resolve_run_id(cli_run_id: str | None) -> str | None:
     """Resolve the RUN_ID for trace correlation.
@@ -332,6 +362,34 @@ def set_sage_mode(prompt: dict, mode: str) -> dict:
 # Sage trace JSONL
 # ---------------------------------------------------------------------------
 
+_TRACE_NON_DATA_EVENTS = frozenset({"header", "summary"})
+
+
+def _iter_trace_rows(trace_path: Path, *, skip_non_data: bool = True):
+    """Yield parsed JSONL rows from a sage trace file. Skips empty
+    lines and rows that fail to parse (mid-write tail, etc.).
+
+    `skip_non_data=True` (default) also drops `event in {"header",
+    "summary"}` framing rows. Set False when the caller specifically
+    needs the framing (e.g. probing whether a `prompt_id` field
+    exists -- header rows are emitted before any data row).
+
+    Shared between the four call sites below + bench_workload_profile;
+    consumer's `sage_telemetry_summary.py` parses the same schema.
+    """
+    with trace_path.open("rb") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = orjson.loads(line)
+            except orjson.JSONDecodeError:
+                continue
+            if skip_non_data and row.get("event") in _TRACE_NON_DATA_EVENTS:
+                continue
+            yield row
+
 
 def sum_attn_us_for_prompt(trace_path: Path, prompt_id: str) -> tuple[int, float]:
     """Sum elapsed_us over sage rows tagged with this prompt_id.
@@ -344,22 +402,14 @@ def sum_attn_us_for_prompt(trace_path: Path, prompt_id: str) -> tuple[int, float
     """
     total_us = 0.0
     n = 0
-    with trace_path.open("rb") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = orjson.loads(line)
-            except orjson.JSONDecodeError:
-                continue
-            if row.get("prompt_id") != prompt_id:
-                continue
-            elapsed = row.get("elapsed_us")
-            if elapsed is None:
-                continue
-            total_us += float(elapsed)
-            n += 1
+    for row in _iter_trace_rows(trace_path):
+        if row.get("prompt_id") != prompt_id:
+            continue
+        elapsed = row.get("elapsed_us")
+        if elapsed is None:
+            continue
+        total_us += float(elapsed)
+        n += 1
     return n, total_us
 
 
@@ -373,25 +423,15 @@ def sum_attn_us_in_window(trace_path: Path, ts_min: float, ts_max: float) -> tup
     """
     total_us = 0.0
     n = 0
-    with trace_path.open("rb") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = orjson.loads(line)
-            except orjson.JSONDecodeError:
-                continue
-            if row.get("event") in {"header", "summary"}:
-                continue
-            ts = row.get("ts")
-            if ts is None or ts < ts_min or ts > ts_max:
-                continue
-            elapsed = row.get("elapsed_us")
-            if elapsed is None:
-                continue
-            total_us += float(elapsed)
-            n += 1
+    for row in _iter_trace_rows(trace_path):
+        ts = row.get("ts")
+        if ts is None or ts < ts_min or ts > ts_max:
+            continue
+        elapsed = row.get("elapsed_us")
+        if elapsed is None:
+            continue
+        total_us += float(elapsed)
+        n += 1
     return n, total_us
 
 
@@ -440,18 +480,8 @@ def _trace_has_prompt_id(trace_path: Path) -> bool:
     consumer commit 6a3be19 (2026-04-26) added the field, but older
     trace files on disk may not have it yet.
     """
-    with trace_path.open("rb") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = orjson.loads(line)
-            except orjson.JSONDecodeError:
-                continue
-            if row.get("event") in {"header", "summary"}:
-                continue
-            return "prompt_id" in row
+    for row in _iter_trace_rows(trace_path):
+        return "prompt_id" in row
     return False
 
 
@@ -524,15 +554,19 @@ def report(results_on: list[RunResult], results_off: list[RunResult],
         print(f"non-attn time (sage):   {non_attn_on:.2f}s")
         print(f"off-arm wall:           {off_med:.2f}s "
               f"(no per-call tracer; attn vs non-attn breakdown unavailable)")
-        # If attention is < ~20% of wall, sage's kernel-level perf wins
-        # are bounded by Amdahl regardless of speedup magnitude. Surface
-        # this so the operator doesn't read a near-1x speedup as "sage
-        # is broken" when it's "attention isn't the bottleneck."
+        # Don't print an Amdahl ceiling. The 2026-04-27 cross-arm exec_log
+        # analysis showed sage's reach extends beyond the per-call attn
+        # rows -- a ~26s sampler savings on top of the ~11s pure-attn
+        # delta. A pure-attention-fraction Amdahl gives a LOWER bound,
+        # not a ceiling, and an operator reading "ceiling 1.03x" while
+        # the actual ratio is 1.08x walks away with the wrong story.
+        # Print the factual fraction; let the speedup ratio printed
+        # above speak for itself.
         if attn_pct_on < 20.0:
-            print(f"NOTE: attention is only {attn_pct_on:.1f}% of wall on sage arm. "
-                  f"Sage's kernel-level wins are Amdahl-bounded by this fraction; "
-                  f"end-to-end speedup of ~{1.0 / (1.0 - attn_pct_on / 100.0 * 0.62):.2f}x "
-                  f"is the ceiling assuming sage runs at v0.4.1's 2.66x kernel ratio.")
+            print(f"NOTE: attention is {attn_pct_on:.1f}% of wall. Sage's reach may "
+                  f"extend beyond the attention rows themselves (sampler-level "
+                  f"amortization); read the speedup ratio above as the empirical "
+                  f"answer, not a pure-attention Amdahl prediction.")
 
     print()
     print("Interpretation:")
@@ -580,13 +614,15 @@ def main() -> int:
     parser.add_argument("--inter-run-sleep", type=float, default=1.0,
                          help="Seconds to sleep between runs (helps disambiguate trace ts windows "
                               "in legacy-glob mode; ignored when run-id resolves).")
-    parser.add_argument("--no-warmup", dest="warmup", action="store_false",
-                         help="Skip the warmup-and-discard prompt before measurement. "
-                              "WARNING: leaves the first measured arm paying cold-start cost "
-                              "(Triton autotune, cuBLAS warmup, CUDA context init, ComfyUI lazy "
-                              "init), which biases short-runs results structurally. Use only "
-                              "when you've already warmed up via a prior bench in this session.")
-    parser.set_defaults(warmup=True)
+    parser.add_argument("--warmup", choices=("auto", "always", "never"), default="auto",
+                         help="Warmup-and-discard policy. 'auto' (default): skip warmup "
+                              "if the most-recent sage trace is < 30 min old (caches still "
+                              "warm). 'always': run warmup unconditionally. 'never': skip "
+                              "warmup unconditionally (biases short-runs results when caches "
+                              "are cold). See module docstring for the structural-bias "
+                              "rationale.")
+    parser.add_argument("--no-warmup", dest="warmup", action="store_const", const="never",
+                         help="Alias for --warmup never (preserved for older recipes).")
     args = parser.parse_args()
 
     host = resolve_host(args.host)
@@ -644,22 +680,31 @@ def main() -> int:
         print(f"trace file (legacy): {trace_path_before}")
     print()
 
-    # Warmup-and-discard. Without it, the first arm pays cold-start
-    # cost (Triton autotune cache miss, cuBLAS / cuDNN warmup, CUDA
-    # context init, ComfyUI's lazy first-prompt initialization), and
-    # the second arm runs fully warm. With --runs 1 + arm-order
-    # bias, the structurally-faster arm can be reported slower by
-    # 100s of seconds when the actual attention-time difference is
-    # only single-digit seconds. Discovered 2026-04-27 when a bench
-    # showed sage_on at 248s vs sage_off at 126s while attention was
-    # only 4.5% of wall -- structurally impossible from sage alone.
-    # Use sage_mode for warmup (warmer cache than baseline_mode --
-    # sage's int8 quant + Triton autotune + JIT).
-    if args.warmup:
+    # Warmup-and-discard. Without it the first arm pays cold-start
+    # cost (Triton autotune cache miss, cuBLAS warmup, CUDA context
+    # init, ComfyUI lazy first-prompt init); the second runs warm.
+    # At --runs 1 with arm-order bias, the structurally-faster arm
+    # gets reported slower by 100s of seconds even when the actual
+    # attention-time difference is single-digit seconds.
+    #
+    # 'auto' policy: skip warmup if the most-recent sage trace mtime
+    # is < 30 min old. ComfyUI typically holds in-process state
+    # (model load, JIT, per-node cache) for the lifetime of the
+    # server; a fresh sage trace within 30 min is strong evidence
+    # the same instance is still up and warm. Triton's on-disk
+    # autotune cache survives across sessions anyway.
+    should_warm = args.warmup == "always" or (
+        args.warmup == "auto" and not _recent_sage_trace_indicates_warm()
+    )
+    if should_warm:
         print(f"[warmup] running 1 prompt in '{args.sage_mode}' mode "
               f"to populate caches; result discarded.")
         run_one(host, prompt, args.sage_mode, run_idx=-1, client_id=client_id)
         time.sleep(args.inter_run_sleep)
+    elif args.warmup == "auto":
+        print("[warmup] skipped (recent sage trace detected; caches likely warm)")
+    else:
+        print("[warmup] skipped per --warmup never / --no-warmup")
 
     # Run interleaved (on / off / on / off / ...) so that wall-time bias from
     # any global drift (thermal, system load, model state) hits both arms
