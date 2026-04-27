@@ -118,7 +118,6 @@ import sys
 expected = {
     "_qattn_sm80": "SM80 (Ampere + Ada backward-compat; powers fp16_cuda)",
     "_qattn_sm89": "SM89 (Ada native fp8; powers fp8_cuda variants)",
-    "_qattn_sm90": "SM90 (Hopper)",
     "_fused":      "fused ops (always built)",
 }
 
@@ -143,8 +142,6 @@ if "_qattn_sm80" not in missing:
 if "_qattn_sm89" not in missing:
     print("  sageattn_qk_int8_pv_fp8_cuda        (INT8 QK + FP8 PV,  fp32+fp32 accum)")
     print("  sageattn_qk_int8_pv_fp8_cuda++      (INT8 QK + FP8 PV,  fp32+fp16 accum)")
-if "_qattn_sm90" not in missing:
-    print("  sageattn3                           (Hopper/Blackwell FP4/FP8)")
 print("  sageattn_qk_int8_pv_fp16_triton     (JIT Triton; always available)")
 PY
 

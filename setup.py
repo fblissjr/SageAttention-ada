@@ -122,9 +122,6 @@ if not SKIP_CUDA_BUILD:
     if nvcc_cuda_version < Version("12.4") and has_capability("8.9"):
         raise RuntimeError(
             "CUDA 12.4 or higher is required for compute capability 8.9.")
-    if nvcc_cuda_version < Version("12.3") and has_capability("9.0"):
-        raise RuntimeError(
-            "CUDA 12.3 or higher is required for compute capability 9.0.")
     if nvcc_cuda_version < Version("12.8") and has_capability("12.0"):
         raise RuntimeError(
             "CUDA 12.8 or higher is required for compute capability 12.0.")
@@ -184,22 +181,6 @@ if not SKIP_CUDA_BUILD:
                 extra_compile_args={
                     "cxx": CXX_FLAGS,
                     "nvcc": get_nvcc_flags(["8.9", "10.0", "12.0", "12.1"]),
-                },
-            )
-        )
-
-    if has_capability("9.0"):
-        ext_modules.append(
-            CUDAExtension(
-                name="sageattention._qattn_sm90",
-                sources=[
-                    "csrc/qattn/pybind_sm90.cpp",
-                    "csrc/qattn/qk_int_sv_f8_cuda_sm90.cu",
-                ],
-                libraries=["cuda"],
-                extra_compile_args={
-                    "cxx": CXX_FLAGS,
-                    "nvcc": get_nvcc_flags(["9.0"]),
                 },
             )
         )
