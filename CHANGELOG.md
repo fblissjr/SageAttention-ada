@@ -252,6 +252,121 @@ sufficient.
 
 ## Versions
 
+### v0.4.1 -- 2026-04-27  (bench coverage realigned to production; head_dim claim corrected)
+
+Closes a load-bearing measurement bug. Every perf decision the fork
+made before today was graded against `self_attn_large_704x704x497`
+at `seq=31776, head_dim=64` -- a synthetic shape with the wrong
+head_dim. LTX 2.3's video path is `attention_head_dim=128`
+(`diffusers/models/transformers/transformer_ltx2.py:907-947`); the
+`d=64` value was the audio side, mis-attributed to the whole model.
+Production traces show zero calls at the synthetic shape.
+
+The new bench coverage is sourced from a real consumer trace
+(`sage_2026-04-26_105851.jsonl`, 6912 attention calls). The
+`tests/bench_workload_profile.py` script (also shipped this session)
+is the durable discovery tool -- every future trace gets routed
+through it before bench-shape decisions.
+
+#### Added
+
+- **`tests/regression_baselines.json`** -- pinned `(shape, mode) ->
+  (median_ms, mean_rtol)` baselines for the load-bearing rows. Schema
+  documents `rtol_budget=0.10`, `perf_drift_pct=5.0`,
+  `speedup_ratio_floor=1.5`. v0.4.1 baselines captured on RTX 4090 /
+  sm89 / CUDA 13.0 / torch 2.11.0+cu130 / triton 3.6.0 / sage rev
+  `8f737c3`.
+- **`tests/test_sageattn_ltx_shapes.py --check-regression`** -- new
+  CLI flag that grades fresh measurements against the baselines and
+  exits non-zero on perf drift > 5%, rtol budget breach (> 0.10),
+  speedup-ratio floor breach (sage_fp8++/torch_flash < 1.5x), or
+  missing measurement on a load-bearing row. Soft `RTOL_DRIFT` alarm
+  at 1.5x baseline (kernel-internal numerical change signal even when
+  under the budget).
+- **`tests/bench_workload_profile.py`** -- aggregates a consumer's
+  sage trace JSONL into per-`(shape, has_mask, dispatched_kernel)`
+  call counts, total wall time, and a coverage-check pass against
+  `regression_baselines.json`. Surfaces "Coverage gaps" -- trace
+  shapes the bench doesn't measure -- which is what justifies adding
+  bench rows. Trace-freshness diagnostic mirrors the consumer's
+  `sage_telemetry / legacy_inferred` bucketing.
+
+#### Changed
+
+- **`tests/test_sageattn_ltx_shapes.py` SHAPES list** replaced with
+  production-aligned rows. New set: LTX 2.3 video self-attn at d=128
+  (init seq=22932, loop seq=23296), audio self-attn at d=64 (same
+  seq), short-Q paths at seq=497/498 (Gemma 3 text-encoder or audio
+  cross-attn, attribution ambiguous from trace), K-probe pair at
+  d=128 / kv=226 (the one masked row that survives -- doubles as
+  v0.3.0 dispatcher mask-routing correctness witness). Synthetic
+  wide-V stress shape kept (kernel robustness check, not a workload).
+- **Dropped from SHAPES**:
+  - `self_attn_large_704x704x497`, `self_attn_small_512x512x97` --
+    speculative seq + wrong head_dim.
+  - `cross_attn_text_kv32`, `kv64`, `kv128`, `kv512`, `kv1024` --
+    re-measured a documented CUDA-mask-bug fingerprint without any
+    gating purpose. Kept only `kv226` as the v0.3.0 dispatcher
+    correctness witness + K-probe pair anchor.
+  - `cross_attn_unmasked_kv226_kratio_probe` (old d=64 version) --
+    replaced by the d=128 version at production seq.
+- **CLAUDE.md** -- "Performance research / load-bearing metric"
+  section updated. Primary row is now `ltx23_video_self_attn_init_22932 /
+  fp8_cuda++` at 20.20 ms / 0.098 rtol. Speedup ratio at the
+  production shape: 2.66x (vs old 2.62x at the synthetic shape; the
+  perf story holds). "Shape coverage today" paragraph rewritten with
+  the corrected video d=128 / audio d=64 split + cite to
+  `transformer_ltx2.py:907-947`.
+
+#### Measured (load-bearing)
+
+RTX 4090 / sm89 / CUDA 13.0 / torch 2.11.0+cu130 / bf16:
+
+| shape                                     | mode         | median_ms | mean_rtol | vs torch_flash |
+|-------------------------------------------|--------------|----------:|----------:|---------------:|
+| ltx23_video_self_attn_init_22932          | fp8_cuda++   |     20.20 |    0.0978 |          2.66x |
+| ltx23_video_self_attn_loop_23296          | fp8_cuda++   |     20.52 |    0.0977 |          2.70x |
+| ltx23_audio_self_attn_init_22932          | fp8_cuda++   |     10.65 |    0.0980 |          2.59x |
+| ltx23_audio_self_attn_loop_23296          | fp8_cuda++   |     10.92 |    0.0977 |          2.53x |
+| ltx23_short_q_init_497                    | fp8_cuda++   |      0.08 |    0.0934 |          0.45x |
+| ltx23_short_q_loop_498                    | fp8_cuda++   |      0.09 |    0.0923 |          0.45x |
+| ltx23_video_cross_unmasked_kv226_probe    | fp8_cuda++   |      0.74 |    0.0904 |          1.12x |
+| ltx23_video_cross_text_kv226              | fp16_triton  |      1.16 |    0.0406 |       n/a (mask) |
+| ltx23_video_cross_text_kv226              | auto         |      1.16 |    0.0406 |       n/a (mask) |
+
+K-probe at d=128 / kv=226: K = 1.16 / 0.74 = **1.57** (vs 1.68 at
+the old d=64 row; well below the 5x trigger for native CUDA mask
+kernel work).
+
+#### Findings worth flagging
+
+- **Short-Q rows where sage loses to torch_flash.** seq=497 / 498
+  fp8_cuda++ runs at ~0.45x of torch_flash's wall-time. int8 quant +
+  kernel launch overhead exceeds the matmul work at that shape. This
+  is the empirical evidence behind the consumer's `nodes_sage.py`
+  deferred "min-sequence skip" backlog item -- the gate is now
+  measurable. Trigger to act: a downstream consumer wires the
+  short-Q skip and we re-measure end-to-end gen time.
+- **Speedup ratio held up.** The "wrong head_dim" framing was a
+  correctness-of-narrative bug, not a perf-magnitude bug. fp8++ at
+  d=128 / production seq is 2.66x torch_flash, vs the old 2.62x at
+  d=64 / synthetic seq. Sage's load-bearing claim is intact.
+- **fp16_cuda is still mask-broken at d=128.** rtol 0.44 on
+  `ltx23_video_cross_text_kv226 / fp16_cuda` -- the v0.3.1 soft-warn
+  fires correctly. Same underlying bug fingerprint as the old d=64
+  measurement.
+
+#### Why this wasn't done sooner
+
+The bench's primary shape was inherited from an earlier session
+without checking it against a real trace. CLAUDE.md's "LTX-2.3:
+head_dim=64" claim was treated as ground truth without grepping the
+diffusers config. The discovery happened only because
+`tests/bench_workload_profile.py` shipped this session and the first
+trace it consumed produced zero `[HIT ]` lines on the load-bearing
+set. The fix is to make the workload-profile coverage check the
+default discovery tool before any future bench-shape decision.
+
 ### v0.4.0 -- 2026-04-26  (end-to-end gen-time bench harness)
 
 Closes the load-bearing "kernel ms is not gen ms" gap that the

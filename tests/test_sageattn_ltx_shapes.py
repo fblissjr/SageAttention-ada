@@ -27,9 +27,13 @@ Run with the venv that has sage installed active:
     ${VIRTUAL_ENV}/bin/python tests/test_sageattn_ltx_shapes.py
 """
 
+import argparse
+import sys
 import time
+from pathlib import Path
 from typing import Callable, NamedTuple
 
+import orjson
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -54,38 +58,55 @@ class Metrics(NamedTuple):
     median_ms: float
 
 
-# LTX-2.3: num_attention_heads=32, attention_head_dim=64. The cross-attn
-# seq_kv values span typical Gemma 3 12B text-encoder padded lengths (both
-# fp and fpmixed variants produce identical seq lengths; padding is
-# precision-independent). Re-run the sweep if LTX switches encoders or if
-# prompt lengths drift outside this range. Characterization valid as of
-# 2026-04-23.
+# LTX 2.3 default config (diffusers transformer_ltx2.py:907-947):
+#   Video path: num_attention_heads=32, attention_head_dim=128 (inner_dim=4096)
+#   Audio path: audio_num_attention_heads=32, audio_attention_head_dim=64
+#                                              (audio_inner_dim=2048)
+# Production seq lengths sourced from a real consumer trace
+# (sage_2026-04-26_105851.jsonl, 6912 attention calls):
+#   iter=null (init render):  seq=22932  (832x448 spatial, 497 frames,
+#                                         patch=32x32x8)
+#   iter>=1   (loop iters):   seq=23296  (one extra latent frame)
+# Update via tests/bench_workload_profile.py against a fresh trace if
+# resolution changes or a new iteration scheme lands.
 SHAPES = [
-    Shape("self_attn_large_704x704x497",   1, 32, 31776, 31776, 64, False),
-    Shape("self_attn_small_512x512x97",    1, 32,  8192,  8192, 64, False),
-    Shape("cross_attn_text_kv32",          1, 32, 31776,    32, 64, True),
-    Shape("cross_attn_text_kv64",          1, 32, 31776,    64, 64, True),
-    Shape("cross_attn_text_kv128",         1, 32, 31776,   128, 64, True),
-    Shape("cross_attn_text_kv226",         1, 32, 31776,   226, 64, True),
-    Shape("cross_attn_text_kv512",         1, 32, 31776,   512, 64, True),
-    Shape("cross_attn_text_kv1024",        1, 32, 31776,  1024, 64, True),
-    # K-ratio probe for the deferred "native CUDA mask kernel" Backlog
-    # item. Same shape as cross_attn_text_kv226 (the typical LTX
-    # text-encoder padded length) but with no mask -- lets us read
-    # K = triton_masked_ms / fp8_cuda++_unmasked_ms at production-
-    # relevant kv. The framework in CLAUDE.md says K > 5x at shapes
-    # the consumer hits is the trigger to invest days of kernel work;
-    # without this row the trigger can never fire because we'd have
-    # no number to compare. CLAUDE.md / "Performance research" /
-    # "How we use the metric to pick what to try next" item 5.
-    Shape("cross_attn_unmasked_kv226_kratio_probe", 1, 32, 31776, 226, 64, False),
-    # Non-LTX generality check: wide-V distribution stresses fp8 range.
-    # Relevant for the v-scale default question (core.py:772): the
-    # sm89 fp8_cuda path uses scale_max=448 by default; the ++ variant
-    # uses 2.25. If we ever consider flipping the default to 2.25 for
-    # non-++ callers, this shape characterizes how much precision the
-    # non-LTX user loses.
-    Shape("synthetic_wide_v_self_attn",    1, 32,  8192,  8192, 64, False, v_std=5.0),
+    # LTX 2.3 video self-attn at production seq + corrected d=128.
+    # 76% of attention wall-time on the trace lives on these two rows.
+    Shape("ltx23_video_self_attn_init_22932",  1, 32, 22932, 22932, 128, False),
+    Shape("ltx23_video_self_attn_loop_23296",  1, 32, 23296, 23296, 128, False),
+
+    # LTX 2.3 audio-side self-attn at d=64 (audio config).
+    # Same seq as video (joint AV at the latent level; both modalities
+    # share the temporal axis after patchification).
+    Shape("ltx23_audio_self_attn_init_22932",  1, 32, 22932, 22932, 64, False),
+    Shape("ltx23_audio_self_attn_loop_23296",  1, 32, 23296, 23296, 64, False),
+
+    # Short-Q path observed in trace at hidden=2048 (3456 calls total;
+    # iter=null seq=497, iter>=1 seq=498). Likely Gemma 3 text-encoder
+    # self-attn or audio-cross-attn through audio_caption_projection;
+    # exact attribution is ambiguous from trace alone but the
+    # (B, S, H*D) tuple is what sage actually runs.
+    Shape("ltx23_short_q_init_497",            1, 32,   497,   497, 64, False),
+    Shape("ltx23_short_q_loop_498",            1, 32,   498,   498, 64, False),
+
+    # K-probe pair at the corrected video config. Two adjacent rows
+    # so K = triton_masked_ms / fp8++_unmasked_ms is readable directly:
+    # _unmasked is the denominator (fp8++), _kv226 masked is the
+    # numerator (fp16_triton via dispatcher). kv=226 = typical Gemma 3
+    # padded text length; encoder-driven, not model-config-driven.
+    # Gates the deferred "native CUDA mask kernel" Backlog item per
+    # CLAUDE.md / Performance research item 5.
+    Shape("ltx23_video_cross_unmasked_kv226_kratio_probe",
+                                               1, 32, 23296,   226, 128, False),
+    # The one masked row that survives. Doubles as the v0.3.0
+    # dispatcher mask-routing correctness witness (auto must dispatch
+    # to fp16_triton, not fp8_cuda++) and the K-probe numerator.
+    Shape("ltx23_video_cross_text_kv226",      1, 32, 23296,   226, 128, True),
+
+    # Synthetic stress: not a workload, tests fp8 dynamic-range
+    # robustness (V ~ N(0, 5)). Catches kernel-internal numerical
+    # changes that production shapes might mask. Sub-second; cheap.
+    Shape("synthetic_wide_v_self_attn",        1, 32,  8192,  8192, 64, False, v_std=5.0),
 ]
 
 
@@ -275,11 +296,15 @@ def print_header(label_width: int):
           f"{'mean_atol':>10}  {'max_atol':>10}  {'median_ms':>10}  speed_x")
 
 
-def run_shape_sweep(shapes: list[Shape], dtype: torch.dtype = torch.bfloat16) -> list[str]:
-    """Run the per-shape table for any list of Shape entries. Returns a
-    list of soft-warning strings (mean_rtol > 0.10 entries) so the caller
-    can format the footer however it wants. The image-shape file reuses
-    this entry point with its own SHAPES list."""
+def run_shape_sweep(
+    shapes: list[Shape], dtype: torch.dtype = torch.bfloat16
+) -> tuple[list[str], dict[tuple[str, str], Metrics]]:
+    """Run the per-shape table for any list of Shape entries. Returns
+    (warnings, measurements). `warnings` is the soft-warn list (mean_rtol
+    > 0.10 entries). `measurements` maps (shape_name, mode_label) ->
+    Metrics so a regression-check pass can grade against pinned baselines
+    without re-running the bench. The image-shape file reuses this entry
+    point with its own SHAPES list."""
     label_width = max(
         len(spec[0]) for spec in
         (*MODE_SPECS, *TORCH_MODE_SPECS, *FLASHINFER_MODE_SPECS, *SPARGE_MODE_SPECS)
@@ -287,6 +312,7 @@ def run_shape_sweep(shapes: list[Shape], dtype: torch.dtype = torch.bfloat16) ->
     print_header(label_width)
 
     warnings: list[str] = []
+    measurements: dict[tuple[str, str], Metrics] = {}
 
     for shape in shapes:
         print()
@@ -336,6 +362,7 @@ def run_shape_sweep(shapes: list[Shape], dtype: torch.dtype = torch.bfloat16) ->
                 print(f"    {label:<{label_width}}  SKIP ({type(exc).__name__}: {str(exc)[:80]})")
                 continue
             _print_result(label, m)
+            measurements[(shape.name, label)] = m
             if label in (TRITON_LABEL, FP8PP_LABEL):
                 cached_outs[label] = out
 
@@ -369,6 +396,7 @@ def run_shape_sweep(shapes: list[Shape], dtype: torch.dtype = torch.bfloat16) ->
                     print(f"    {label:<{label_width}}  SKIP ({type(exc).__name__}: {str(exc)[:80]})")
                     continue
                 _print_result(label, m, warn_rtol=warn_rtol)
+                measurements[(shape.name, label)] = m
 
         # Torch backends reference themselves against SDPA-EFFICIENT, so rtol
         # can be ~0 (one of them IS the reference) -- don't warn.
@@ -379,7 +407,138 @@ def run_shape_sweep(shapes: list[Shape], dtype: torch.dtype = torch.bfloat16) ->
         # as sage modes is fine.
         _run_aux(SPARGE_MODE_SPECS, dispatch_sparge, warn_rtol=True)
 
-    return warnings
+    return warnings, measurements
+
+
+def check_regressions(
+    measurements: dict[tuple[str, str], Metrics],
+    baselines_path: Path,
+) -> tuple[int, list[str]]:
+    """Grade fresh measurements against pinned baselines.
+
+    Returns (exit_code, regression_lines). Exit 0 = clean; exit 1 = at
+    least one load-bearing baseline regressed beyond the configured
+    drift / rtol budget. Non-load-bearing baselines drift-warn but
+    don't fail the gate.
+    """
+    if not baselines_path.exists():
+        return 0, [f"(no baselines file at {baselines_path}; skipping check)"]
+
+    cfg = orjson.loads(baselines_path.read_bytes())
+
+    rtol_budget = float(cfg.get("rtol_budget", 0.10))
+    perf_drift_pct = float(cfg.get("perf_drift_pct", 5.0))
+    speedup_floor = float(cfg.get("speedup_ratio_floor", 1.5))
+
+    regressions: list[str] = []
+    notes: list[str] = []
+    fail = False
+
+    # Speedup-ratio anchor: the shape with both a sage-primary AND a
+    # torch_flash baseline marked load_bearing. Auto-discovered to
+    # survive shape renames without manual lookup updates. Errs on
+    # multiple anchors; informational-only on zero.
+    speedup_anchor: str | None = None
+    sage_primary_ms: float | None = None
+    torch_flash_ms: float | None = None
+
+    sage_shapes = {
+        e["shape"] for e in cfg.get("baselines", [])
+        if e.get("mode") == "fp8_cuda++" and e.get("load_bearing")
+    }
+    torch_shapes = {
+        e["shape"] for e in cfg.get("baselines", [])
+        if e.get("mode") == "torch_flash" and e.get("load_bearing")
+    }
+    anchors = sage_shapes & torch_shapes
+    if len(anchors) == 1:
+        speedup_anchor = next(iter(anchors))
+    elif len(anchors) > 1:
+        notes.append(
+            f"SPEEDUP  multiple shapes have both fp8_cuda++ and torch_flash "
+            f"load_bearing baselines ({sorted(anchors)}); skipping ratio check. "
+            f"Mark exactly one shape as the anchor."
+        )
+
+    for entry in cfg.get("baselines", []):
+        shape = entry["shape"]
+        mode = entry["mode"]
+        baseline_ms = entry.get("median_ms")
+        baseline_rtol = entry.get("mean_rtol")
+        load_bearing = bool(entry.get("load_bearing", False))
+
+        m = measurements.get((shape, mode))
+        if m is None:
+            line = f"MISSING  {shape} / {mode}: not measured this run"
+            (regressions if load_bearing else notes).append(line)
+            if load_bearing:
+                fail = True
+            continue
+
+        if shape == speedup_anchor:
+            if mode == "fp8_cuda++":
+                sage_primary_ms = m.median_ms
+            elif mode == "torch_flash":
+                torch_flash_ms = m.median_ms
+
+        if baseline_ms is not None and m.median_ms is not None:
+            drift_pct = (m.median_ms - baseline_ms) / baseline_ms * 100.0
+            if drift_pct > perf_drift_pct:
+                line = (
+                    f"PERF     {shape} / {mode}: {m.median_ms:.2f} ms vs "
+                    f"baseline {baseline_ms:.2f} ms (+{drift_pct:.1f}%, "
+                    f"threshold {perf_drift_pct:.1f}%)"
+                )
+                (regressions if load_bearing else notes).append(line)
+                if load_bearing:
+                    fail = True
+            elif drift_pct < -perf_drift_pct:
+                notes.append(
+                    f"FASTER   {shape} / {mode}: {m.median_ms:.2f} ms vs "
+                    f"baseline {baseline_ms:.2f} ms ({drift_pct:.1f}%) "
+                    f"-- verify env stable before updating baselines"
+                )
+
+        if baseline_rtol is not None and m.mean_rtol is not None:
+            if m.mean_rtol > rtol_budget:
+                line = (
+                    f"RTOL     {shape} / {mode}: mean_rtol={m.mean_rtol:.4f} "
+                    f"exceeds budget {rtol_budget:.2f}"
+                )
+                (regressions if load_bearing else notes).append(line)
+                if load_bearing:
+                    fail = True
+            elif m.mean_rtol > baseline_rtol * 1.5:
+                # 1.5x baseline = kernel-internal numerical change signal
+                # even when the absolute number is still under budget.
+                notes.append(
+                    f"RTOL_DRIFT {shape} / {mode}: mean_rtol={m.mean_rtol:.4f} "
+                    f"vs baseline {baseline_rtol:.4f} (1.5x baseline)"
+                )
+
+    # Speedup-ratio floor: sage_fp8++ must remain at least speedup_floor x faster
+    # than torch_flash on the anchor row, or the fork's load-bearing claim
+    # collapses (per CLAUDE.md / "What we explicitly ignore" / torch row trigger).
+    if (speedup_anchor is not None
+            and sage_primary_ms is not None
+            and torch_flash_ms is not None):
+        ratio = torch_flash_ms / sage_primary_ms
+        if ratio < speedup_floor:
+            regressions.append(
+                f"SPEEDUP  {speedup_anchor}: torch_flash/sage_fp8++ "
+                f"= {ratio:.2f}x; below floor {speedup_floor:.2f}x. The fork's "
+                f"reason to exist is empirically suspect -- see CLAUDE.md / "
+                f"Performance research."
+            )
+            fail = True
+        else:
+            notes.append(
+                f"SPEEDUP  {speedup_anchor}: torch_flash/sage_fp8++ "
+                f"= {ratio:.2f}x (floor {speedup_floor:.2f}x)"
+            )
+
+    out_lines = regressions + notes
+    return (1 if fail else 0), out_lines
 
 
 def print_warnings_footer(warnings: list[str]) -> None:
@@ -397,10 +556,41 @@ def print_warnings_footer(warnings: list[str]) -> None:
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check-regression", action="store_true",
+        help="Compare results against tests/regression_baselines.json and "
+             "exit non-zero on perf drift > threshold or rtol budget breach. "
+             "Default: print-only (legacy behavior).",
+    )
+    parser.add_argument(
+        "--baselines", type=Path,
+        default=Path(__file__).parent / "regression_baselines.json",
+        help="Path to regression baselines JSON.",
+    )
+    args = parser.parse_args()
+
     if not torch.cuda.is_available():
         print("CUDA not available -- this test measures kernel numerics on-GPU.")
         return
-    print_warnings_footer(run_shape_sweep(SHAPES))
+
+    warnings, measurements = run_shape_sweep(SHAPES)
+    print_warnings_footer(warnings)
+
+    if args.check_regression:
+        print()
+        print("=== Regression check vs baselines ===")
+        exit_code, lines = check_regressions(measurements, args.baselines)
+        if not lines:
+            print("(no baselines configured)")
+        for line in lines:
+            print(f"  {line}")
+        if exit_code != 0:
+            print()
+            print("REGRESSION DETECTED -- exiting non-zero. Investigate before "
+                  "updating baselines. Bench env discipline: re-snapshot "
+                  "internal/bench_env_<date>.txt if any version bumped.")
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":

@@ -42,7 +42,8 @@ def main():
     if not torch.cuda.is_available():
         print("CUDA not available -- this test measures kernel numerics on-GPU.")
         return
-    print_warnings_footer(run_shape_sweep(IMAGE_SHAPES))
+    warnings, _ = run_shape_sweep(IMAGE_SHAPES)
+    print_warnings_footer(warnings)
 
 
 if __name__ == "__main__":

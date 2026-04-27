@@ -30,11 +30,11 @@ Three things matter:
 
 ```
 tests/test_sageattn_ltx_shapes.py
-  shape: self_attn_large_704x704x497  (B=1, H=32, Sq=Skv=31776, D=64, no mask, bf16)
+  shape: ltx23_video_self_attn_init_22932  (B=1, H=32, Sq=Skv=22932, D=128, no mask, bf16)
   mode:  fp8_cuda++
-  -> primary perf metric: median_ms — lower is better (today: 19.95 ms)
-  -> accuracy guard:      mean_rtol ≤ 0.10 (today: ~0.097)
-  -> cross-session normalizer: torch_flash / sage_fp8++ ratio (today: 2.62×)
+  -> primary perf metric: median_ms — lower is better (today: 20.20 ms)
+  -> accuracy guard:      mean_rtol ≤ 0.10 (today: ~0.098)
+  -> cross-session normalizer: torch_flash / sage_fp8++ ratio (today: 2.66×)
 ```
 
 **What does good look like?** `median_ms` goes down. `mean_rtol`
@@ -59,13 +59,16 @@ rtol stayed under 0.10 → keep, ship. Anything else → discard, revert.
 
 ## Why this metric, why this row, why this hardware
 
-**The shape (LTX 31776×31776 self-attn).** On LTX 2.3 video gen,
-this single attention shape accounts for the overwhelming majority
-of attention cost per sampling step. Per gen, ~25–50 sampling steps
-× this row = the real wall-clock the user feels. Cross-attn (kv ≤
-1024) is sub-millisecond per call; image-gen shapes (Flux head_dim
-= 128, Z-Image head_dim = 120) are 1–2 ms. The 31776×31776 row is
-where milliseconds compound into seconds of gen time.
+**The shape (LTX 2.3 video self-attn at production seq).** On LTX 2.3
+video gen, video self-attn accounts for the overwhelming majority of
+attention cost per sampling step (~76% of total attention wall-time
+per a real consumer trace; see CHANGELOG v0.4.1). Per gen, ~25–50
+sampling steps × this row = the real wall-clock the user feels.
+Cross-attn (kv ≤ 1024) is sub-millisecond per call; image-gen shapes
+(Flux head_dim = 128, Z-Image head_dim = 120) are 1–2 ms. Production
+seq is 22932 (init render) or 23296 (loop iter); the LTX 2.3 video
+path uses `attention_head_dim=128` (`transformer_ltx2.py:907-947`),
+not the d=64 the audio path uses.
 
 **The kernel (`fp8_cuda++`).** That's what `sageattn()` picks on sm89
 + CUDA ≥ 12.8 unmasked, after the v0.3.0 dispatcher mask-routing

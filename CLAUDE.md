@@ -97,8 +97,11 @@ VENV=/path/to/venv ./tests/run_all.sh  # explicit venv
 Individual tests if you want one specifically:
 
 ```bash
-# LTX-2.3 shape + kernel sweep (head_dim=64; ~30s on 4090):
+# LTX-2.3 shape + kernel sweep (video d=128, audio d=64; ~30s on 4090):
 ${VIRTUAL_ENV}/bin/python tests/test_sageattn_ltx_shapes.py
+# Add --check-regression to gate against tests/regression_baselines.json
+# (exits non-zero on >5% perf drift or rtol budget breach):
+${VIRTUAL_ENV}/bin/python tests/test_sageattn_ltx_shapes.py --check-regression
 
 # Image-gen shape sweep (head_dim ∈ {120, 128}; Flux-class + Z-Image-Turbo):
 ${VIRTUAL_ENV}/bin/python tests/test_sageattn_image_shapes.py
@@ -116,12 +119,26 @@ mostly subsumed by `test_sageattn_ltx_shapes.py` (which covers a
 broader sweep including the same kind of small self-attn shape). Run
 it only if you want a 1-second smoke check before the longer bench.
 
-Shape coverage today: head_dim in {64 (LTX, in `test_sageattn_ltx_shapes.py`),
-128 (Flux-class) and 120 (Z-Image-Turbo S3-DiT), both in
-`test_sageattn_image_shapes.py`}. sage's CUDA kernels handle all three
-cleanly on sm89 -- including the non-power-of-2 d=120 (verified
-2026-04-25). If a new model class brings a different head_dim, add a
-row to the appropriate file before assuming compatibility.
+Shape coverage today (corrected 2026-04-27 after a workload-profile
+audit against a real consumer trace):
+- LTX 2.3 video path: d=128, 32 heads, seq ∈ {22932 init, 23296 loop iter}
+- LTX 2.3 audio path: d=64, 32 heads, same seq as video (joint AV)
+- LTX 2.3 short-Q path (Gemma 3 text-encoder or audio cross-attn,
+  attribution ambiguous from trace alone): d=64, 32 heads, seq ∈ {497, 498}
+- Flux-class image-gen: d=128, in `test_sageattn_image_shapes.py`
+- Z-Image-Turbo S3-DiT: d=120, non-power-of-2, in `test_sageattn_image_shapes.py`
+- Synthetic stress (V ~ N(0,5), d=64, seq=8192): kernel robustness
+  check, not a workload
+
+Source-of-truth for LTX 2.3 dims is `transformer_ltx2.py:907-947` in
+diffusers (default config: `attention_head_dim=128` video,
+`audio_attention_head_dim=64`). Earlier docs claimed "LTX head_dim=64"
+across the board -- that was the audio-side value mis-attributed to
+the whole model. To re-derive shape coverage from a fresh production
+trace, run `tests/bench_workload_profile.py` and read its
+"Coverage gaps" section. sage's CUDA kernels handle all the listed
+head_dims cleanly on sm89, including the non-power-of-2 d=120
+(verified 2026-04-25).
 
 `tests/test_sageattn_ltx_shapes.py` is the load-bearing test for LTX
 workflows. It characterizes accuracy AND speed per (shape, mode)
@@ -414,11 +431,16 @@ decisions on the sm89 box are graded against one row of one test:
 
 ```
 tests/test_sageattn_ltx_shapes.py
-  shape: self_attn_large_704x704x497  (B=1, H=32, Sq=Skv=31776, D=64, no mask, bf16)
+  shape: ltx23_video_self_attn_init_22932  (B=1, H=32, Sq=Skv=22932, D=128, no mask, bf16)
   mode:  fp8_cuda++
-  -> primary perf metric: median_ms (today: 19.95 ms)
-  -> accuracy guard:      mean_rtol ≤ 0.10 (today: ~0.097)
+  -> primary perf metric: median_ms (today: 20.20 ms)
+  -> accuracy guard:      mean_rtol ≤ 0.10 (today: ~0.098)
 ```
+
+Sourced from a real consumer trace; see CHANGELOG v0.4.1 for the
+re-derivation. The earlier metric (`self_attn_large_704x704x497` at
+seq=31776, D=64) was a synthetic shape with the wrong head_dim --
+LTX 2.3 video is D=128, not D=64.
 
 Anything else you might want to measure is secondary, useful as a
 guard against side effects, or explicitly ignored — see below.
@@ -427,12 +449,15 @@ guard against side effects, or explicitly ignored — see below.
 
 The chain matters; if any link breaks, the metric moves.
 
-1. **LTX self-attn at 31776×31776 dominates real gen wall-time.**
-   On LTX-2.3 video gen, this single attention shape accounts for
-   the overwhelming majority of attention cost per step. Cross-attn
-   kv ≤ 1024 is sub-millisecond per call; image-gen shapes
-   (head_dim ∈ {120, 128}) are 1-2 ms. The 31776×31776 row is where
-   milliseconds compound into seconds of gen time.
+1. **LTX 2.3 video self-attn at seq=22932/23296 dominates real gen
+   wall-time.** Per the consumer trace
+   `sage_2026-04-26_105851.jsonl`, video self-attn (init seq=22932 +
+   loop seq=23296, both at d=128) accounts for **76% of total
+   attention wall-time** across a typical render. Audio self-attn
+   (d=64) is another ~5%; short-Q paths (text-encoder / audio
+   cross-attn at seq~497) are ~19% by call count but only ~3% by
+   wall-time because each call is sub-millisecond. The video d=128
+   row is where milliseconds compound into seconds of gen time.
 2. **`fp8_cuda++` is what `sageattn()` picks on sm89 + CUDA ≥ 12.8
    unmasked.** That's the consumer's actual hot path — the
    dispatcher routes there for self-attn after the v0.3.0 mask-aware
@@ -458,11 +483,18 @@ within-session signal you optimize against during a research sitting.
 
 For comparing across sessions (after a torch / triton / CUDA / driver
 bump, or after a cold boot), use the **`torch_flash / sage_fp8++`
-ratio** instead of absolute time (today: 2.62x). The ratio
-normalizes against driver-thermal drift, which is on the order of
-1-2% across cold boots even with no code changes — see CHANGELOG's
-cu128→cu130 transition note. If absolute fp8++ time drifts but the
-ratio holds, it's the box, not the code.
+ratio** instead of absolute time (today: 2.66x at the v0.4.1 primary
+shape). The ratio normalizes against driver-thermal drift, which is
+on the order of 1-2% across cold boots even with no code changes —
+see CHANGELOG's cu128→cu130 transition note. If absolute fp8++ time
+drifts but the ratio holds, it's the box, not the code.
+
+The regression-gate floor is encoded in `tests/regression_baselines.json`
+under `speedup_ratio_floor` (currently 1.5x) — sage drops below that
+on the primary row → the fork's reason to exist is empirically
+suspect. The `--check-regression` flag exits non-zero on any
+load-bearing perf drift > 5%, rtol budget breach (> 0.10), or
+speedup-ratio floor breach.
 
 Bench env (torch / triton / CUDA / sage rev) pinned to
 `internal/bench_env_<date>.txt`; resnapshot after any version bump
@@ -504,8 +536,8 @@ The bench output is also a diagnostic for where to spend the next
 research hour. Five patterns to look for:
 
 1. **Where kernels disagree on rtol, the gap is the optimization
-   target.** If fp8_cuda++ shows 0.097 rtol at 19.95ms and fp16_cuda
-   shows 0.04 rtol at ~22ms, the 0.057 rtol delta is "FP8
+   target.** If fp8_cuda++ shows 0.098 rtol at 20ms and fp16_cuda
+   shows 0.037 rtol at ~34ms, the 0.061 rtol delta is "FP8
    quantization cost." The research question becomes: is there a
    variant of fp8 quant (scale_max, granularity, per-block Q mean,
    etc.) that closes some of that gap at similar speed? If you
@@ -518,16 +550,18 @@ research hour. Five patterns to look for:
    Move up the stack: torch.compile around sage, fusion with
    adjacent ops, model-side activation reformulation.
 3. **Speedup-ratio degradation tells you which torch path got
-   better.** If `torch_flash / sage_fp8++` drops from 2.62x to 1.8x
+   better.** If `torch_flash / sage_fp8++` drops from 2.66x to 1.8x
    on a future torch release, torch closed gap somewhere — check
    the `torch_flash`, `torch_eff`, `torch_cudnn` row that improved
    most and figure out what changed. That's where fp8++ is leaving
    perf on the table.
-4. **Outliers in the kv sweep are kernel-boundary effects.** A
-   cross-attn rtol that breaks the smooth `1/seq_kv` trend at one
-   specific kv is a block-size or autotune-config artifact. Target
-   the outlier with a focused experiment; don't change global
-   defaults.
+4. **Short-Q rows where sage loses to torch_flash.** v0.4.1 bench
+   shows the seq=497/498 short-Q paths (Gemma 3 text-encoder /
+   audio cross-attn) at ~0.45x vs torch_flash -- sage is materially
+   slower on short shapes because int8 quant + kernel launch
+   overhead exceeds the matmul work. The consumer's `nodes_sage.py`
+   has a deferred "min-sequence skip" backlog item; this is the
+   empirical evidence that gates it.
 5. **The unmasked-vs-masked timing gap quantifies the deferred CUDA
    mask kernel.** Today triton is the only mask-correct path; if
    `triton @ kv=N` is K× slower than `fp8++ @ kv=N` (unmasked) at
@@ -535,13 +569,14 @@ research hour. Five patterns to look for:
    item "Add mask support to the sm80/sm89 CUDA kernels." If K < 2x,
    the kernel work probably isn't worth days of effort. If K > 5x at
    shapes the consumer actually hits, the trigger fires. The probe
-   row `cross_attn_unmasked_kv226_kratio_probe` in
+   row `ltx23_video_cross_unmasked_kv226_kratio_probe` in
    `tests/test_sageattn_ltx_shapes.py` exists specifically so K is
-   measurable -- it pairs with `cross_attn_text_kv226` (same shape,
-   masked) so K = triton_masked_ms / fp8++_unmasked_ms is just two
-   numbers from the bench output. **Measured 2026-04-26:** K ≈ 1.68
-   at kv=226, K ≈ 2.0 at kv=1024 -- both below the 5x trigger, so
-   the deferred kernel work is not perf-justified today. Re-measure
+   measurable -- it pairs with `ltx23_video_cross_text_kv226` (same
+   shape, masked) so K = triton_masked_ms / fp8++_unmasked_ms is just
+   two numbers from the bench output. **Measured 2026-04-27 at the
+   corrected d=128 video config:** K ≈ 1.57 at kv=226 (triton 1.16ms
+   / fp8++ 0.74ms), still well below the 5x trigger, so the deferred
+   kernel work is not perf-justified today. Re-measure
    after every kernel-side optimization that lands on the unmasked
    cross-attn path; if fp8++ at small kv gets meaningfully faster,
    K grows and the trigger could fire even with no triton change.

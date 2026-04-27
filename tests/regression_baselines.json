@@ -1,0 +1,65 @@
+{
+  "_schema_version": 1,
+  "_captured": "2026-04-27",
+  "_captured_from": "v0.4.1 measurement run on production-aligned SHAPES; internal/log/test_sageattn_ltx_shapes_2026-04-27.log",
+  "_env_snapshot": "internal/bench_env_2026-04-25.txt",
+  "_device": "RTX 4090 / sm89",
+  "_torch": "2.11.0+cu130",
+  "_triton": "3.6.0",
+  "_cuda": "13.0",
+  "_sage_rev_at_capture": "8f737c3",
+  "rtol_budget": 0.10,
+  "perf_drift_pct": 5.0,
+  "speedup_ratio_floor": 1.5,
+  "_doc": "Pinned (shape, mode) baselines for the load-bearing rows in tests/test_sageattn_ltx_shapes.py. Run the bench with --check-regression to gate on these. Update via a deliberate kernel/env change. Drift threshold per CLAUDE.md / Bench env discipline. Speedup ratio floor per CLAUDE.md / Performance research / What we explicitly ignore (torch_eff/torch_cudnn rows). v0.4.1 realignment: shapes sourced from real consumer trace sage_2026-04-26_105851.jsonl, mapped to LTX 2.3 default config (transformer_ltx2.py:907-947) -- video d=128, audio d=64.",
+  "baselines": [
+    {
+      "shape": "ltx23_video_self_attn_init_22932",
+      "mode": "fp8_cuda++",
+      "median_ms": 20.20,
+      "mean_rtol": 0.0978,
+      "load_bearing": true,
+      "rationale": "primary metric -- LTX 2.3 video self-attn at production seq (init render), corrected head_dim=128. CLAUDE.md / Performance research / load-bearing"
+    },
+    {
+      "shape": "ltx23_video_self_attn_init_22932",
+      "mode": "torch_flash",
+      "median_ms": 53.63,
+      "mean_rtol": null,
+      "load_bearing": true,
+      "rationale": "speedup-ratio normalizer; torch_flash/sage_fp8++ = 2.66x at production shape; floor 1.5x"
+    },
+    {
+      "shape": "ltx23_video_self_attn_loop_23296",
+      "mode": "fp8_cuda++",
+      "median_ms": 20.52,
+      "mean_rtol": 0.0977,
+      "load_bearing": true,
+      "rationale": "loop-iter variant; most common iter>=1 path in production traces"
+    },
+    {
+      "shape": "ltx23_video_cross_unmasked_kv226_kratio_probe",
+      "mode": "fp8_cuda++",
+      "median_ms": 0.74,
+      "mean_rtol": 0.0904,
+      "load_bearing": true,
+      "rationale": "K-probe denominator at corrected video config; K = 1.16/0.74 = 1.57 at kv=226 (< 5x trigger; native CUDA mask kernel work stays deferred)"
+    },
+    {
+      "shape": "ltx23_video_cross_text_kv226",
+      "mode": "fp16_triton",
+      "median_ms": 1.16,
+      "mean_rtol": 0.0406,
+      "load_bearing": true,
+      "rationale": "K-probe numerator + the mask-correct kernel itself; rtol must stay near 0.04 across kv range"
+    },
+    {
+      "shape": "ltx23_video_cross_text_kv226",
+      "mode": "auto",
+      "median_ms": 1.16,
+      "mean_rtol": 0.0406,
+      "load_bearing": true,
+      "rationale": "v0.3.0 dispatcher mask-routing correctness witness: auto must dispatch masked calls to fp16_triton (matching the row above), NOT to fp8_cuda++ (which would show ~0.44 rtol from the silent-mask-drop bug)"
+    }
+  ]
+}
