@@ -92,18 +92,25 @@ class ShapeAggregate:
 def parse_traces(
     paths: list[Path],
     prompt_id_filter: str | None = None,
-) -> tuple[list[ShapeAggregate], dict[str, int], int]:
+) -> tuple[list[ShapeAggregate], dict[str, int], int, dict[str, int]]:
     """Parse one or more trace JSONL files. Returns
-    (aggregates, kernel_source_counts, total_rows).
+    (aggregates, kernel_source_counts, total_rows, skip_reason_counts).
     `kernel_source_counts` buckets rows by dispatched_kernel attribution
     (`sage_telemetry` if dispatched_kernel field is present, `legacy` if
-    only effective_mode is). The consumer's summary script
+    only effective_mode is). `skip_reason_counts` buckets rows where the
+    consumer's policy short-circuited sage entirely (e.g.
+    skip_under_seq_len -> skip_reason="under_seq_len" since their commit
+    04919fd, 2026-04-27); rows without a skip_reason field bucket as
+    "not_skipped" so the dict's totals match total_rows.
+
+    The consumer's summary script
     (`coderef/ComfyUI-AudioLoopHelper/scripts/sage_telemetry_summary.py`)
     parses the same JSONL schema for a different question
     ("what % of gen wall-time is masked-triton?"); any field-name
     change must land in both places."""
     bucket: dict[tuple[tuple[int, ...], bool, str], list[float]] = defaultdict(list)
     kernel_source_counts: dict[str, int] = {"sage_telemetry": 0, "legacy_inferred": 0}
+    skip_reason_counts: dict[str, int] = {"not_skipped": 0}
     total_rows = 0
 
     for path in paths:
@@ -130,15 +137,31 @@ def parse_traces(
                 has_mask = bool(row.get("has_mask", False))
                 elapsed_us = float(row.get("elapsed_us", 0.0))
 
-                # Prefer the v0.2.0+ dispatched_kernel field. Fall back to
-                # effective_mode for legacy traces (records the routing
-                # decision, not the kernel that actually ran).
-                if "dispatched_kernel" in row and row["dispatched_kernel"]:
-                    kernel = str(row["dispatched_kernel"])
+                # Skip-reason bucketing. Consumer policy (e.g.
+                # AudioLoopHelper's skip_under_seq_len, shipped 2026-04-27
+                # in their commit 04919fd) short-circuits sage and routes
+                # to torch SDPA on shapes where sage loses; trace rows on
+                # the skip path carry skipped=true + skip_reason=<code>.
+                # Aggregating these separately so the workload-profile
+                # output makes "policy-skipped" calls visible at a glance,
+                # distinct from sage's own dispatch decisions and from
+                # error fallbacks.
+                if row.get("skipped"):
+                    reason = str(row.get("skip_reason") or "unknown")
+                    skip_reason_counts[reason] = skip_reason_counts.get(reason, 0) + 1
+                    kernel = f"skipped:{reason}"
                     kernel_source_counts["sage_telemetry"] += 1
                 else:
-                    kernel = str(row.get("effective_mode", "unknown"))
-                    kernel_source_counts["legacy_inferred"] += 1
+                    skip_reason_counts["not_skipped"] += 1
+                    # Prefer the v0.2.0+ dispatched_kernel field. Fall back
+                    # to effective_mode for legacy traces (records the
+                    # routing decision, not the kernel that actually ran).
+                    if "dispatched_kernel" in row and row["dispatched_kernel"]:
+                        kernel = str(row["dispatched_kernel"])
+                        kernel_source_counts["sage_telemetry"] += 1
+                    else:
+                        kernel = str(row.get("effective_mode", "unknown"))
+                        kernel_source_counts["legacy_inferred"] += 1
 
                 bucket[(shape, has_mask, kernel)].append(elapsed_us)
 
@@ -148,7 +171,7 @@ def parse_traces(
         for k, v in bucket.items()
     ]
     aggregates.sort(key=lambda a: a.total_ms, reverse=True)
-    return aggregates, kernel_source_counts, total_rows
+    return aggregates, kernel_source_counts, total_rows, skip_reason_counts
 
 
 def load_baseline_shapes(baselines_path: Path) -> set[str]:
@@ -330,6 +353,25 @@ def print_freshness(kernel_source_counts: dict[str, int]) -> None:
               "approximate for those rows.)")
 
 
+def print_skip_reasons(skip_reason_counts: dict[str, int]) -> None:
+    """Surface consumer-side skip-policy reach. Suppressed when no
+    rows were skipped (the common case before AudioLoopHelper's
+    skip_under_seq_len landed)."""
+    skipped_total = sum(c for r, c in skip_reason_counts.items() if r != "not_skipped")
+    if skipped_total == 0:
+        return
+    print()
+    grand = sum(skip_reason_counts.values())
+    print("Consumer skip policy:")
+    for reason, count in sorted(skip_reason_counts.items(),
+                                key=lambda kv: kv[1], reverse=True):
+        pct = count / grand * 100.0
+        print(f"  {reason:<20} {count:>7} ({pct:5.1f}%)")
+    print(f"  -> {skipped_total} of {grand} attention calls "
+          f"({skipped_total / grand * 100.0:.1f}%) were policy-skipped "
+          f"before reaching sage.")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -351,7 +393,7 @@ def main():
     )
     args = parser.parse_args()
 
-    aggregates, kernel_source_counts, total_rows = parse_traces(
+    aggregates, kernel_source_counts, total_rows, skip_reason_counts = parse_traces(
         args.trace_paths, prompt_id_filter=args.prompt_id,
     )
 
@@ -365,6 +407,7 @@ def main():
     print_aggregates(aggregates)
     print_top_n(aggregates, n=args.top_n)
     print_coverage_check(aggregates, args.baselines)
+    print_skip_reasons(skip_reason_counts)
     print_freshness(kernel_source_counts)
 
 
