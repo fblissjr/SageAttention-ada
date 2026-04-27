@@ -20,8 +20,11 @@ Local fork of `woct0rdho/SageAttention` (itself a fork of
    fork stays primitive (kernels + bench).
 
 We care about exactly one GPU: **sm89 / RTX 40xx / Ada**. Other archs
-compile and run (the code is upstream's), but we don't test or debug
-them.
+compile and run via the dispatcher's sm100/sm120/sm121 fallback to
+the sm89 kernel, but we don't test or debug them. **We do not carry
+Hopper/Blackwell-specific kernels** (sage 3 Blackwell subpackage, sm90
+CUDA kernel, FP4 paths) -- all removed in v0.5.0. Windows install
+paths are also gone; build is Linux+source only.
 
 ## Architecture
 
@@ -42,14 +45,18 @@ Relevant pieces for us:
   `sageattn_qk_int8_pv_fp16_triton`. Works anywhere, slower than CUDA
   on sm89. **The only masked path that's numerically correct** (see
   CHANGELOG "Known kernel bugs").
-- `sageattention3_blackwell/` -- subpackage for Hopper/Blackwell.
-  Irrelevant to us; leave alone.
 - `setup.py` -- builds `_qattn_sm80`, `_qattn_sm89`, `_fused` on a
   typical Ada box after our patch (line 152 adds sm89 to the SM80
-  build gate).
+  build gate). v0.5.0 dropped the SM90 build block + the
+  CUDA-12.3-for-9.0 check + Windows MSVC compile flags; only the
+  Linux gcc + sm80/sm89 paths remain.
 - `build.sh` -- our editable-install wrapper. Enforces `VIRTUAL_ENV`,
   pins `uv pip install --python ${VIRTUAL_ENV}/bin/python`, caps
   `MAX_JOBS` at 8. Compiles for arch 8.0;8.6;8.9 by default.
+
+We do not carry Hopper/Blackwell kernels (`sageattention3_blackwell/`,
+`csrc/qattn/*sm90*`, `sm90_compile.py`), upstream's `bench/` one-shape
+scripts, or Windows wheel install paths. All removed in v0.5.0.
 
 ## Install / build
 
@@ -65,7 +72,9 @@ cd /path/to/sage-fork
 ./build.sh                # build + install editable into $VIRTUAL_ENV
 ./build.sh clean          # wipe prior .so / build/ artifacts first
 ./build.sh verify         # import-check only, no rebuild
-./build.sh full           # add Hopper (9.0) and Blackwell (12.0)
+# Hopper/Blackwell builds: set CUDA_ARCHES env var explicitly. The
+# `full` action was dropped in v0.5.0 (upstream Hopper/Blackwell
+# wasn't validated on this fork).
 ```
 
 Build is 60–90s on an 8-core box with MAX_JOBS=8. Longer if you don't cap.
@@ -252,11 +261,23 @@ telemetry test; multiple GiB for the LTX bench).
 ## What's ours vs what's upstream
 
 Upstream-from-woct0rdho code (unmodified unless noted):
-- `csrc/`, `sageattention3_blackwell/`, `pyproject.toml`, `bench/`,
+- `csrc/qattn/{pybind_sm80.cpp, pybind_sm89.cpp, qk_int_sv_f16_cuda_sm80.cu,
+  sm89_qk_int8_sv_f8_*.cu}`, `csrc/fused/`, `pyproject.toml`,
   `tests/test_sageattn.py`, `tests/test_flashattn{2,3}.py`.
 - `sageattention/` mostly unmodified except
   `sageattention/triton/attn_qk_int8_per_block.py` (we added autotune).
-- `setup.py` mostly unmodified except line 152 (sm89 → SM80 build gate).
+- `setup.py` mostly unmodified except line 152 (sm89 → SM80 build gate)
+  + v0.5.0 trims (Hopper SM90 block, CUDA-12.3-for-9.0 check, Windows
+  MSVC compile flags).
+
+Removed in v0.5.0 (we own the fork; not building or running these):
+- `sageattention3_blackwell/` -- sage 3 Blackwell subpackage (FP4).
+- `csrc/qattn/{attn_cuda_sm90.h, pybind_sm90.cpp,
+  qk_int_sv_f8_cuda_sm90.cu}` -- Hopper kernel.
+- `sageattention/sm90_compile.py` + `core.py::sageattn_qk_int8_pv_fp8_cuda_sm90`
+  function + dispatcher branch + KERNEL_FP8_CUDA_SM90 constant.
+- `bench/` -- 9 one-shape upstream benchmarks superseded by our LTX +
+  image + e2e + workload-profile bench files.
 
 Our additions and modifications (tracked in CHANGELOG.md):
 - `setup.py:152` -- one-line tuple change so `_qattn_sm80` builds on
@@ -305,11 +326,13 @@ Our additions and modifications (tracked in CHANGELOG.md):
   dispatcher-set keys like `pv_accum_dtype`) so non-mask kwargs are
   no longer silently swallowed.
 - `sageattention/core.py::_warn_if_mask_passed_to_cuda_kernel` --
-  v0.3.1 soft-warn helper. Hooked into the three CUDA entry-point
+  v0.3.1 soft-warn helper. Hooked into the two CUDA entry-point
   wrappers (`sageattn_qk_int8_pv_fp16_cuda`,
-  `sageattn_qk_int8_pv_fp8_cuda`, `sageattn_qk_int8_pv_fp8_cuda_sm90`)
-  right after the assert block. Catches consumers who bypass the
-  dispatcher and hand-pick a `_cuda` kernel with a non-None mask.
+  `sageattn_qk_int8_pv_fp8_cuda`) right after the assert block.
+  Catches consumers who bypass the dispatcher and hand-pick a `_cuda`
+  kernel with a non-None mask. (v0.5.0 dropped the third wrapper,
+  `sageattn_qk_int8_pv_fp8_cuda_sm90`, along with the rest of the
+  Hopper plumbing.)
   Soft (warns, not raises) so `attn_mask=None` defensive callers
   aren't penalized.
 - `build.sh` -- editable-install wrapper with VIRTUAL_ENV check,

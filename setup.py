@@ -36,12 +36,9 @@ if not SKIP_CUDA_BUILD:
     import torch
     from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
 
-    # Compiler flags.
-    if os.name == "nt":
-        # TODO: Detect MSVC rather than OS
-        CXX_FLAGS = ["/O2", "/openmp", "/std:c++17", "/permissive-", "-DENABLE_BF16"]
-    else:
-        CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
+    # Compiler flags. Linux-only build; Windows wheel paths upstream
+    # are not validated on this fork.
+    CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
 
     NVCC_FLAGS_COMMON = [
         "-O3",
@@ -55,12 +52,6 @@ if not SKIP_CUDA_BUILD:
         "-diag-suppress=177",
         "-diag-suppress=221",
     ]
-    if os.name == "nt":
-        # https://github.com/pytorch/pytorch/issues/148317
-        NVCC_FLAGS_COMMON += [
-            "-D_WIN32=1",
-            "-DUSE_CUDA=1",
-        ]
 
     # Append flags from env if provided
     cxx_append = os.getenv("CXX_APPEND_FLAGS", "").strip()

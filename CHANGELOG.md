@@ -252,6 +252,98 @@ sufficient.
 
 ## Versions
 
+### v0.5.0 -- 2026-04-27  (dead-code removal: Hopper/Blackwell + Windows + upstream bench)
+
+Aggressive cut of upstream code that doesn't serve sm89/Ada or our
+active research surface. We own this fork; we never push to upstream;
+the cost of carrying unused code is more than the cost of removing
+it. Each removal landed as its own commit so `git revert <sha>`
+works granularly per arc.
+
+#### Removed (4 arcs, ~7000 lines, no functional change for sm89)
+
+**Arc 1 -- `sageattention3_blackwell/` (commit ceddb19, -5027 lines)**
+The sage 3 Blackwell subpackage targets sm120+ with FP4 quantization.
+Completely isolated -- zero imports from `sageattention/`, no
+`setup.py` references, no test coverage. 27 files removed.
+
+**Arc 2 -- sm90 Hopper kernel + Python wrapper + entry point (-1285 lines)**
+- `csrc/qattn/{attn_cuda_sm90.h, pybind_sm90.cpp, qk_int_sv_f8_cuda_sm90.cu}`
+  -- the Hopper CUDA kernel sources.
+- `sageattention/sm90_compile.py` -- the Python custom-op wrapper.
+- `sageattention/core.py::sageattn_qk_int8_pv_fp8_cuda_sm90` (~170-line
+  function), the `SM90_ENABLED` guard + try/import block, and the
+  `arch == 'sm90'` dispatcher branch in `sageattn()`.
+- `KERNEL_FP8_CUDA_SM90` constant + `'fp8_cuda_sm90'` entry from
+  `KernelName` Literal and `KNOWN_KERNEL_NAMES` frozenset.
+- `sageattn_qk_int8_pv_fp8_cuda_sm90` from
+  `sageattention/__init__.py` exports.
+- `setup.py`: the SM90 `CUDAExtension` build block + the
+  CUDA-12.3-for-9.0 minimum-version check.
+- `build.sh`: `_qattn_sm90` from the verify-extensions inventory + the
+  "sageattn3 (Hopper/Blackwell)" line in the available-kernels print.
+
+Build verifies clean post-removal: `_qattn_sm80` + `_qattn_sm89` +
+`_fused` import. Telemetry test passes (dispatcher routes correctly,
+fp8_cuda++ on unmasked / fp16_triton on masked, soft-warns on
+hand-picked CUDA + mask). Regression-check unit tests pass.
+
+**Arc 3 -- `bench/` upstream one-shape benchmarks (-706 lines)**
+9 files (`bench_baseline.py`, `bench_fa3.py`, `bench_fa3_fp8.py`,
+`bench_qk_int8_pv_fp16_cuda.py`, `bench_qk_int8_pv_fp16_triton.py`,
+`bench_qk_int8_pv_fp8_cuda.py`, `bench_qk_int8_pv_fp8_cuda_sm90.py`,
+`utils.py`, `README.md`). Zero references from any code we keep.
+Superseded by:
+- `tests/test_sageattn_ltx_shapes.py` -- production-shape sweep across
+  every sage kernel + 3 torch SDPA backends + FlashInfer/Sparge gates.
+- `tests/test_sageattn_image_shapes.py` -- image-gen head_dim coverage.
+- `tests/bench_e2e_ltx.py` -- end-to-end gen wall-time bench via
+  ComfyUI HTTP API.
+- `tests/bench_workload_profile.py` -- consumer-trace aggregator with
+  coverage-gap analysis.
+
+**Arc 4 -- build.sh `full` mode + Windows compile flags (-15 lines)**
+- `build.sh`: dropped `./build.sh full` action that targeted Hopper +
+  Blackwell arches we never validate. Default `./build.sh` targets
+  `8.0;8.6;8.9` (Ampere + Ada); env override `CUDA_ARCHES`
+  preserved for explicit Hopper/Blackwell builds.
+- `setup.py`: dropped `os.name == "nt"` branches in `CXX_FLAGS`
+  (MSVC `/O2 /openmp /std:c++17 /permissive-`) and
+  `NVCC_FLAGS_COMMON` (`-D_WIN32=1 -DUSE_CUDA=1`). README narrows
+  install to Linux+source; the Windows wheel paths upstream
+  maintained are not validated here.
+
+#### Why this is right
+
+We own the fork; there's no upstream to send PRs to. Hopper/Blackwell
+kernels won't run on sm89 even if compiled. Windows-build paths exist
+upstream but are untested on this fork. Upstream's one-shape `bench/`
+scripts measured one number with no rtol guardrails -- our LTX-shape
+bench measures every kernel + every torch backend on production-
+relevant shapes with `--check-regression` gating. Carrying unused
+code inflates audit surface, build time, pyright noise, and the
+"what does this fork actually do" question every reader has to
+re-answer. The cost of removal is bounded; the cost of carrying it
+recurs every time anyone reads the tree.
+
+#### What's preserved
+
+- sm80 kernel (forward-compatible to Ada via CUDA backward-compat;
+  still powers `sageattn_qk_int8_pv_fp16_cuda`).
+- sm89 kernels (the production hot path; `sageattn_qk_int8_pv_fp8_cuda`
+  and the `++` variant).
+- Triton kernels (mask-correct path; `sageattn_qk_int8_pv_fp16_triton`).
+- The dispatcher's `arch in {"sm100", "sm120", "sm121"}` branch -- it
+  routes to the existing sm89 kernel; one-line forward-compat for
+  Blackwell users who happen to install this fork. Removing it would
+  be churn with no win.
+
+#### Verified, no action
+
+- Dispatcher telemetry test -- 11 cases pass post-removal.
+- Regression-check unit tests -- 7 cases pass post-removal.
+- Build verify mode -- all expected extensions importable.
+
 ### v0.4.1 -- 2026-04-27  (bench coverage realigned to production; head_dim claim corrected)
 
 Closes a load-bearing measurement bug. Every perf decision the fork

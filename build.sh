@@ -12,7 +12,6 @@
 #   ./build.sh              # build for Ada + Ampere backward compat (default)
 #   ./build.sh clean        # remove prior build artifacts first
 #   ./build.sh verify       # verify a previous build without rebuilding
-#   ./build.sh full         # Ampere + Ada + Hopper + Blackwell
 #
 # Env overrides:
 #   CUDA_ARCHES  override the default arch list (e.g. CUDA_ARCHES="8.0;8.9")
@@ -31,10 +30,6 @@ cd "${SCRIPT_DIR}"
 ACTION="${1:-build}"
 
 case "${ACTION}" in
-    full)
-        CUDA_ARCHES="8.0;8.6;8.9;9.0;12.0"
-        ACTION="build"
-        ;;
     clean)
         echo "==> Cleaning prior build artifacts"
         rm -rf build/ dist/ sageattention.egg-info/ sageattention/*.so
@@ -46,7 +41,7 @@ case "${ACTION}" in
         ;;
     *)
         echo "Unknown action: ${ACTION}" >&2
-        echo "Usage: $0 [build|clean|verify|full]" >&2
+        echo "Usage: $0 [build|clean|verify]" >&2
         exit 1
         ;;
 esac
@@ -72,9 +67,8 @@ echo "==> Detected CUDA:   ${CUDA_VER}"
 echo "==> Target archs:    ${CUDA_ARCHES}"
 echo "==> Target venv:     ${VIRTUAL_ENV}"
 
-# setup.py asserts CUDA >= 12.4 for 8.9, >= 12.3 for 9.0, >= 12.8 for 12.0.
-# We don't replicate those here -- let setup.py fail with its own message
-# if the toolkit is too old for the requested archs.
+# setup.py asserts CUDA >= 12.4 for 8.9. We don't replicate that here --
+# let setup.py fail with its own message if the toolkit is too old.
 
 if [[ "${ACTION}" == "build" ]]; then
     # Use the project's venv if one is active; otherwise uv will pick the
