@@ -161,11 +161,14 @@ _RUN_ID_DIR_PATTERN = re.compile(r"^\d{8}T\d{6}Z_[0-9a-f]{4}$")
 _WARM_TRACE_AGE_SECONDS = 30 * 60
 
 
-def _recent_sage_trace_indicates_warm() -> bool:
+def _recent_sage_trace_exists() -> bool:
     """True if any RUN_ID dir under coderef/.../data/runs/ has a
     non-empty sage.jsonl with mtime < _WARM_TRACE_AGE_SECONDS.
-    Defensive: returns False on any I/O error so a broken filesystem
-    doesn't silently skip warmup."""
+    Filesystem-only signal; cannot distinguish "ComfyUI is still
+    the same warm instance" from "ComfyUI was warm 30 min ago, then
+    restarted cold." Pair with `_comfyui_session_has_history()` to
+    rule out the restart case.
+    """
     runs_dir = CONSUMER_ROOT / "data" / "runs"
     if not runs_dir.is_dir():
         return False
@@ -183,6 +186,49 @@ def _recent_sage_trace_indicates_warm() -> bool:
     except OSError:
         return False
     return False
+
+
+def _comfyui_session_has_history(host: str) -> bool:
+    """Probe ComfyUI's `/history` endpoint. Returns True if the
+    server has processed at least one prompt this session.
+
+    `/history` is in-memory (not disk-persisted) and resets on
+    ComfyUI restart, so an empty history is a strong signal that
+    ComfyUI is freshly started -- model load, JIT cache, per-node
+    cache all cold regardless of what stale sage trace files are
+    sitting on disk from prior sessions.
+
+    Returns False if the probe fails (network error, endpoint not
+    available); the caller should treat unknown as cold and warm
+    up.
+    """
+    url = f"http://{host}/history"
+    try:
+        with urllib.request.urlopen(url, timeout=5.0) as resp:
+            data = orjson.loads(resp.read())
+    except (urllib.error.URLError, OSError, orjson.JSONDecodeError):
+        return False
+    if isinstance(data, dict):
+        return len(data) > 0
+    if isinstance(data, list):
+        return len(data) > 0
+    return False
+
+
+def _caches_appear_warm(host: str) -> bool:
+    """True only if BOTH (a) a recent sage trace exists on disk AND
+    (b) ComfyUI's in-memory history is non-empty (i.e. the server
+    has not just restarted). Either signal alone is unreliable:
+
+    - Trace alone fails when ComfyUI restarts -- old trace mtime
+      remains recent but the in-process state is cold.
+    - History alone fails when ComfyUI processed prompts in another
+      workflow -- it doesn't tell us sage's caches are warm.
+
+    Both together is the strongest filesystem-+-HTTP-probe signal
+    we can build without ComfyUI exposing a session uptime field.
+    """
+    return _recent_sage_trace_exists() and _comfyui_session_has_history(host)
 
 
 def resolve_run_id(cli_run_id: str | None) -> str | None:
@@ -687,14 +733,16 @@ def main() -> int:
     # gets reported slower by 100s of seconds even when the actual
     # attention-time difference is single-digit seconds.
     #
-    # 'auto' policy: skip warmup if the most-recent sage trace mtime
-    # is < 30 min old. ComfyUI typically holds in-process state
-    # (model load, JIT, per-node cache) for the lifetime of the
-    # server; a fresh sage trace within 30 min is strong evidence
-    # the same instance is still up and warm. Triton's on-disk
-    # autotune cache survives across sessions anyway.
+    # 'auto' policy: skip warmup only if BOTH (a) a recent sage
+    # trace exists on disk AND (b) ComfyUI's /history is non-empty.
+    # Filesystem mtime alone is unreliable -- the trace persists
+    # across ComfyUI restarts, so a 30-min-old trace looks "recent"
+    # even when ComfyUI was just restarted cold (false positive
+    # caught 2026-04-27 by the user). /history is in-memory and
+    # resets on restart, so empty history is a definite "cold"
+    # signal regardless of what the filesystem shows.
     should_warm = args.warmup == "always" or (
-        args.warmup == "auto" and not _recent_sage_trace_indicates_warm()
+        args.warmup == "auto" and not _caches_appear_warm(host)
     )
     if should_warm:
         print(f"[warmup] running 1 prompt in '{args.sage_mode}' mode "
@@ -702,7 +750,7 @@ def main() -> int:
         run_one(host, prompt, args.sage_mode, run_idx=-1, client_id=client_id)
         time.sleep(args.inter_run_sleep)
     elif args.warmup == "auto":
-        print("[warmup] skipped (recent sage trace detected; caches likely warm)")
+        print("[warmup] skipped (recent sage trace + non-empty ComfyUI history; caches warm)")
     else:
         print("[warmup] skipped per --warmup never / --no-warmup")
 
