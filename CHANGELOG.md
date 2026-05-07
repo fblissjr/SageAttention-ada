@@ -206,6 +206,75 @@ spend on a "kernel-side gap" finding.
 Investigations that closed without action. Recorded so we don't
 re-derive them. Each entry has an explicit reopen-trigger.
 
+### "FFN-adjacent reach" / launch-overhead / cache-footprint hypotheses on iclora: all three falsified
+
+**Investigated 2026-05-07** (cross-claude bounded investigation
+with AudioLoopHelper claude; memo trail in
+`internal/AUDIO_LOOP_CLAUDE_TO_SAGE_CLAUDE_MEMO.md` +
+`internal/SAGE_CLAUDE_TO_AUDIO_LOOP_CLAUDE_MEMO.md`).
+
+The v0.5.1 entry's claim that sage's e2e speedup "extends beyond
+per-call attention rows into FFN-adjacent amortization within the
+sampler step" was a single-data-point inference from the
+audio_loop_latent workload (arm-2 attention time was never directly
+traced; +17pt above strict Amdahl was attributed to FFN-adjacent
+mechanism without measurement).
+
+A clean sage-on/sage-off A/B on the iclora workflow (consumer's
+production-scale workload, profiler on, matched 3456 attention calls
+per arm) decomposes the savings cleanly:
+
+| Mechanism | Savings | Status |
+|---|---|---|
+| Attention kernel time (sage 7.20ms vs torch flash 22.14ms) | -51.6s | confirmed (dominant) |
+| Non-attention named CUDA kernels | +2.1s | sage-on slightly slower |
+| cudaLaunchKernel call-count delta (0.82%) | -0.4s | negligible |
+| Wall-clock vs CUDA-time gap (CPU-side) | -3.9s | not GPU-side |
+
+Strict Amdahl with iclora's actual attention share (~42% of CUDA
+time) and the actual per-kernel ratio (3.08x) predicts 1.39x e2e
+speedup; measured wall ratio is 1.41x -- match within 1.4%. **No
+non-Amdahl mechanism is required on iclora.**
+
+Three hypotheses closed:
+1. **Launch-overhead reduction** ("sage replaces torch SDPA's
+   decomposed-op path with one fused kernel, saving ~6-10 launches
+   per attention call"): falsified. Sage-off is already routed
+   through `aten::_scaled_dot_product_flash_attention` -- one fused
+   launch per call. Sage replaces flash with sage; one-fused-for-
+   one-fused. Total launch delta is 2205 of 270k (0.82%).
+2. **FFN-adjacent reach via int8 amortization**: falsified on
+   iclora. Non-attention CUDA kernel time is essentially identical
+   sage-on vs sage-off (delta -2.1s, in the wrong direction).
+3. **Cache-footprint helping adjacent matmul/elementwise**:
+   falsified on iclora. If int8 K + fp8 V freed L2/HBM bandwidth
+   for adjacent ops, the named matmul kernels would be faster
+   sage-on; instead they're 0.13-0.73s slower per kernel (sage's
+   own quant work pollutes their cache lines).
+
+**Decision:** retire all three from sage-fork's mental model on
+iclora. The original v0.5.1 +17pt residual on audio_loop_latent
+remains unexplained but is single-data-point and measurement-
+methodology-dependent (no arm-2 attention tracer); not load-
+bearing for any current decision.
+
+**Trigger to reopen:**
+- A future workload measures non-trivial sage-on-vs-off non-
+  attention kernel-time delta (>5s on a render of similar scale to
+  iclora's 180s sage-off baseline). Direct evidence of any of the
+  three mechanisms operating.
+- The audio_loop_latent +17pt gets re-measured with arm-2
+  attention tracing in place, confirming it's real and not an
+  inference artifact. If real and reproducible, the mechanism
+  question reopens for that specific workload.
+
+**Process note:** the pre-committed-prior-and-decision-rule
+discipline (recorded in CLAUDE.md / "Pre-trigger briefing
+pattern") fired correctly twice in this exchange. Both times an
+investigation produced a "your hypothesis is wrong" outcome
+without consuming downstream code-change budget. Confirmed as
+default for future cross-claude bounded investigations.
+
 ### sm89 fp8 quantization scale: closed as no-action
 
 **Investigated 2026-04-23.** `sageattention/core.py:772-774` keeps

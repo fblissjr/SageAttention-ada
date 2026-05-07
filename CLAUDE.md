@@ -608,18 +608,51 @@ tests/test_sageattn_ltx_shapes.py
 ```
 
 The kernel ratio (2.66x) is what the bench measures directly. The
-e2e ratio (1.22x) is what the consumer's LTX gen achieves; it's
-lower because attention is only 8.2% of gen wall time, but higher
-than pure-attention Amdahl predicts (~1.05x) because sage's reach
-extends beyond per-call attention rows into FFN-adjacent
-amortization within the sampler step. Both numbers move
-independently across torch / triton / CUDA bumps; track both.
+e2e ratio depends on the workload's attention share -- and the share
+varies. Two measurements on file:
 
-Sourced from a real consumer trace; see CHANGELOG v0.4.1 for the
-shape re-derivation and v0.5.1 for the e2e measurement. The earlier
-metric (`self_attn_large_704x704x497` at seq=31776, D=64) was a
-synthetic shape with the wrong head_dim -- LTX 2.3 video is D=128,
-not D=64.
+- **audio_loop_latent.api.json (832x480x497 / 25fps / 8-step distilled,
+  v0.5.1 e2e bench)**: attention 8.2% of wall, e2e ratio 1.22x
+  VAE-decode-cold-start-normalized. Pure-attention Amdahl with the
+  2.66x kernel ratio predicts ~1.05x; observed exceeded that by 17
+  points. The v0.5.1 entry attributed the +17pt to "FFN-adjacent
+  reach within the sampler step" -- but that was a single-data-point
+  inference (arm-2 attention time was never directly traced; the
+  attribution assumed the kernel ratio held but didn't measure it on
+  the actual workload). Treat the 1.22x as load-bearing; treat the
+  FFN-adjacent mechanism story as an unverified hypothesis.
+- **iclora at production scale (audio-loop-music-video_latent_iclora
+  workflow, sage-on/sage-off A/B 2026-05-07)**: attention is ~42% of
+  CUDA kernel time (76.5/183.4 sage-off). Per-kernel ratio is 3.08x
+  on the actual call mix (matched 3456 calls/render in both arms;
+  sage 7.20 ms/call vs torch flash 22.14 ms/call). Strict Amdahl with
+  these inputs predicts 1.39x; measured wall ratio is 1.41x -- match
+  within 1.4%. **No non-Amdahl term is needed on iclora.** Kernel-
+  level decomposition shows non-attention CUDA time is essentially
+  identical sage-on vs sage-off (delta -2.1s, in the wrong direction
+  for any "FFN-adjacent" or "cache-footprint" reach). Launch-overhead
+  delta is 0.82% of total launches -- ~0.4s, also negligible. The
+  full saving comes from sage's faster attention kernel.
+
+Both numbers are real; they describe different workloads with
+different attention shares. The framework: measure attention-share-
+of-CUDA-time on each workload of interest, apply Amdahl with the
+per-kernel ratio observed on that workload's actual call mix, and
+treat any residual as a hypothesis that needs its own measurement
+before going into a perf claim. Don't generalize one workload's
+ratio to another.
+
+Sourced from real consumer traces; see CHANGELOG v0.4.1 for the
+kernel-bench shape re-derivation, v0.5.1 for the audio_loop_latent
+e2e measurement, and the 2026-05-07 cross-claude memo trail
+(`internal/AUDIO_LOOP_CLAUDE_TO_SAGE_CLAUDE_MEMO.md` +
+`internal/SAGE_CLAUDE_TO_AUDIO_LOOP_CLAUDE_MEMO.md`) for the iclora
+A/B decomposition that retired the launch-overhead, FFN-adjacent,
+and cache-footprint hypotheses on that workload.
+
+The earlier metric (`self_attn_large_704x704x497` at seq=31776, D=64)
+was a synthetic shape with the wrong head_dim -- LTX 2.3 video is
+D=128, not D=64.
 
 Anything else you might want to measure is secondary, useful as a
 guard against side effects, or explicitly ignored — see below.
