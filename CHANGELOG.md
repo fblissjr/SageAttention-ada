@@ -393,6 +393,23 @@ when someone says "this used to be faster."
 **Trigger to act:** any version bump in the list above, OR a measured >5%
 shape-level drift on a routine workflow gen.
 
+**Open observation (2026-05-07):** synthetic LTX bench
+(`tests/test_sageattn_ltx_shapes.py`) reports `torch_flash / sage_fp8++`
+= **2.66x** at the primary shape; the iclora production A/B (cross-
+claude memo trail, 2026-05-07) measured the same kernel pair at
+**3.08x** averaged over 3456 cache-warm calls. The 16% gap is unaddressed
+but probably not a real kernel-side change. Most likely candidates,
+roughly ranked: (1) median-of-3 (synthetic) vs sum/calls average over
+3456 calls (production) is a different statistical animal — long-tail
+distributions on warm production state can shift the central estimate
+10-15% even on identical shapes; (2) cache state (synthetic short-burst
+vs production sustained); (3) driver-thermal asymmetry across kernel
+types under sustained load; (4) torch/triton/CUDA drift between when the
+synthetic bench was last snapshotted and when iclora ran. Action: log
+this gap on the next bench env re-snapshot. If the synthetic ratio shifts
+toward 3.08x without a kernel-side change, hypothesis (1) is the answer
+and the synthetic bench's median-of-3 protocol may be worth widening.
+
 ### Session-level attention telemetry summary (consumer side)
 
 Cross-repo backlog item, tracked here because it feeds sage-fork's

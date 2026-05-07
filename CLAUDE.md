@@ -272,6 +272,21 @@ telemetry test; multiple GiB for the LTX bench).
   read of the dispatch code catches this in seconds. **Use `coderef/`
   proactively as a verification surface, not just reactively at
   audit time.** Audit trail in `internal/audit_2026-04-26.md`.
+  Beyond code: `coderef/<consumer>/data/runs/*/profiler/summary.txt`
+  chrome-trace categorizations are the authoritative answer to "where
+  does GPU time actually go." Read them before promoting any perf
+  *mechanism* claim. The 2026-05-07 FFN-adjacent retirement was sitting
+  in the archive for 6 days before use.
+- **Mechanism claims need both arms measured, not inferred from one.**
+  A perf *number* can come from one measurement; a perf *mechanism*
+  claim ("sage's reach extends beyond attention into the sampler")
+  needs both A/B arms directly instrumented. CHANGELOG v0.5.1's
+  "FFN-adjacent reach" claim was promoted to load-bearing status on a
+  single-data-point inference (arm-2 attention time was never traced)
+  and lived for 10 days before the 2026-05-07 cross-claude A/B retired
+  it (CHANGELOG Decision log). When in doubt, write the claim with the
+  workload + measurement context attached so the inference-vs-
+  measurement distinction stays visible.
 - **Run `/simplify` after every substantive arc, not just at session
   end.** Three passes one session caught: a real `TypeError` in
   v0.3.1 kwargs forwarding, two SIGPIPE-under-pipefail bugs in bash
