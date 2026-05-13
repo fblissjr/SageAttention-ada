@@ -104,8 +104,42 @@ above. Size estimate: days of kernel work, not hours (pybind signature,
 new `MaskMode::kGeneral`, kernel-loop mask application, plus perf and
 register-pressure regression verification).
 
-**Trigger to act:** triton's cross-attn perf becomes a measured
-bottleneck on a real production render (not speculatively).
+**Triggers to act (any one of):**
+
+1. *Perf signal*: K = `triton_masked_ms / fp8++_unmasked_ms` crosses
+   5x at a shape the dispatcher hits in production. Last measured:
+   K ~= 1.57 at kv=226 on RTX 4090 (v0.4.1 bench, 2026-04-27) -- well
+   below the threshold. Re-measure after every kernel-side optimization
+   that lands on the unmasked cross-attn path; the probe row
+   `ltx23_video_cross_unmasked_kv226_kratio_probe` exists for this.
+2. *Wall-time signal*: a downstream consumer's per-call JSONL trace
+   over a real production gen reports masked-triton as >5% of total
+   gen wall-time. (See Recurring process items / "Session-level
+   attention telemetry summary.")
+3. *Structural-correctness signal*: a downstream consumer explicitly
+   asks for the CUDA path to be mask-correct as a routing or
+   stability concern, not just a perf concern. The original trigger
+   formulation excluded this dimension; v0.5.4's Phase 3 work
+   surfaced that it should be included. Threshold: 2+ independent
+   downstream consumers, or 1 consumer with high-leverage rationale
+   (e.g. forced-Triton routing in a load-bearing upstream PR they
+   would otherwise rather not merge).
+
+**Signals received so far:**
+
+- 2026-05-13 -- Kijai (ComfyUI maintainer, Comfy-Org/ComfyUI PR
+  13735 author): on Discord, "yeah it just feels dangerous to force
+  the triton sage path in general / I'm not sure why their cuda
+  paths don't support it, and would it technically be possible to
+  fix". One signal on dimension #3. Not yet sufficient to fire the
+  trigger alone (threshold is 2+ independent OR high-leverage
+  rationale + commitment). His PR forces SDPA fallback, not
+  Triton, so the "would rather not merge" lever doesn't apply
+  here. Logged for future aggregation.
+
+Until a trigger fires, the dispatcher's masked->triton routing
+(v0.3.0) + the `_warn_if_mask_passed_to_cuda_kernel` soft-warn
+(v0.3.1) remain the consumer-facing safety net.
 
 ### `torch.library.custom_op` registration for fused-pybind kernels
 
