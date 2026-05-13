@@ -1,0 +1,45 @@
+{
+  "config": {
+    "batch": 1,
+    "heads": 32,
+    "seq": 23296,
+    "head_dim": 128,
+    "guide_start": 22796,
+    "tracked_count": 500,
+    "dtype": "bf16",
+    "device_name": "NVIDIA GeForce RTX 4090",
+    "partition": "noisy[0:22796] mask_q=1 + tracked[22796:23296] mask_q=500",
+    "slices": [
+      {
+        "name": "noisy",
+        "q_start": 0,
+        "q_end": 22796,
+        "mask_q_dim": 1
+      },
+      {
+        "name": "tracked",
+        "q_start": 22796,
+        "q_end": 23296,
+        "mask_q_dim": 500
+      }
+    ]
+  },
+  "results_mib": {
+    "single_full_T_no_mask": 1095.98095703125,
+    "single_full_T_with_broadcast_mask": 1096.025390625,
+    "N_call_cumulative_no_mask": 1807.033203125,
+    "N_call_cumulative_with_mask": 1272.16552734375,
+    "per_call_mask_bytes": [
+      46592,
+      23296000
+    ],
+    "total_mask_mib": 22.26123046875
+  },
+  "decision_gate": {
+    "reference_mib": 1095.98095703125,
+    "delta_no_mask_mib": 711.05224609375,
+    "delta_with_mask_mib": 176.1845703125,
+    "threshold_mib": 130.0,
+    "verdict": "proceed"
+  }
+}
