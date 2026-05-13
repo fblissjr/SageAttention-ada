@@ -1,5 +1,8 @@
 # sage-fork
 
+L1 routing index. Detailed material lives in `docs/` (committed) and
+`internal/` (gitignored); see "Deeper context" at the bottom.
+
 ## TLDR
 
 Local fork of `woct0rdho/SageAttention` (itself a fork of
@@ -14,56 +17,42 @@ Local fork of `woct0rdho/SageAttention` (itself a fork of
 2. **Experimentation and measurement surface** for sm89 attention
    kernel decisions. The LTX-shape bench harness
    (`tests/test_sageattn_ltx_shapes.py`) and torch.compile spike
-   live here so kernel-side decisions (autotune coverage,
-   mask-kernel work, FlashInfer / SpargeAttn comparisons) can be
-   made with numbers. Consumers handle their own routing policy; the
-   fork stays primitive (kernels + bench).
+   live here so kernel-side decisions can be made with numbers.
+   Consumers handle their own routing policy; the fork stays
+   primitive (kernels + bench).
 
 We care about exactly one GPU: **sm89 / RTX 40xx / Ada**. Other archs
 compile and run via the dispatcher's sm100/sm120/sm121 fallback to
-the sm89 kernel, but we don't test or debug them. **We do not carry
-Hopper/Blackwell-specific kernels** (sage 3 Blackwell subpackage, sm90
-CUDA kernel, FP4 paths) -- all removed in v0.5.0. Windows install
-paths are also gone; build is Linux+source only.
+the sm89 kernel, but we don't test or debug them. We do not carry
+Hopper/Blackwell-specific kernels (all removed in v0.5.0). Windows
+install paths are also gone; build is Linux+source only.
 
 ## Architecture
 
-This is a CUDA extension + Triton + Python wrapper for int8/fp8
-quantized attention. Upstream structure unchanged from the last sync.
-Relevant pieces for us:
+CUDA extension + Triton + Python wrapper for int8/fp8 quantized
+attention. Relevant pieces:
 
 - `sageattention/core.py` -- `sageattn()` top-level dispatch. On
   sm89 + CUDA >= 12.8, picks `sageattn_qk_int8_pv_fp8_cuda` with
   `pv_accum_dtype="fp32+fp16"` (SageAttention2++).
-- `csrc/qattn/pybind_sm80.cpp` + `csrc/qattn/qk_int_sv_f16_cuda_sm80.cu` --
-  the SM80 kernel (INT8 QK + FP16 PV, fp32 accum). Forward-compatible to
-  Ada. Powers `sageattn_qk_int8_pv_fp16_cuda`.
-- `csrc/qattn/pybind_sm89.cpp` + `csrc/qattn/sm89_qk_int8_sv_f8_*.cu` --
-  the SM89 kernel set (INT8 QK + FP8 PV, multiple accum variants). Powers
-  `sageattn_qk_int8_pv_fp8_cuda{,++}`.
-- `sageattention/triton/` -- JIT-compiled Triton kernels. Powers
-  `sageattn_qk_int8_pv_fp16_triton`. Works anywhere, slower than CUDA
-  on sm89. **The only masked path that's numerically correct** (see
-  CHANGELOG "Known kernel bugs").
-- `setup.py` -- builds `_qattn_sm80`, `_qattn_sm89`, `_fused` on a
-  typical Ada box after our patch (line 152 adds sm89 to the SM80
-  build gate). v0.5.0 dropped the SM90 build block + the
-  CUDA-12.3-for-9.0 check + Windows MSVC compile flags; only the
-  Linux gcc + sm80/sm89 paths remain.
-- `build.sh` -- our editable-install wrapper. Enforces `VIRTUAL_ENV`,
-  pins `uv pip install --python ${VIRTUAL_ENV}/bin/python`, caps
-  `MAX_JOBS` at 8. Compiles for arch 8.0;8.6;8.9 by default.
+- `csrc/qattn/pybind_sm80.cpp` + `qk_int_sv_f16_cuda_sm80.cu` --
+  SM80 kernel (INT8 QK + FP16 PV). Forward-compatible to Ada.
+- `csrc/qattn/pybind_sm89.cpp` + `sm89_qk_int8_sv_f8_*.cu` -- SM89
+  kernel set (INT8 QK + FP8 PV, multiple accum variants).
+- `sageattention/triton/` -- JIT Triton kernels. The only masked
+  path that's numerically correct (CHANGELOG / Known kernel bugs).
+- `setup.py` -- builds `_qattn_sm80`, `_qattn_sm89`, `_fused`. Our
+  patch at line 152 adds sm89 to the SM80 build gate.
+- `build.sh` -- editable-install wrapper. Enforces `VIRTUAL_ENV`,
+  `--python` pin, MAX_JOBS cap.
 
-We do not carry Hopper/Blackwell kernels (`sageattention3_blackwell/`,
-`csrc/qattn/*sm90*`, `sm90_compile.py`), upstream's `bench/` one-shape
-scripts, or Windows wheel install paths. All removed in v0.5.0.
+Full upstream-vs-ours inventory in `docs/whats_ours_vs_upstream.md`.
 
 ## Install / build
 
 Always active-venv. Never bare `python`. Use `${VIRTUAL_ENV}/bin/python`
-or `${VENV}/bin/python` directly when `VIRTUAL_ENV` isn't exported in
-the shell. `python -m pip freeze` fails on uv-managed venvs (no pip
-module installed) -- use `VIRTUAL_ENV=<venv> <venv>/bin/uv pip freeze`
+or `${VENV}/bin/python` directly. `python -m pip freeze` fails on
+uv-managed venvs -- use `VIRTUAL_ENV=<venv> <venv>/bin/uv pip freeze`
 for env snapshots.
 
 ```bash
@@ -72,14 +61,11 @@ cd /path/to/sage-fork
 ./build.sh                # build + install editable into $VIRTUAL_ENV
 ./build.sh clean          # wipe prior .so / build/ artifacts first
 ./build.sh verify         # import-check only, no rebuild
-# Hopper/Blackwell builds: set CUDA_ARCHES env var explicitly. The
-# `full` action was dropped in v0.5.0 (upstream Hopper/Blackwell
-# wasn't validated on this fork).
 ```
 
-Build is 60–90s on an 8-core box with MAX_JOBS=8. Longer if you don't cap.
+Build is 60-90s on an 8-core box with MAX_JOBS=8.
 
-Confirm the editable install is live (path should point at our source tree):
+Confirm install (path should point at our source tree):
 
 ```bash
 ${VIRTUAL_ENV}/bin/python -c "import sageattention, os; print(os.path.dirname(sageattention.__file__))"
@@ -87,18 +73,15 @@ ${VIRTUAL_ENV}/bin/python -c "import sageattention, os; print(os.path.dirname(sa
 
 Post-build, run `${VIRTUAL_ENV}/bin/python tests/test_sageattn_ltx_shapes.py`
 once before the first production LTX gen. Side effect: populates
-Triton's on-disk autotune cache for every LTX shape the test
-covers, so ComfyUI's first gen after a rebuild skips the ~100-500ms
-per-new-shape autotune warmup. `./build.sh` invalidates this cache,
-so re-run the test after every rebuild.
+Triton's on-disk autotune cache for every LTX shape the test covers,
+so the first gen after a rebuild skips the ~100-500ms per-new-shape
+autotune warmup. `./build.sh` invalidates this cache.
 
-**The first `--check-regression` after `./build.sh` is expected to
-fail on triton-autotune-pending rows** (200-300% drift on
-sub-millisecond cross-attn / K-probe rows is typical -- autotune
-sweep dominates the median). Run the bench once without the flag to
-populate the cache, then re-run with `--check-regression` for the
-gate. `tests/run_all.sh` doesn't currently do this two-step; if you
-wire it in, document the rationale alongside.
+**First `--check-regression` after `./build.sh` is expected to fail**
+on triton-autotune-pending rows (200-300% drift on sub-millisecond
+rows is typical -- autotune sweep dominates the median). Run the
+bench once without the flag to populate the cache, then re-run with
+`--check-regression` for the gate.
 
 ### `tests/bench_e2e_ltx.py` warmup auto-detection
 
@@ -108,354 +91,86 @@ Auto-mode skips the warmup-and-discard prompt only when BOTH:
    on disk with mtime < 30 min, AND
 2. ComfyUI's `/history/1` HTTP endpoint returns a non-empty dict.
 
-Either signal alone is unreliable: filesystem mtime persists
-across ComfyUI restarts (false-positive after restart), and
-`/history` non-empty without a recent sage trace doesn't mean
-sage's caches are warm. Both together is the strongest signal we
-can build without ComfyUI exposing a session uptime.
-
-If you suspect the auto-detection is wrong (e.g. you restarted
-ComfyUI and bench still printed "skipped (caches warm)"), pass
-`--warmup always` explicitly. The asymmetric-cost reasoning:
-false-positive (skip warmup when cold) → cold-start measurement
-bias on arm 1 → bench reads as "sage 0.5x SLOWER"; false-negative
-(warm when warm) → wasted 250s. Always errs toward warmup.
+Either signal alone is unreliable. If you suspect the auto-detection
+is wrong, pass `--warmup always` explicitly. Asymmetric-cost
+reasoning: false-positive (skip warmup when cold) -> cold-start
+measurement bias -> bench reads as "sage 0.5x SLOWER"; false-negative
+-> wasted 250s. Always errs toward warmup.
 
 ## Testing
 
 Standalone scripts (no pytest). Run against the installed sage in
-`$VIRTUAL_ENV`, not the source tree directly. Easiest path: the
-one-shot runner.
+`$VIRTUAL_ENV`, not the source tree directly.
 
 ```bash
 ./tests/run_all.sh                     # env snapshot + ltx + image + spike
 VENV=/path/to/venv ./tests/run_all.sh  # explicit venv
-```
 
-Individual tests if you want one specifically:
-
-```bash
-# LTX-2.3 shape + kernel sweep (video d=128, audio d=64; ~30s on 4090):
+# Individual:
 ${VIRTUAL_ENV}/bin/python tests/test_sageattn_ltx_shapes.py
-# Add --check-regression to gate against tests/regression_baselines.json
-# (exits non-zero on >5% perf drift or rtol budget breach):
 ${VIRTUAL_ENV}/bin/python tests/test_sageattn_ltx_shapes.py --check-regression
-
-# Image-gen shape sweep (head_dim ∈ {120, 128}; Flux-class + Z-Image-Turbo):
 ${VIRTUAL_ENV}/bin/python tests/test_sageattn_image_shapes.py
-
-# torch.compile compatibility spike (re-run after torch upgrades):
 ${VIRTUAL_ENV}/bin/python tests/spike_torch_compile.py
-
-# Upstream's flash-attn comparisons (if flash-attn installed):
-${VIRTUAL_ENV}/bin/python tests/test_flashattn2.py
+${VIRTUAL_ENV}/bin/python tests/test_flashattn2.py     # if flash-attn installed
 ${VIRTUAL_ENV}/bin/python tests/test_flashattn3.py
 ```
 
-`tests/test_sageattn.py` exists upstream as a one-shape sanity test;
-mostly subsumed by `test_sageattn_ltx_shapes.py` (which covers a
-broader sweep including the same kind of small self-attn shape). Run
-it only if you want a 1-second smoke check before the longer bench.
+Shape coverage is derivable -- run `tests/bench_workload_profile.py`
+against a recent consumer trace and read its "Coverage gaps" section.
+Bench-shape changes have their own discipline; see
+`docs/bench_discipline.md`.
 
-Shape coverage today (corrected 2026-04-27 after a workload-profile
-audit against a real consumer trace):
-- LTX 2.3 video path: d=128, 32 heads, seq ∈ {22932 init, 23296 loop iter}
-- LTX 2.3 audio path: d=64, 32 heads, same seq as video (joint AV)
-- LTX 2.3 short-Q path (Gemma 3 text-encoder or audio cross-attn,
-  attribution ambiguous from trace alone): d=64, 32 heads, seq ∈ {497, 498}
-- Flux-class image-gen: d=128, in `test_sageattn_image_shapes.py`
-- Z-Image-Turbo S3-DiT: d=120, non-power-of-2, in `test_sageattn_image_shapes.py`
-- Synthetic stress (V ~ N(0,5), d=64, seq=8192): kernel robustness
-  check, not a workload
+`tests/test_sageattn_ltx_shapes.py` is the load-bearing test. It
+characterizes accuracy AND speed per (shape, mode) using
+`SDPBackend.EFFICIENT_ATTENTION` as the reference (MATH backend
+OOMs at LTX self-attn scale). Soft-warns when mean_rtol > 0.10.
+Measures five sage kernels and three torch SDPA backends in one run,
+plus an `fp8++vs.triton` cross-kernel rtol row.
 
-Source-of-truth for LTX 2.3 dims is `transformer_ltx2.py:907-947` in
-diffusers (default config: `attention_head_dim=128` video,
-`audio_attention_head_dim=64`). Earlier docs claimed "LTX head_dim=64"
-across the board -- that was the audio-side value mis-attributed to
-the whole model. To re-derive shape coverage from a fresh production
-trace, run `tests/bench_workload_profile.py` and read its
-"Coverage gaps" section. sage's CUDA kernels handle all the listed
-head_dims cleanly on sm89, including the non-power-of-2 d=120
-(verified 2026-04-25).
+`tests/repros/` holds minimal standalone repros for kernel defects.
 
-`tests/test_sageattn_ltx_shapes.py` is the load-bearing test for LTX
-workflows. It characterizes accuracy AND speed per (shape, mode)
-using `SDPBackend.EFFICIENT_ATTENTION` as the reference (MATH backend
-OOMs at LTX self-attn scale -- ~120 GiB for the full matrix).
-Soft-warns when mean_rtol > 0.10. Measures five sage kernels
-(fp16_cuda, fp16_triton, fp8_cuda, fp8_cuda++, auto) and three torch
-SDPA backends (FLASH, EFFICIENT, CUDNN) in the same run, plus an
-`fp8++vs.triton` cross-kernel rtol row on unmasked shapes (sanity
-check that a consumer's mix-routed fp8++ + triton in one forward
-pass doesn't introduce a discontinuity beyond each kernel's own noise
-floor; expected ~0.10, warns >0.15). Torch rows are the regression
-guard for "did a torch upgrade close the sage perf gap?" questions. First call with a new shape tuple pays one-time
-triton autotune warmup (~100ms per tuple); triton caches to disk so
-subsequent runs are fast. Expect the first run after `./build.sh` to
-be ~0.5-1s slower than subsequent ones.
-
-`tests/repros/` holds minimal standalone repros for defects in this
-fork's kernels that we haven't fixed yet. They double as regression
-tests once we do fix them.
-
-GPU OOM mid-test usually means contention, not a real bug. Check
+GPU OOM mid-test usually means contention, not a bug. Check
 `nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader`
-before debugging — a sibling process (e.g. ComfyUI loading a model)
-likely holds the VRAM Triton autotune needs (~256 MiB for the small
-telemetry test; multiple GiB for the LTX bench).
+before debugging -- a sibling process likely holds the VRAM Triton
+autotune needs.
 
 ## Conventions
 
-- Python: **always uv**. Never `pip`, never bare `python3`. Build
-  script uses `${VIRTUAL_ENV}/bin/python` directly.
+- Python: **always uv**. Never `pip`, never bare `python3`.
 - JSON: **orjson**, never stdlib `json`.
 - **No emojis** in any file or output.
-- Comments: only non-obvious WHY. Don't explain what well-named code
-  already does.
+- Comments: only non-obvious WHY.
 - **Never push without being asked.** Origin is the maintainer's
-  personal GitHub fork; the maintainer decides when to force-push
-  after any history rewrite.
-- **Consumer-agnostic framing in committed material.** Anything checked
-  in (README, CLAUDE.md, CHANGELOG, code comments, CLI labels, commit
-  messages) refers to downstream callers as "downstream consumer" or
-  "consumer" -- generic. Do **not** name specific consumer projects
-  or custom nodes by name. Model targets are different: naming the
-  *model class* the bench supports (LTX 2.3, Z-Image-Turbo, Flux,
-  etc.) is fine and useful. The distinction:
-    - model class -> name it (bench shapes, head_dim coverage)
-    - consumer project -> generic phrasing
-  Real-world validation runs against private consumer projects /
-  workflows; that work stays out of this repo so this repo stays
-  focused on kernels + bench. If you find yourself typing the name
-  of a specific custom node here, stop and rephrase.
-- **Project-internal phase numbers don't ship.** "Phase 0", "Phase 5",
-  "TDD red-first", task IDs -- those belong in the plan file or
-  commit messages, not in shipped code, CLI output, or CHANGELOG.
-  Operators reading this repo months later don't have the plan
-  context.
-- **Path discipline.** Every committed path is repo-relative. Absolute
-  home paths and tilde-prefixed external paths leak. Use generic
-  placeholders (`<repo_root>`, `/path/to/venv`, `<some-path>`) or just
-  drop the prefix (`./scripts/foo.sh`). `internal/` is gitignored and
-  exempt from anything ever shipping. The `path-privacy` plugin's
-  pre-commit and commit-msg hooks hard-block the leak class; they're
-  installed in this repo and run automatically. If a hook fires, edit
-  the file to remove the absolute portion -- do not bypass.
-  Belt-and-suspenders manual scan before every commit (catches strings
-  the hook's regex doesn't, e.g. consumer-project names):
+  personal fork.
+- **Consumer-agnostic framing in committed material.** Refer to
+  downstream callers as "downstream consumer" / "consumer" --
+  generic. Model class is fine (LTX 2.3, Flux, Z-Image-Turbo); a
+  specific custom node by name is not. Two narrow carve-outs where
+  the name is itself load-bearing: the downstream-known-symbols
+  audit (specific importer) and measurement provenance (workflow
+  filename in perf claims).
+- **Project-internal phase numbers don't ship.** Belong in the plan
+  file, not in code / CLI / CHANGELOG.
+- **Path discipline.** Every committed path is repo-relative. The
+  `path-privacy` plugin's pre-commit and commit-msg hooks hard-block
+  leaks; don't bypass. Belt-and-suspenders manual scan:
   `git add <files> && git diff --cached | grep -nE '/home/|~/dev|~/ComfyUI|fbliss|/Users/'`  <!-- path-privacy: ignore -->
-  -- empty output = clean. (The scan-pattern line above is itself a
-  documented regex source; the trailing token tells the path-privacy
-  hook to skip it.)
 - **Session logs append, never overwrite.** `internal/log/log_<date>.md`
-  is gitignored and may already exist when a new session starts on
-  the same day (see today's file with multiple `## Update N — ...`
-  sections). Append a new `## Update N — <topic> (<time-of-day>)`
-  section at the bottom rather than rewriting the file. Earlier-in-day
-  work is the audit trail across sibling sessions.
+  may already exist on the same day -- append a new `## Update N --
+  <topic> (<time-of-day>)` section.
 - **Local-machine config in `internal/local_config.json`** (gitignored).
-  Resolution order for any test/script that needs host:port or local
-  paths: CLI arg > env var > `local_config.json` > hard error pointing
-  at the runbook. Don't hardcode local-machine values in committed
-  code; this is the documented escape hatch. Established 2026-04-26
-  by `tests/bench_e2e_ltx.py`; schema in
-  `internal/runbook_bench_e2e_ltx.md`.
-- **`coderef/` is gitignored** alongside `internal/`. Used as a local
-  working area for symlinks/clones of consumer source trees we want to
-  grep against (verifying our public-API claims, reading their
-  scratch.md, etc.). Repo cloners won't have it; that's by design.
-- **Verify aspirational doc claims against actual code.** Twice in one
-  session (dispatcher mask routing, `sageattn_warmup` "consumers call
-  it") a public-API doc claimed "X is used by Y" or "dispatcher does
-  Z" — both turned out to be aspirational, not implemented. One
-  `grep -r "<api_name>" coderef/` for consumer call sites + a quick
-  read of the dispatch code catches this in seconds. **Use `coderef/`
-  proactively as a verification surface, not just reactively at
-  audit time.** Audit trail in `internal/audit_2026-04-26.md`.
-  Beyond code: `coderef/<consumer>/data/runs/*/profiler/summary.txt`
-  chrome-trace categorizations are the authoritative answer to "where
-  does GPU time actually go." Read them before promoting any perf
-  *mechanism* claim. The 2026-05-07 FFN-adjacent retirement was sitting
-  in the archive for 6 days before use.
-- **Mechanism claims need both arms measured, not inferred from one.**
-  A perf *number* can come from one measurement; a perf *mechanism*
-  claim ("sage's reach extends beyond attention into the sampler")
-  needs both A/B arms directly instrumented. CHANGELOG v0.5.1's
-  "FFN-adjacent reach" claim was promoted to load-bearing status on a
-  single-data-point inference (arm-2 attention time was never traced)
-  and lived for 10 days before the 2026-05-07 cross-claude A/B retired
-  it (CHANGELOG Decision log). When in doubt, write the claim with the
-  workload + measurement context attached so the inference-vs-
-  measurement distinction stays visible.
-- **Run `/simplify` after every substantive arc, not just at session
-  end.** Three passes one session caught: a real `TypeError` in
-  v0.3.1 kwargs forwarding, two SIGPIPE-under-pipefail bugs in bash
-  hooks, and several stale doc claims (mask routing, warmup API, two
-  `start.sh` references). Bug-density on a fresh diff is high enough
-  that one /simplify per coherent arc earns its cost.
-- **Deletion-heavy arcs need a post-arcs `/simplify` pass.** Per-arc
-  commits land kernel/code clean, but cross-arc doc drift (README
-  claims, TLDR claims, inventory lists, stranded headers) survives
-  unless reviewed together. v0.5.0 had 5 real cleanup items found
-  by `/simplify` after the 4 removal commits: stranded
-  `csrc/wgmma.cuh`, README `./build.sh full` reference, README
-  "Hopper/Blackwell as build target" prose, `core.py` docstring
-  "sage 3 Blackwell" mention, dead `_fused` arch entries. Do the
-  simplify pass after the last arc lands, not between.
-- **Before changing bench shapes, run
-  `tests/bench_workload_profile.py` against a recent consumer
-  trace.** Shape decisions made without checking the actual workload
-  distribution drifted twice: original `self_attn_large_704x704x497`
-  at seq=31776/d=64 (stale; never matched production) and would
-  have drifted again at v0.4.1 if the workload-profile coverage
-  check hadn't surfaced "every load-bearing baseline MISS." The
-  script is durable; the discipline isn't free unless documented.
-- **`tests/regression_baselines.json` is the source of truth for
-  shape names; `check_regressions()` discovers anchors from the
-  data.** The first regression-check landed with a hardcoded
-  `self_attn_large_704x704x497` shape-name lookup; when SHAPES
-  renamed in v0.4.1, the speedup-ratio gate went silently dead
-  until `/simplify` caught it. Pattern: any shape-aware logic in
-  the bench infrastructure must derive the shape set from the
-  JSON, not hardcode strings. `tests/test_regression_check.py`
-  guards the dead-branch class with a unit test
-  (`test_speedup_line_appears`).
-- **Record priors before measurement.** For any non-trivial
-  measurement (bench-fire, perceptual eval, ablation), commit the
-  expected result in writing before the measurement runs. "Did the
-  number confirm or surprise?" extracts more learning than "what was
-  the number?" The bilateral pre-bench briefing exercise this
-  session produced two priors (literature-estimate vs Amdahl-from-
-  exec-log); the more grounded one won, both sides aligned. Without
-  the commit-before-measuring step, post-hoc rationalization wins.
-
-## What's ours vs what's upstream
-
-Upstream-from-woct0rdho code (unmodified unless noted):
-- `csrc/qattn/{pybind_sm80.cpp, pybind_sm89.cpp, qk_int_sv_f16_cuda_sm80.cu,
-  sm89_qk_int8_sv_f8_*.cu}`, `csrc/fused/`, `pyproject.toml`,
-  `tests/test_sageattn.py`, `tests/test_flashattn{2,3}.py`.
-- `sageattention/` mostly unmodified except
-  `sageattention/triton/attn_qk_int8_per_block.py` (we added autotune).
-- `setup.py` mostly unmodified except line 152 (sm89 → SM80 build gate)
-  + v0.5.0 trims (Hopper SM90 block, CUDA-12.3-for-9.0 check, Windows
-  MSVC compile flags).
-
-Removed in v0.5.0 (we own the fork; not building or running these):
-- `sageattention3_blackwell/` -- sage 3 Blackwell subpackage (FP4).
-- `csrc/qattn/{attn_cuda_sm90.h, pybind_sm90.cpp,
-  qk_int_sv_f8_cuda_sm90.cu}` -- Hopper kernel.
-- `sageattention/sm90_compile.py` + `core.py::sageattn_qk_int8_pv_fp8_cuda_sm90`
-  function + dispatcher branch + KERNEL_FP8_CUDA_SM90 constant.
-- `bench/` -- 9 one-shape upstream benchmarks superseded by our LTX +
-  image + e2e + workload-profile bench files.
-
-Our additions and modifications (tracked in CHANGELOG.md):
-- `setup.py:152` -- one-line tuple change so `_qattn_sm80` builds on
-  sm89 boxes (was gated on 8.0/8.6/8.7 only; Ada is forward-compat to
-  SM80).
-- `sageattention/core.py::sageattn_warmup(shapes, kernels=...)` --
-  public API that fires one-shot dispatches per (kernel, shape) to
-  prime Triton's JIT + autotune cache. Defaults to the Triton kernel
-  only (CUDA kernels are build-time compiled, no warmup benefit).
-  **Status (verified 2026-04-26):** available API; no consumers in
-  our coordinated set currently call it. The mechanism (Triton
-  autotune cache hit on subsequent calls) is real; the "~1s → ~2ms"
-  perf claim circulating in earlier docs was the documented
-  mechanism, not a measured number from our box. Treat as an opt-in
-  optimization we offer; remove from this list if no consumer adopts
-  it within ~6 months.
-- `sageattention.get_last_dispatched_kernel() -> Optional[KernelName]`
-  -- public helper exposing which kernel the most recent `sageattn*`
-  call on this thread dispatched to, as a stable short string
-  (`fp16_triton`, `fp8_cuda++`, etc.; full set in
-  `KNOWN_KERNEL_NAMES`, type alias in `KernelName`). Lets consumer
-  tracers record sage's routing decision instead of mirroring the
-  dispatch table or treating it as opaque. Backed by a
-  `threading.local()` set inside each entry point's dispatch branch.
-  Read immediately after the sage call -- thread-local, not
-  contextvar-aware. Test:
-  `tests/test_dispatched_kernel_telemetry.py`. **Adding a new kernel
-  variant requires three coupled edits in `core.py`:** a new
-  `KERNEL_*` string constant, the matching entry in the
-  `KNOWN_KERNEL_NAMES` frozenset, and the matching string in the
-  `KernelName = Literal[...]` alias. Forgetting the Literal silently
-  breaks consumer type-checking but not runtime; forgetting the
-  frozenset silently breaks consumer `assert kernel in
-  KNOWN_KERNEL_NAMES` validators. The constant + set + Literal trio
-  is the public contract.
-- `sageattention.fused_rope_split(q, k, freqs_cis, *, use_triton=True)
-  -> tuple[Tensor, Tensor]` -- v0.5.3 fused split-RoPE primitive.
-  Clean-room Triton kernel matching LTX's `apply_split_rotary_emb`;
-  falls back to torch reference on non-CUDA / non-split-pe / shape
-  mismatch / `use_triton=False`. Lives in
-  `sageattention/triton/fused_rope.py`. v1 supports the LTX split-pe
-  convention only; interleaved variants silently fall back.
-  **Status (verified 2026-05-01):** consumer measured RoPE at 0.55%
-  of GPU time on the iclora workflow, so immediate ROI is ~zero --
-  candidate for removal at the next deletion arc if no consumer
-  adopts within ~6 months (same disposition as `sageattn_warmup`).
-  Test: `tests/test_fused_rope.py` (3 CPU + 7 GPU + export-check).
-- `sageattention/triton/attn_qk_int8_per_block.py` -- `@triton.autotune`
-  over `num_warps` and `num_stages`. Zero immediate perf delta on
-  sm89 + LTX shapes (hardcoded config was already optimal) but
-  forward-compatible: catches future kernel/triton/shape shifts.
-- `sageattention/core.py::sageattn` -- v0.3.0 dispatcher mask-routing
-  fix. Pre-fix the dispatcher routed purely by arch and silently
-  dropped `attn_mask` (CHANGELOG / Known kernel bugs). Post-fix:
-  pulls `attn_mask` out of `**kwargs` before the arch branch and
-  short-circuits to `sageattn_qk_int8_pv_fp16_triton` when non-None.
-  Forwards remaining `**kwargs` (with `kwargs.setdefault` on
-  dispatcher-set keys like `pv_accum_dtype`) so non-mask kwargs are
-  no longer silently swallowed.
-- `sageattention/core.py::_warn_if_mask_passed_to_cuda_kernel` --
-  v0.3.1 soft-warn helper. Hooked into the two CUDA entry-point
-  wrappers (`sageattn_qk_int8_pv_fp16_cuda`,
-  `sageattn_qk_int8_pv_fp8_cuda`) right after the assert block.
-  Catches consumers who bypass the dispatcher and hand-pick a `_cuda`
-  kernel with a non-None mask. (v0.5.0 dropped the third wrapper,
-  `sageattn_qk_int8_pv_fp8_cuda_sm90`, along with the rest of the
-  Hopper plumbing.)
-  Soft (warns, not raises) so `attn_mask=None` defensive callers
-  aren't penalized.
-- `build.sh` -- editable-install wrapper with VIRTUAL_ENV check,
-  `--python` pin, MAX_JOBS cap.
-- `tests/test_sageattn_ltx_shapes.py` -- LTX-parametrized accuracy +
-  perf measurement across sage kernels AND torch SDPA backends
-  (FLASH / EFFICIENT / CUDNN). Doubles as a regression guard for
-  "did a torch upgrade close the sage perf gap?"
-- `tests/test_dispatched_kernel_telemetry.py` -- standalone-script
-  test for the `get_last_dispatched_kernel()` helper. 11 tests
-  covering: exports, initial-None state, dispatcher-routes-to-fp8++
-  on sm89 (unmasked), dispatcher-routes-masked-calls-to-triton
-  (v0.3.0 invariant), `pv_accum_dtype` override honored
-  (v0.3.1 regression test), per-variant kernel name strings,
-  hand-picked-_cuda-warns-on-mask (v0.3.1 soft-warn),
-  thread-local isolation. Pure Python; no rebuild needed after
-  edits to `core.py` or `__init__.py`.
-- `tests/test_sageattn_ltx_shapes.py::cross_attn_unmasked_kv226_kratio_probe`
-  -- v0.3.1 K-ratio probe row. Same shape as `cross_attn_text_kv226`
-  but unmasked, so `K = triton_masked_ms / fp8++_unmasked_ms` is
-  readable from two bench rows. Gates the deferred native CUDA
-  mask kernel work (Backlog).
-- `tests/bench_e2e_ltx.py` -- v0.4.0 end-to-end gen-time bench.
-  Submits a workflow via the ComfyUI HTTP API, runs N times sage-on
-  vs sage-disabled, reports wall-time speedup +
-  attention-fraction-of-step. Closes the framework's "kernel ms is
-  not gen ms" gap. Host resolved from CLI / `$COMFYUI_HOST` /
-  `internal/local_config.json` (no hardcoded default). See
-  `internal/runbook_bench_e2e_ltx.md` for the operational runbook.
-- `tests/repros/repro_cuda_mask_kernel.py` -- minimal repro for the
-  CUDA mask-path missing-feature documented in CHANGELOG.
-- `CHANGELOG.md` -- versioned divergence + Known kernel bugs + Backlog + Decision log + Recurring process items.
-- `README.md` -- minimal; attribution only.
-- `CLAUDE.md` -- this file.
-
-Git history was squashed to a single "Fork baseline" commit with our
-changes layered on top. All safety-backup branches have been deleted;
-the squashed history is the canonical state. `origin/main` still
-carries the pre-squash 196-commit upstream history; the next push
-will need `git push --force-with-lease origin main`.
+  Resolution order: CLI arg > env var > `local_config.json` > hard
+  error pointing at the runbook. Don't hardcode local-machine values
+  in committed code.
+- **`coderef/` is gitignored** alongside `internal/`. Holds
+  symlinks/clones of consumer source trees for verification. Use
+  proactively as a verification surface (perf-mechanism claims,
+  aspirational API doc claims) -- discipline in
+  `docs/perf_research_framework.md`.
+- **Perf-mechanism claims need both arms measured.** A *number* can
+  come from one measurement; a *mechanism* claim needs both A/B
+  arms directly instrumented. Full rule + the v0.5.1 retirement
+  story in `docs/perf_research_framework.md`.
 
 ## The consumer surface
 
@@ -463,530 +178,89 @@ Sage exposes two surfaces to downstream consumers:
 
 1. **`sageattn()` top-level dispatcher.** Picks a kernel based on
    `(detected arch, CUDA version, mask presence)`. On sm89 + CUDA >=
-   12.8 with no mask: lands on `sageattn_qk_int8_pv_fp8_cuda` with
-   `pv_accum_dtype="fp32+fp16"` (sage 2++). With `attn_mask` passed:
-   routes to `sageattn_qk_int8_pv_fp16_triton` regardless of arch,
-   because that's the only mask-correct path (see CHANGELOG / Known
-   kernel bugs). Implementation: `sageattention/core.py::sageattn`
-   pulls `attn_mask` out of `**kwargs` before the arch branch and
-   short-circuits to triton when non-None. The mask-routing claim is
-   enforced by a test
-   (`tests/test_dispatched_kernel_telemetry.py::test_sageattn_dispatcher_routes_masked_calls_to_triton`)
+   12.8 unmasked: lands on `sageattn_qk_int8_pv_fp8_cuda` with
+   `pv_accum_dtype="fp32+fp16"`. With `attn_mask` passed: routes to
+   `sageattn_qk_int8_pv_fp16_triton` regardless of arch, because
+   that's the only mask-correct path. Implementation:
+   `sageattention/core.py::sageattn` pulls `attn_mask` out of
+   `**kwargs` before the arch branch. The mask-routing claim is
+   enforced by a test in `tests/test_dispatched_kernel_telemetry.py`
    that fails the moment the dispatcher reverts to arch-only routing.
    **Most consumers should just call this and let dispatch decide.**
 2. **Specific kernel exports** -- `sageattn_qk_int8_pv_fp16_cuda`,
    `sageattn_qk_int8_pv_fp8_cuda`, `sageattn_qk_int8_pv_fp16_triton`,
-   etc. Bypass the dispatcher; the caller picks. **Masked attention
-   only works with `_fp16_triton`**; passing `attn_mask` to a `_cuda`
+   etc. Bypass the dispatcher; caller picks. **Masked attention only
+   works with `_fp16_triton`**; passing `attn_mask` to a `_cuda`
    kernel silently drops the mask and produces numerically wrong
-   output. The CUDA wrappers accept `attn_mask` via `**kwargs` (a
-   pre-existing upstream signature shape) but never read it. If a
-   consumer is hand-picking a CUDA kernel and also passing a mask,
-   that's a consumer bug -- the dispatcher is the safe default.
+   output. CUDA wrappers accept `attn_mask` via `**kwargs` but never
+   read it. If a consumer hand-picks a CUDA kernel + mask, that's a
+   consumer bug -- the dispatcher is the safe default.
 
-The dispatcher's mask-routing fix landed v0.3.0 (2026-04-26). Prior
-to that the dispatcher routed purely by arch and silently dropped
-`attn_mask` -- the docs claimed otherwise but the code didn't match.
-See `internal/audit_2026-04-26.md` for the audit trail. If we ever
-add a kernel-side mask implementation (Backlog item), the dispatcher
-gets a second look: it's possible we'd want `attn_mask` to land on
-the native CUDA path for some shapes once the mask kernel exists.
+Mask-routing fix landed v0.3.0 (2026-04-26); audit trail in
+`internal/audit_2026-04-26.md`.
 
-Beyond mask routing, sage-fork stays primitive. The bench harness
-lives here; consumer-facing routing policy beyond the mask gap (e.g.
-shape-specific kernel preference) belongs in the consumer.
+There is also an undocumented L3 contract -- underscore-prefixed
+symbols and pybind methods that downstream consumers import by name.
+Before removing or renaming any of those, read
+`docs/downstream_symbols.md` and run the pre-removal checklist.
 
-## Downstream-known internal symbols (de-facto public surface)
+## Performance research
 
-The two surfaces above are the *documented* public contract. There
-is also an undocumented one: underscore-prefixed and module-level
-re-exports in `sageattention.core` that downstream consumers import
-**by name** at module-load time. Removing or renaming them breaks
-those consumers without warning.
-
-This bit us in v0.5.0: dropping `_qattn_sm90` + `sm90_compile`
-without considering downstream callers means KJNodes'
-`LTX2MemoryEfficientSageAttentionPatch` can fail to import against
-our fork even on sm89 boxes (depends on whether KJ's import is
-try/except-guarded). The Hopper kernel removal was correct; the
-*consideration* of the downstream blast radius was missing.
-
-### Known importers (audit 2026-05-01)
-
-KJNodes `ComfyUI-KJNodes/nodes/ltxv_nodes.py` (the LTX-2 per-block
-patch) imports these from `sageattention.core` directly:
-
-```
-_qattn_sm80, _qattn_sm89, _qattn_sm90        # compiled .so extensions
-sm80_compile, sm89_compile, sm90_compile     # Python fallback modules
-per_thread_int8_triton                       # quant fn
-per_warp_int8_cuda                           # quant fn
-per_block_int8_triton                        # quant fn
-per_channel_fp8                              # quant fn
-attn_false                                   # triton attn entry point
-get_cuda_arch_versions                       # arch-detection util
-```
-
-Plus a specific pybind method on `_qattn_sm89`:
-
-```
-_qattn_sm89.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf
-```
-
-The other pybind methods in `csrc/qattn/pybind_sm89.cpp:23-30` are
-load-bearing for our own dispatcher and effectively in the same
-risk class -- treat the full list as protected.
-
-### Pre-removal checklist
-
-Before removing or renaming any symbol in the list above, OR adding
-to the list of compiled `_qattn_sm*` modules / their pybind
-methods:
-
-1. `grep -r "<symbol>" coderef/` -- check if any consumer in our
-   coordinated set imports it. Empty result lowers risk but doesn't
-   eliminate it (we don't grep all of GitHub).
-2. If found: either (a) keep a compatibility shim (e.g. a stub
-   module that raises `NotImplementedError` on use), (b) coordinate
-   a memo to the consumer-side claude before removal, or (c) bump
-   the major version and document the break in CHANGELOG /
-   "Breaking changes."
-3. If not found in `coderef/` but the symbol is on the list above:
-   document the removal in CHANGELOG with a "downstream-known
-   internal symbol removed" note. Treats the de-facto contract as
-   real even when not currently exercised.
-
-### Why we don't just promote these to the typed public API
-
-Two reasons. First, the underscore prefix is doing real work:
-these are implementation details that change shape across
-upstream sageattention versions (the dual-name fallback pattern
-`_qattn_sm89` / `sm89_compile as _qattn_sm89` is evidence upstream
-has already restructured them once). Promoting them locks us in.
-Second, the typed API (`sageattn`, `sageattn_qk_int8_pv_*`) is the
-right entry point for almost every consumer; the only legitimate
-reason to import the underscore symbols is to do something the
-typed API doesn't expose (per-block patching with custom RoPE
-fusion, KJ's case). Documenting the de-facto contract is the
-balance: we don't promise stability, but we promise not to break
-it without consideration.
-
-## If we ever need to fix a sage bug ourselves
-
-We own this fork; there's no upstream to send PRs to anymore. If a
-kernel defect blocks the LTX workflow:
-
-1. Build a minimal repro in `tests/repros/<name>.py`.
-2. Find the kernel in `csrc/qattn/`. sm80 = fp16 PV, sm89 = fp8 PV.
-3. Mask-handling code is in the `pybind_sm*.cpp` files (PyTorch entry
-   points) and the `.cu` files (kernel body).
-4. Rebuild via `./build.sh` and re-run the repro.
-5. Add a CHANGELOG entry under the latest version block (Fixed
-   subsection) with the repro reference.
-
-We deliberately have no CI. Verify by running the LTX-shape test and
-the full downstream-consumer pytest suite on this box before trusting
-a change.
-
-## Linter / pyright noise to ignore
-
-Every edit to `sageattention/` or `tests/` triggers these false
-positives:
-
-- `Import "torch" could not be resolved` -- pyright's default scan
-  env doesn't have torch; our ComfyUI venv does. Runtime is fine.
-- `"q_int8" / "k_int8" / "lse_correction" / "sm80_compile" is
-  possibly unbound` in `core.py` around lines 325, 594, 598, 601 --
-  pre-existing upstream control-flow pyright can't prove. Not
-  introduced by any edit here. Ignore.
-- `"sageattn_*" is not accessed` in `__init__.py` -- public
-  re-exports; pyright doesn't model star-import consumers.
-
-If pyright flags something inside code we actually added and it
-looks substantive, investigate. Otherwise skip.
-
-## Performance research: the load-bearing metric
-
-When you're trying to make this fork perform better, ALL perf
-decisions on the sm89 box are graded against one row of one test:
-
-```
-tests/test_sageattn_ltx_shapes.py
-  shape: ltx23_video_self_attn_init_22932  (B=1, H=32, Sq=Skv=22932, D=128, no mask, bf16)
-  mode:  fp8_cuda++
-  -> primary perf metric: median_ms (today: 20.20 ms)
-  -> accuracy guard:      mean_rtol ≤ 0.10 (today: ~0.098)
-  -> kernel speedup ratio: torch_flash / sage_fp8++ = 2.66x (today)
-  -> e2e speedup ratio:    1.22x (v0.5.1 first empirical measurement;
-                           831x480x497 / 25fps / 8-step distilled;
-                           VAE-decode-cold-start-normalized)
-```
-
-The kernel ratio (2.66x) is what the bench measures directly. The
-e2e ratio depends on the workload's attention share -- and the share
-varies. Two measurements on file:
-
-- **audio_loop_latent.api.json (832x480x497 / 25fps / 8-step distilled,
-  v0.5.1 e2e bench)**: attention 8.2% of wall, e2e ratio 1.22x
-  VAE-decode-cold-start-normalized. Pure-attention Amdahl with the
-  2.66x kernel ratio predicts ~1.05x; observed exceeded that by 17
-  points. The v0.5.1 entry attributed the +17pt to "FFN-adjacent
-  reach within the sampler step" -- but that was a single-data-point
-  inference (arm-2 attention time was never directly traced; the
-  attribution assumed the kernel ratio held but didn't measure it on
-  the actual workload). Treat the 1.22x as load-bearing; treat the
-  FFN-adjacent mechanism story as an unverified hypothesis.
-- **iclora at production scale (audio-loop-music-video_latent_iclora
-  workflow, sage-on/sage-off A/B 2026-05-07)**: attention is ~42% of
-  CUDA kernel time (76.5/183.4 sage-off). Per-kernel ratio is 3.08x
-  on the actual call mix (matched 3456 calls/render in both arms;
-  sage 7.20 ms/call vs torch flash 22.14 ms/call). Strict Amdahl with
-  these inputs predicts 1.39x; measured wall ratio is 1.41x -- match
-  within 1.4%. **No non-Amdahl term is needed on iclora.** Kernel-
-  level decomposition shows non-attention CUDA time is essentially
-  identical sage-on vs sage-off (delta -2.1s, in the wrong direction
-  for any "FFN-adjacent" or "cache-footprint" reach). Launch-overhead
-  delta is 0.82% of total launches -- ~0.4s, also negligible. The
-  full saving comes from sage's faster attention kernel.
-
-Both numbers are real; they describe different workloads with
-different attention shares. The framework: measure attention-share-
-of-CUDA-time on each workload of interest, apply Amdahl with the
-per-kernel ratio observed on that workload's actual call mix, and
-treat any residual as a hypothesis that needs its own measurement
-before going into a perf claim. Don't generalize one workload's
-ratio to another.
-
-Sourced from real consumer traces; see CHANGELOG v0.4.1 for the
-kernel-bench shape re-derivation, v0.5.1 for the audio_loop_latent
-e2e measurement, and the 2026-05-07 cross-claude memo trail
-(`internal/AUDIO_LOOP_CLAUDE_TO_SAGE_CLAUDE_MEMO.md` +
-`internal/SAGE_CLAUDE_TO_AUDIO_LOOP_CLAUDE_MEMO.md`) for the iclora
-A/B decomposition that retired the launch-overhead, FFN-adjacent,
-and cache-footprint hypotheses on that workload.
-
-The earlier metric (`self_attn_large_704x704x497` at seq=31776, D=64)
-was a synthetic shape with the wrong head_dim -- LTX 2.3 video is
-D=128, not D=64.
-
-Anything else you might want to measure is secondary, useful as a
-guard against side effects, or explicitly ignored — see below.
-
-### Why this is the metric (the load-bearing reasoning)
-
-The chain matters; if any link breaks, the metric moves.
-
-1. **LTX 2.3 video self-attn at seq=22932/23296 dominates real gen
-   wall-time.** Per the consumer trace
-   `sage_2026-04-26_105851.jsonl`, video self-attn (init seq=22932 +
-   loop seq=23296, both at d=128) accounts for **76% of total
-   attention wall-time** across a typical render. Audio self-attn
-   (d=64) is another ~5%; short-Q paths (text-encoder / audio
-   cross-attn at seq~497) are ~19% by call count but only ~3% by
-   wall-time because each call is sub-millisecond. The video d=128
-   row is where milliseconds compound into seconds of gen time.
-2. **`fp8_cuda++` is what `sageattn()` picks on sm89 + CUDA ≥ 12.8
-   unmasked.** That's the consumer's actual hot path — the
-   dispatcher routes there for self-attn after the v0.3.0 mask-aware
-   fix. Optimizing a kernel that the dispatcher doesn't pick is
-   research that doesn't ship.
-3. **The fp8++ kernel is where every plausible perf change lands.**
-   Edits to `csrc/qattn/sm89_qk_int8_sv_f8_*.cu`,
-   `sageattention/quant.py` (per-block / per-warp INT8 quant), the
-   fp8 V-quant `scale_max` in `core.py:914-918`, or the SM89 PV
-   accumulator variants all show up on this row. Triton-side
-   changes show up only on the cross-attn rows.
-4. **The README's "<0.1 mean rtol" promise is the accuracy ceiling.**
-   If a perf change pushes mean_rtol > 0.10, the fork's documented
-   accuracy floor is gone. That's not a tradeoff to make silently;
-   it's a re-pitching of the fork.
-
-### How we measure it
-
-`tests/test_sageattn_ltx_shapes.py` is the only thing you need to
-run. The bench's `time_and_vram` does 1 warmup + median over 3 runs
-to kill within-session noise; absolute median_ms is the
-within-session signal you optimize against during a research sitting.
-Peak working-set VRAM (MiB) is captured in the same pass at zero
-extra kernel cost.
-
-For comparing across sessions (after a torch / triton / CUDA / driver
-bump, or after a cold boot), use the **`torch_flash / sage_fp8++`
-ratio** instead of absolute time (today: 2.66x at the v0.4.1 primary
-shape). The ratio normalizes against driver-thermal drift, which is
-on the order of 1-2% across cold boots even with no code changes —
-see CHANGELOG's cu128→cu130 transition note. If absolute fp8++ time
-drifts but the ratio holds, it's the box, not the code.
-
-The regression-gate floor is encoded in `tests/regression_baselines.json`
-under `speedup_ratio_floor` (currently 1.5x) — sage drops below that
-on the primary row → the fork's reason to exist is empirically
-suspect. The `--check-regression` flag exits non-zero on any
-load-bearing perf drift > 5%, rtol budget breach (> 0.10), or
-speedup-ratio floor breach.
-
-Bench env (torch / triton / CUDA / sage rev) pinned to
-`internal/bench_env_<date>.txt`; resnapshot after any version bump
-per "Bench env discipline" below.
-
-### How we detect unintended side effects
-
-The harness already prints every check side-by-side in one run. Read
-all of these every time you change a kernel — don't tunnel-vision on
-the primary row.
-
-- **All 5 sage kernels + 3 torch backends on every shape.** A change
-  that helps fp8++ but hurts fp16_cuda or fp16_triton means you
-  shifted a knob that's shared between code paths; either intentional
-  or a foot-gun.
-- **The cross-attn-with-mask kv sweep (32, 64, 128, 226, 512, 1024).**
-  Catches regressions in the masked path. Pre-v0.3.0 the dispatcher
-  silently dropped masks here; now it routes to triton. The triton
-  row's rtol should stay ≈0.04 across the sweep; CUDA rows stay
-  pinned at the documented mask-bug fingerprint (0.94→0.13).
-- **The cross-kernel `fp8++ vs triton` rtol row** (unmasked shapes
-  only). Should sit ≈0.10 — quadrature of each kernel's independent
-  ~0.04 / ~0.09 vs SDPA. If it spikes above 0.15, a kernel-internal
-  numerical change broke the cross-kernel agreement, even if neither
-  kernel's solo rtol-vs-SDPA changed.
-- **Image-gen shapes** in `tests/test_sageattn_image_shapes.py`
-  (head_dim=120 Z-Image, head_dim=128 Flux). A kernel change keyed on
-  head_dim=64 might silently break the non-power-of-2 d=120 path.
-- **Dispatcher telemetry** (`tests/test_dispatched_kernel_telemetry.py`).
-  Verifies routing invariants — the `auto` row matching the wrong
-  kernel name post-change is the v0.3.0 mask-routing regression
-  signal in primitive form.
-- **`tests/run_all.sh`** runs all of the above in one shot. Use it
-  before declaring a perf change done.
-
-### How we use the metric to pick what to try next
-
-The bench output is also a diagnostic for where to spend the next
-research hour. Five patterns to look for:
-
-1. **Where kernels disagree on rtol, the gap is the optimization
-   target.** If fp8_cuda++ shows 0.098 rtol at 20ms and fp16_cuda
-   shows 0.037 rtol at ~34ms, the 0.061 rtol delta is "FP8
-   quantization cost." The research question becomes: is there a
-   variant of fp8 quant (scale_max, granularity, per-block Q mean,
-   etc.) that closes some of that gap at similar speed? If you
-   measure two fp8 variants and they're indistinguishable in rtol,
-   you're at the FP8 information floor and should look elsewhere.
-2. **Where kernels agree, you're at the numeric floor — stop
-   optimizing the kernel and look elsewhere.** Two kernels with
-   different code paths producing the same number means the
-   underlying numerics, not the implementation, is the bottleneck.
-   Move up the stack: torch.compile around sage, fusion with
-   adjacent ops, model-side activation reformulation.
-3. **Speedup-ratio degradation tells you which torch path got
-   better.** If `torch_flash / sage_fp8++` drops from 2.66x to 1.8x
-   on a future torch release, torch closed gap somewhere — check
-   the `torch_flash`, `torch_eff`, `torch_cudnn` row that improved
-   most and figure out what changed. That's where fp8++ is leaving
-   perf on the table.
-4. **Short-Q rows where sage loses to torch_flash.** v0.4.1 bench
-   shows the seq=497/498 short-Q paths (Gemma 3 text-encoder /
-   audio cross-attn) at ~0.45x vs torch_flash -- sage is materially
-   slower on short shapes because int8 quant + kernel launch
-   overhead exceeds the matmul work. The consumer's `nodes_sage.py`
-   has a deferred "min-sequence skip" backlog item; this is the
-   empirical evidence that gates it.
-5. **The unmasked-vs-masked timing gap quantifies the deferred CUDA
-   mask kernel.** Today triton is the only mask-correct path; if
-   `triton @ kv=N` is K× slower than `fp8++ @ kv=N` (unmasked) at
-   the same shape, K is the speedup ceiling for the deferred Backlog
-   item "Add mask support to the sm80/sm89 CUDA kernels." If K < 2x,
-   the kernel work probably isn't worth days of effort. If K > 5x at
-   shapes the consumer actually hits, the trigger fires. The probe
-   row `ltx23_video_cross_unmasked_kv226_kratio_probe` in
-   `tests/test_sageattn_ltx_shapes.py` exists specifically so K is
-   measurable -- it pairs with `ltx23_video_cross_text_kv226` (same
-   shape, masked) so K = triton_masked_ms / fp8++_unmasked_ms is just
-   two numbers from the bench output. **Measured 2026-04-27 at the
-   corrected d=128 video config:** K ≈ 1.57 at kv=226 (triton 1.16ms
-   / fp8++ 0.74ms), still well below the 5x trigger, so the deferred
-   kernel work is not perf-justified today. Re-measure
-   after every kernel-side optimization that lands on the unmasked
-   cross-attn path; if fp8++ at small kv gets meaningfully faster,
-   K grows and the trigger could fire even with no triton change.
-
-### What we explicitly ignore — and the trigger that would change that
-
-These rows print every run; we don't optimize against them today.
-Each one comes with a re-evaluation trigger so we don't keep
-ignoring them after the world changes.
-
-- **`fp8++ vs triton` cross-kernel rtol row as a perf signal.**
-  It's a consistency check, not a speed measurement. **Trigger to
-  care:** the row spikes above 0.15, indicating mixed-route
-  consumer forward passes are now seeing a discontinuity beyond
-  combined-noise.
-- **Cross-attn-with-mask perf rows.** Triton at sub-millisecond is
-  already fast enough that perf wins on this path don't move real
-  gen time. **Trigger to care:** a downstream consumer's per-call
-  JSONL trace, aggregated over a real production gen, reports
-  masked-triton as >5% of total gen wall-time. (See CHANGELOG
-  Recurring process items / "Session-level attention telemetry
-  summary.")
-- **Image-gen perf rows.** Already 1.7-2.1x faster than `torch_flash`
-  on Flux + Z-Image-Turbo; not the hot path for the sm89 box's
-  primary workload. **Trigger to care:** a new model class lands
-  with shapes that show < 1.3x speedup, or a consumer reports image
-  gen wall-time is now attention-bound.
-- **`torch_eff` and `torch_cudnn` rows.** Regression telemetry for
-  "is sage still load-bearing as a fork?" — not a perf signal for
-  sage changes. **Trigger to care:** sage's speedup ratio drops below
-  1.5x on the primary row, which triggers a "is the fork still worth
-  maintaining?" review rather than a perf experiment.
-- **Spike `tests/spike_torch_compile.py` perf delta.** Verdict on
-  torch 2.11: keep the consumer-side `torch.compiler.disable()`.
-  **Trigger to care:** re-run after any torch upgrade; the spike
-  itself records the reopen condition (bounded rtol AND measurable
-  speedup).
-
-### What we might be wrong about (the framework is V1)
-
-This metric reflects the workload mix on this box as of 2026-04-26.
-We may be wrong in ways that take time to surface; record the
-disconfirming evidence rather than wait for it to be obvious.
-
-- **The "LTX self-attn dominates" assumption is workload-specific.**
-  If a new model class with fundamentally different attention
-  patterns (very short autoregressive seq, sliding-window, MQA/GQA
-  with very different head ratios) becomes the primary use case, the
-  load-bearing shape moves and the metric should be re-derived.
-  Disconfirming signal: a downstream-consumer telemetry summary
-  showing a non-LTX-class shape consuming > 30% of gen attention
-  time.
-- **Mean rtol is a proxy for "does the output look right," not the
-  truth.** A perf change that improves mean_rtol but visibly
-  degrades a real render fails the spirit of the guard. We don't
-  currently have a perceptual eval in this repo (it'd be a new
-  bench, probably keyed on per-frame structural similarity vs an
-  fp32 reference render). If we ever ship a kernel change that
-  passes the rtol guard but causes a consumer-reported visual
-  regression, the rtol guard isn't the right floor and we need to
-  add the perceptual layer.
-- **Kernel ms is not gen ms.** A 2x kernel speedup is invisible
-  end-to-end if attention is already < 50% of step time. We don't
-  measure end-to-end here (it's downstream-consumer telemetry); a
-  refinement would be a `gen_wall_time / attention_kernel_time`
-  ratio captured per-render, so kernel improvements get an
-  end-to-end translation factor. Until then, a "this saved 5ms per
-  call" claim should be paired with "and we observed a real LTX gen
-  go from X seconds to Y seconds" before ranking high.
-- **The "find next experiment" framework above is forward-looking;
-  we haven't run a perf experiment through it yet.** The first time
-  we use it to pick a direction and either succeed or fail, the
-  framework gets refined. Treat the five patterns as starting
-  hypotheses, not validated playbook.
-
-If any of the above bullets fires (disconfirming signal observed),
-update this section and record the change in the session log so the
-re-derivation is auditable later.
-
-### Pre-trigger briefing pattern
-
-For any user-gated trigger (currently: e2e bench run, perceptual
-data from downstream Phase 2.1), stage a pre-trigger brief BEFORE
-the trigger fires. Lives at `internal/brief_pre_<trigger>.md`
-(gitignored). Forces a state-audit that catches doc drift the
-regular audit pass misses — this caught a stale `start.sh` claim
-in `internal/runbook_bench_e2e_ltx.md` that would have misled an
-operator at bench-fire time. Format: recorded prior (commit before
-measuring, per the framework's "what we might be wrong about" item
-3), output expectations, durable context the other side would
-otherwise re-derive at trigger time.
-
-## Bench env discipline
-
-Every wall-clock comparison in `test_sageattn_ltx_shapes.py` is pinned
-to the version surface in `internal/bench_env_<date>.txt`. After any
-torch/triton/CUDA/sage-rev bump, re-run the test and resnapshot. Trigger
-doc + drift threshold: `CHANGELOG.md` / Recurring process items /
-"Bench env re-snapshot."
-
-## fp16 matmul accumulation flag
-
-`torch.backends.cuda.matmul.allow_fp16_accumulation` (available in
-torch 2.7.1+; exposed by KJ's `CheckpointLoaderKJ` as
-`enable_fp16_accumulation`): does NOT affect sage's internals.
-
-Verified 2026-04-24:
-
-- Sage's Q @ K^T and P @ V are done inside its own int8/fp8
-  CUDA/Triton kernels via tensor cores. No cuBLAS on any path -- grep
-  of `csrc/` finds zero `cublas` references.
-- Sage does call `torch.matmul` exactly once, in
-  `core.py::lse_correction` (when `smooth_k=True` AND
-  `return_lse=True`). That path isn't taken by the ComfyUI
-  `optimized_attention_override` hook, which never asks for LSE.
-- Net effect on attention: zero.
-
-What the flag DOES affect: torch's own matmuls for the Q/K/V/output
-linear projections around attention (those go through cuBLAS). For
-LTX-2.3 that's ~5-10% of total gen time in the linear layers. Safe
-to enable for speedup; impact on sage attention output is nil.
+ALL perf decisions are graded against one row of one test:
+`tests/test_sageattn_ltx_shapes.py`, shape
+`ltx23_video_self_attn_init_22932`, mode `fp8_cuda++`. E2e ratios are
+workload-dependent (attention share varies). Full framework --
+metric, reasoning chain, side-effect checks, experiment-selection
+patterns, ignore-triggers, "what we might be wrong about",
+pre-trigger briefing -- in `docs/perf_research_framework.md`. Load
+that before running a perf experiment.
 
 ## Compile / torch.compile
 
-Not used. The downstream consumer node wraps sage in
-`torch.compiler.disable()`.
+Not used. Consumer wraps sage in `torch.compiler.disable()`. The
+spike rejects on rtol drift, not perf. Two pybind kernels Dynamo
+graph-breaks at, the trigger to revisit, and the estimated work in
+`docs/torch_compile_spike.md`.
 
-**Empirical status (verified 2026-05-01 on RTX 4090 / torch 2.11.0+cu130
-/ sage `main`):** the spike (`tests/spike_torch_compile.py`) rejects on
-**rtol drift**, not perf. Both `reduce-overhead` and `default` modes
-trace + run, but produce mean relative error 0.02759 vs eager
-(rejection threshold 0.01). Same drift on both modes (5 sig figs)
-indicates deterministic precision loss from partial-graph reordering
-across pybind boundaries, not a stochastic compile artifact.
+## Deeper context (L3 references)
 
-**The two pybind kernels Dynamo graph-breaks at:**
-
-- `_fused.transpose_pad_permute_cuda` (csrc/fused/pybind.cpp:30)
-- `_fused.scale_fuse_quant_cuda` (csrc/fused/pybind.cpp:31)
-
-Both are called from `sageattention/quant.py:281,289,292` in
-`per_channel_fp8` (the V-quant path on every fp8 sage call --
-load-bearing dispatch on sm89). Same risk class extends to
-`mean_scale_fuse_quant_cuda` (csrc/fused/pybind.cpp:32, smooth_v=True
-branch).
-
-**Trigger to do the work:** if/when consumer-side path 1 (CUDA graphs
-on the LTX denoiser) fails AND consumer wants path 2 (torch.compile
-the denoiser), register the three named kernels as
-`torch.library.custom_op` with proper meta/abstract registrations so
-Dynamo can trace through them without graph breaks. Estimate ~1-2 days
-per kernel (~3-6 days total). Until that trigger fires, keep the
-disable.
-
-Re-run the spike after every torch upgrade; reopen if a mode produces
-bounded-rtol speedup > 1.05x.
+- `docs/perf_research_framework.md` -- load-bearing metric, reasoning
+  chain, side-effect checks, five experiment-selection patterns,
+  ignore-triggers, uncertainty record, mechanism-claim + aspirational-
+  claim discipline, prior-recording, pre-trigger briefing.
+- `docs/whats_ours_vs_upstream.md` -- file-by-file inventory: upstream
+  unmodified, removed-in-v0.5.0, our additions + status of each.
+- `docs/downstream_symbols.md` -- de-facto public surface (underscore
+  symbols + pybind methods), known importers, pre-removal checklist.
+- `docs/sage_bug_fix_workflow.md` -- 5-step procedure when a kernel
+  defect blocks a workflow: minimal repro -> locate kernel in
+  csrc/qattn/ -> patch -> rebuild -> CHANGELOG entry.
+- `docs/bench_discipline.md` -- env snapshot rules, cross-session
+  ratio comparison, before-changing-bench-shapes workflow,
+  regression_baselines.json source-of-truth rule.
+- `docs/fp16_matmul_accum.md` -- whether KJ's
+  `enable_fp16_accumulation` affects sage output (no).
+- `internal/pyright_noise.md` (gitignored) -- pyright false-positives
+  to ignore in `sageattention/` and `tests/`.
 
 ## Related
 
 - `VISION.md` -- canonical scope doc. What this fork is, what it
   isn't, the single load-bearing metric, what we might be wrong
-  about. Rare edits; update when the fork's philosophy shifts.
-- `README.md` -- what changed vs upstream, what was measured, what
-  tradeoffs come with using it. The longer per-feature explanation
-  surface; cross-linked from VISION.md.
+  about. Rare edits.
+- `README.md` -- attribution + minimal user-facing summary.
 - `CHANGELOG.md` -- versioned divergence + Known kernel bugs +
   Backlog + Decision log + Recurring process items. Source of truth
   for closed decisions.
 - `internal/PLAN.md` (gitignored) -- live operational doc: current
   state, active backlog with triggers, cross-repo coupling,
-  experiment log (TSV), the research loop. Edit every session.
-  Mirrors CHANGELOG's Backlog and Recurring sections in active
-  form. Pairs with `internal/log/log_<date>.md` (narrative session
-  notes) and `internal/audit_<date>.md` (durable findings).
+  experiment log. Edit every session. Mirrors CHANGELOG's Backlog
+  and Recurring sections in active form. Pairs with
+  `internal/log/log_<date>.md` and `internal/audit_<date>.md`.
 - `.claude.local.md` (gitignored) -- personal companion to this
-  file. Holds the specific local-machine details that would leak in
-  committed material: active venv path, consumer-install location,
-  the `coderef/` symlink targets. May not exist on a fresh clone;
-  that's by design. When this CLAUDE.md says "use `${VIRTUAL_ENV}`"
-  or "`coderef/` is symlinks to consumer source," `.claude.local.md`
-  is where the specific values live.
+  file. Holds the specific local-machine details that would leak
+  in committed material: active venv path, consumer-install
+  location, `coderef/` symlink targets.
 - A downstream ComfyUI consumer (any custom node patching attention)
   owns routing policy, tracing telemetry, and workflow integration.
   Sage-fork stays primitive: kernels and the bench harness only.
