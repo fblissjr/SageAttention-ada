@@ -80,18 +80,24 @@ additions (we own the contract).
   sm89 + LTX shapes (hardcoded config was already optimal) but
   forward-compatible: catches future kernel/triton/shape shifts.
 - `sageattention/core.py::sageattn` -- v0.3.0 dispatcher mask-routing
-  fix. See CLAUDE.md "The consumer surface" section and CHANGELOG
-  v0.3.0 for the mechanism.
+  fix. v0.5.5 changed the masked-call destination on sm89 + CUDA >= 12.8
+  from `sageattn_qk_int8_pv_fp16_triton` to `sageattn_qk_int8_pv_fp8_cuda`
+  (the new CUDA mask path); other archs unchanged. See CLAUDE.md "The
+  consumer surface" section and CHANGELOG v0.3.0 / v0.5.5 for the
+  mechanism.
 - `sageattention/core.py::_warn_if_mask_passed_to_cuda_kernel` --
-  v0.3.1 soft-warn helper. Hooked into the two CUDA entry-point
-  wrappers (`sageattn_qk_int8_pv_fp16_cuda`,
-  `sageattn_qk_int8_pv_fp8_cuda`) right after the assert block.
-  Catches consumers who bypass the dispatcher and hand-pick a `_cuda`
-  kernel with a non-None mask. (v0.5.0 dropped the third wrapper,
-  `sageattn_qk_int8_pv_fp8_cuda_sm90`, along with the rest of the
-  Hopper plumbing.)
-  Soft (warns, not raises) so `attn_mask=None` defensive callers
-  aren't penalized.
+  v0.3.1 soft-warn helper. Still hooked into `sageattn_qk_int8_pv_fp16_cuda`.
+  For `sageattn_qk_int8_pv_fp8_cuda`, v0.5.5 replaced the call with
+  explicit kwargs-pop logic that (a) passes the mask through to the
+  fp32+fp16 variant (native kGeneral path) and (b) warns + drops on
+  the other `pv_accum_dtype` variants (their kernels haven't gained
+  the kGeneral path).
+- **`MaskMode::kGeneral` + `apply_general_mask` helper** in
+  `csrc/qattn/attn_utils.cuh` + kGeneral specialization in
+  `qk_int_sv_f8_cuda_sm89.cuh` -- v0.5.5 native CUDA general-mask
+  support, scoped to the load-bearing sm89 fp8++ kernel
+  (`qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf`). Mechanism,
+  measurement, and what's deferred: CHANGELOG v0.5.5.
 - `build.sh` -- editable-install wrapper with VIRTUAL_ENV check,
   `--python` pin, MAX_JOBS cap.
 - `tests/test_sageattn_ltx_shapes.py` -- LTX-parametrized accuracy +
@@ -101,17 +107,21 @@ additions (we own the contract).
 - `tests/test_dispatched_kernel_telemetry.py` -- standalone-script
   test for the `get_last_dispatched_kernel()` helper. 11 tests
   covering: exports, initial-None state, dispatcher-routes-to-fp8++
-  on sm89 (unmasked), dispatcher-routes-masked-calls-to-triton
-  (v0.3.0 invariant), `pv_accum_dtype` override honored
-  (v0.3.1 regression test), per-variant kernel name strings,
-  hand-picked-_cuda-warns-on-mask (v0.3.1 soft-warn),
-  thread-local isolation. Pure Python; no rebuild needed after
-  edits to `core.py` or `__init__.py`.
+  on sm89 (unmasked), dispatcher-routes-masked-calls-correctly
+  (v0.3.0 + v0.5.5 invariant: masked calls land on fp8++ on
+  sm89+CUDA>=12.8, on Triton elsewhere), `pv_accum_dtype` override
+  honored (v0.3.1 regression test), per-variant kernel name strings,
+  hand-picked-_cuda-warns-on-mask (v0.3.1 soft-warn for non-fp8++
+  variants), thread-local isolation. Pure Python; no rebuild
+  needed after edits to `core.py` or `__init__.py`.
 - `tests/test_sageattn_ltx_shapes.py::cross_attn_unmasked_kv226_kratio_probe`
   -- v0.3.1 K-ratio probe row. Same shape as `cross_attn_text_kv226`
   but unmasked, so `K = triton_masked_ms / fp8++_unmasked_ms` is
-  readable from two bench rows. Gates the deferred native CUDA
-  mask kernel work (Backlog).
+  readable from two bench rows. Originally gated the deferred native
+  CUDA mask kernel work; v0.5.5 superseded its role for sm89 fp8++
+  (the work landed). Probe row stays as a perf-regression signal --
+  if K spikes, an autotune-config or kernel optimization regressed
+  the masked Triton path.
 - `tests/bench_e2e_ltx.py` -- v0.4.0 end-to-end gen-time bench.
   Submits a workflow via the ComfyUI HTTP API, runs N times sage-on
   vs sage-disabled, reports wall-time speedup +

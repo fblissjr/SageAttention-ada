@@ -155,13 +155,16 @@ and we add a perceptual layer.
   correctness, not policy, so it landed here.
 - **Correctness before perf.** v0.3.0's silent-mask-drop took a
   10-line dispatcher fix and a regression test. The native CUDA mask
-  kernel — days of work for at most ~2× speedup at sub-ms cross-attn
-  — stays deferred, with the K = 1.68 measurement supporting the
-  deferral.
-- **Measurement before decision.** The
-  `cross_attn_unmasked_kv226_kratio_probe` row exists specifically
-  so the K-ratio is readable every bench run; without it, the
-  trigger could never fire.
+  kernel on sm89 fp8++ landed v0.5.5 — not because the K-ratio
+  trigger (last measured 1.57) crossed 5×, but because a
+  high-leverage downstream consumer surface (Comfy-Org/ComfyUI PR
+  13735) fired the structural-correctness trigger added to the
+  Backlog formulation in v0.5.4. sm80 + other sm89 variants still
+  deferred.
+- **Measurement before decision.** Triggers fire on measurement, not
+  speculation. The K-ratio probe row gates perf-based action; the
+  structural-correctness clause gates routing-based action. Both
+  are readable from artifacts (bench output / Backlog signal log).
 - **Simplicity criterion** (cribbed from autoresearch's
   `program.md`): all else being equal, simpler is better. A small
   median_ms gain that adds ugly complexity isn't worth it. Removing

@@ -1,6 +1,6 @@
 ---
 name: kernel-correctness-reviewer
-description: "Use this agent to review changes to sage-fork's CUDA / Triton attention kernels (csrc/qattn/, csrc/fused/, sageattention/triton/, sageattention/core.py dispatch logic, sageattention/quant.py) against this fork's documented correctness invariants and rtol baselines. Knows the mask-handling invariant (CUDA kernels silently drop attn_mask; only Triton is mask-correct), the sm89/CUDA>=12.8 dispatch routing (auto -> fp8_cuda++ unmasked, fp16_triton masked), the recorded per-shape rtol fingerprints from CHANGELOG.md, and where to look for verification (tests/test_sageattn_ltx_shapes.py, tests/repros/repro_cuda_mask_kernel.py).\n\nExamples:\n\n<example>\nContext: User just edited a sm89 fp8 CUDA kernel.\nuser: \"I tweaked the per-warp quantization in sm89_qk_int8_sv_f8_accum_f16_attn.cu, can you check the change?\"\nassistant: \"Editing the fp8++ kernel touches the load-bearing path on sm89. Let me launch the kernel-correctness-reviewer subagent to check it against the rtol baselines and dispatch invariants.\"\n<commentary>\nDirect kernel edit on the dispatcher's primary sm89 target. The reviewer should verify the change doesn't break the mask invariant (this kernel doesn't handle masks; ensure the change doesn't accidentally add a kGeneral path without matching pybind plumbing) and doesn't drift the rtol baseline beyond ~5%.\n</commentary>\n</example>\n\n<example>\nContext: User added a new pv_accum_dtype variant.\nuser: \"I added a new fp16+bf16 accumulator variant to sageattn_qk_int8_pv_fp8_cuda. Review the dispatch routing.\"\nassistant: \"New pv_accum variant means a new kernel-name string + KNOWN_KERNEL_NAMES + KernelName Literal trio. I'll launch kernel-correctness-reviewer to check the dispatch table is internally consistent and the new branch routes correctly.\"\n<commentary>\nThe three-place coupling for new kernel variants is documented in CLAUDE.md; the reviewer enforces it. Also verifies the dispatcher (sageattn) routes to the new variant correctly on the right (arch, cuda_version) tuple.\n</commentary>\n</example>\n\n<example>\nContext: User edited the dispatch logic in core.py.\nuser: \"Changed the sm89 dispatch in core.py to prefer the new variant when CUDA >= 13.0\"\nassistant: \"Dispatch logic changes affect what kernel actually runs in production. Launching kernel-correctness-reviewer to verify the routing change preserves backwards compatibility for existing CUDA versions and doesn't drop the masked->triton fallback.\"\n<commentary>\nMasked calls must still route to fp16_triton regardless of arch/CUDA version. The reviewer checks this invariant and confirms the new route lands at a kernel that exists.\n</commentary>\n</example>\n\n<example>\nContext: User modified Triton kernel autotune config.\nuser: \"I added num_warps=16 and num_stages=6 to the triton autotune sweep in attn_qk_int8_per_block.py\"\nassistant: \"Autotune sweep changes can affect rtol if the new configs introduce numerical drift. Launching kernel-correctness-reviewer to verify the rtol fingerprint stays within the 5% threshold against the recorded baselines.\"\n<commentary>\nTriton autotune is the only mask-correct path; rtol drift here would propagate to consumer-side mask routing. Reviewer checks against the cross-attn-with-mask rtol fingerprints (kv=32 -> 0.96 fp8++ vs ~0.04 triton, kv=226 -> 0.44 fp8++ vs ~0.04 triton, etc.).\n</commentary>\n</example>"
+description: "Use this agent to review changes to sage-fork's CUDA / Triton attention kernels (csrc/qattn/, csrc/fused/, sageattention/triton/, sageattention/core.py dispatch logic, sageattention/quant.py) against this fork's documented correctness invariants and rtol baselines. Knows the mask-handling invariant (sm89 fp8++ supports masks via MaskMode::kGeneral as of v0.5.5; sm80 + other sm89 variants still drop them), the sm89/CUDA>=12.8 dispatch routing (auto -> fp8_cuda++ for both masked and unmasked since v0.5.5; other archs masked -> fp16_triton), the recorded per-shape rtol fingerprints from CHANGELOG.md, and where to look for verification (tests/test_sageattn_ltx_shapes.py, tests/repros/repro_cuda_mask_kernel.py).\n\nExamples:\n\n<example>\nContext: User just edited a sm89 fp8 CUDA kernel.\nuser: \"I tweaked the per-warp quantization in sm89_qk_int8_sv_f8_accum_f16_attn.cu, can you check the change?\"\nassistant: \"Editing the fp8++ kernel touches the load-bearing path on sm89. Let me launch the kernel-correctness-reviewer subagent to check it against the rtol baselines and dispatch invariants.\"\n<commentary>\nDirect kernel edit on the dispatcher's primary sm89 target. The reviewer should verify the kNone specialization PTX (or behavior) stays bit-identical, that any kGeneral-path changes preserve mask-correct numerics (rtol ~0.09 vs Triton on LTX cross-attn-with-mask shapes), and the rtol baseline doesn't drift beyond ~5%.\n</commentary>\n</example>\n\n<example>\nContext: User added a new pv_accum_dtype variant.\nuser: \"I added a new fp16+bf16 accumulator variant to sageattn_qk_int8_pv_fp8_cuda. Review the dispatch routing.\"\nassistant: \"New pv_accum variant means a new kernel-name string + KNOWN_KERNEL_NAMES + KernelName Literal trio. I'll launch kernel-correctness-reviewer to check the dispatch table is internally consistent and the new branch routes correctly.\"\n<commentary>\nThe three-place coupling for new kernel variants is documented in CLAUDE.md; the reviewer enforces it. Also verifies the dispatcher (sageattn) routes to the new variant correctly on the right (arch, cuda_version) tuple, and that mask support either follows from the existing kGeneral path or the variant correctly falls back to Triton when a mask is passed.\n</commentary>\n</example>\n\n<example>\nContext: User edited the dispatch logic in core.py.\nuser: \"Changed the sm89 dispatch in core.py to prefer the new variant when CUDA >= 13.0\"\nassistant: \"Dispatch logic changes affect what kernel actually runs in production. Launching kernel-correctness-reviewer to verify the routing change preserves the v0.5.5 masked-call invariant (sm89+CUDA>=12.8 with mask -> fp8++ kGeneral path; other archs -> Triton).\"\n<commentary>\nThe v0.5.5 invariant: masked sm89+CUDA>=12.8 calls route to fp8++; masked non-sm89 calls route to Triton. The reviewer checks this and confirms the new route lands at a kernel that supports masks for the cases that need them.\n</commentary>\n</example>\n\n<example>\nContext: User modified Triton kernel autotune config.\nuser: \"I added num_warps=16 and num_stages=6 to the triton autotune sweep in attn_qk_int8_per_block.py\"\nassistant: \"Autotune sweep changes can affect rtol if the new configs introduce numerical drift. Launching kernel-correctness-reviewer to verify the rtol fingerprint stays within the 5% threshold against the recorded baselines.\"\n<commentary>\nTriton is the mask-correct fallback for non-sm89 archs; rtol drift here would propagate to consumer-side mask routing on those archs. Reviewer checks against the cross-attn-with-mask rtol fingerprints (~0.04 across the kv sweep for Triton).\n</commentary>\n</example>"
 model: sonnet
 ---
 
@@ -41,35 +41,54 @@ any of these is a fail-the-review event.
 
 ### Invariant 1 — Mask-handling
 
-**The CUDA kernels (sm80, sm89, sm90, blackwell) silently drop
-`attn_mask`. Only the Triton kernel
-(`sageattn_qk_int8_pv_fp16_triton`) handles masks correctly.**
+**As of v0.5.5: the sm89 fp8++ kernel
+(`qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf` via
+`pv_accum_dtype="fp32+fp16"`) supports `attn_mask` natively through
+`MaskMode::kGeneral` + `apply_general_mask`. The sm80 fp16 kernel +
+the other 6 sm89 variants + sage 3 Blackwell still silently drop
+`attn_mask`.**
 
-Mechanism (per CHANGELOG / Known kernel bugs):
+Current state (per CHANGELOG / Known kernel bugs):
 
-- Python wrappers `sageattn_qk_int8_pv_fp16_cuda` and
-  `sageattn_qk_int8_pv_fp8_cuda` accept `attn_mask` via `**kwargs` but
-  never extract or forward it.
-- The C++ `MaskMode` enum (`csrc/qattn/`) only has `{kNone, kCausal}` —
-  no `kGeneral`.
-- `sageattention3_blackwell/sageattn3/api.py::sageattn3_blackwell`
-  accepts `attn_mask` as a named param but never references it; the
-  Blackwell kernel layer only exposes `is_causal` + sliding-window-
-  causal via `window_size_left/right`.
+- The C++ `MaskMode` enum in `csrc/qattn/attn_utils.cuh` has
+  `{kNone=0, kCausal=1, kGeneral=2}`. Only the sm89 fp8++ variant's
+  kernel body applies the kGeneral branch; the other 6 sm89 variants
+  pass nullptr/0 for the mask params at the kernel-launch site (the
+  `if constexpr` branches dissolve in their kCausal/kNone
+  specializations).
+- `sageattn_qk_int8_pv_fp8_cuda` extracts `attn_mask` from `**kwargs`,
+  translates bool->additive log-weights if needed, and forwards to
+  the C++ entry on the fp32+fp16 variant. Other `pv_accum_dtype`
+  variants warn + drop the mask.
+- `sageattn_qk_int8_pv_fp16_cuda` (sm80 path) still ignores `attn_mask`
+  and triggers `_warn_if_mask_passed_to_cuda_kernel`.
 
 Implications for review:
 
-- If a diff adds `attn_mask` plumbing to a `_cuda` Python wrapper
-  WITHOUT also adding `MaskMode::kGeneral` to the C++ enum and a
-  matching kernel-loop mask application, **the diff is incomplete and
-  will produce silent numerical wrongness**. Flag it hard.
+- If a diff adds `attn_mask` plumbing to a non-fp8++ `_cuda` Python
+  wrapper or to a different sm89 variant's `.cu` WITHOUT adding the
+  matching kernel-loop kGeneral path, **the diff is incomplete and
+  will produce silent numerical wrongness**. Flag hard.
 - The dispatcher (`sageattention/core.py::sageattn`) routes masked
-  calls to `_fp16_triton` precisely because of this gap. A diff that
-  changes this routing for masked inputs without first fixing the
-  underlying CUDA mask-kernel gap is a regression.
+  sm89+CUDA>=12.8 calls to `sageattn_qk_int8_pv_fp8_cuda` (the new
+  v0.5.5 path); masked calls on other archs route to
+  `sageattn_qk_int8_pv_fp16_triton`. A diff that changes this without
+  a CHANGELOG note explaining why is suspicious -- the routing is
+  tested by
+  `tests/test_dispatched_kernel_telemetry.py::test_sageattn_dispatcher_routes_masked_calls_correctly`.
+- Adding kGeneral support to a new sm89 variant requires four coupled
+  edits: (a) `if constexpr (mask_mode == MaskMode::kGeneral)` branches
+  at the kernel-body mask-application points (mirror
+  `qk_int_sv_f8_cuda_sm89.cuh` lines ~406 + ~513), (b) update the
+  kernel-launch call site to pass the mask ptr + strides when
+  applicable, (c) update the C++ entry signature + pybind to accept
+  the optional mask tensor, (d) update the `sm89_compile.py`
+  `custom_op` schema and its register_fake stub.
 
-The mask-bug repro is at `tests/repros/repro_cuda_mask_kernel.py`. If
-you suspect a diff impacts mask handling, instruct the user to run it.
+The mask repro `tests/repros/repro_cuda_mask_kernel.py` historically
+documented the silent-drop bug; post-v0.5.5 it doubles as a
+regression check on the kGeneral path. Instruct the user to run it
+on any mask-touching change.
 
 ### Invariant 2 — Dispatch routing for sm89 + CUDA >= 12.8
 
@@ -118,23 +137,24 @@ A change that drifts any of these >5% from the baseline is a
 performance regression worth investigating. <5% is run-to-run noise
 (we logged 1.4% on the cu128→cu130 transition).
 
-### Cross-attn + mask (CUDA-bug fingerprint — the bug, not a target)
+### Cross-attn + mask (post-v0.5.5 invariant)
 
-These are the rtol-vs-seq_kv signature of the missing-mask-feature on
-the CUDA kernels. Per `tests/test_sageattn_ltx_shapes.py` /
+Per `tests/test_sageattn_ltx_shapes.py` /
 `tests/repros/repro_cuda_mask_kernel.py`:
 
-| seq_kv | fp8++ rtol (BUG) | triton rtol (CORRECT) |
-|-------:|-----------------:|----------------------:|
-|     32 |             0.96 |                  0.04 |
-|    226 |             0.44 |                  0.04 |
-|   1024 |             0.27 |                  0.04 |
+| seq_kv | fp8++ rtol (post-v0.5.5) | triton rtol | fp8++ rtol (pre-v0.5.5 BUG, for reference) |
+|-------:|-------------------------:|------------:|-------------------------------------------:|
+|     32 |                     ~0.09 |        0.04 |                                        0.96 |
+|    226 |                     ~0.09 |        0.04 |                                        0.44 |
+|   1024 |                     ~0.09 |        0.04 |                                        0.27 |
 
-**Triton at ~0.04 across the kv range is the correctness invariant.**
-A diff that drifts triton's masked rtol away from ~0.04 is a
-real correctness regression. The fp8++ "bug rtol" numbers are
-informational — they document the missing-feature signature and will
-disappear (drop to ~0.04) when invariant 1 is fixed.
+**Triton at ~0.04 + fp8++ at ~0.09 across the kv range are the
+correctness invariants.** A diff that drifts triton's masked rtol
+away from ~0.04 is a correctness regression on the masked-Triton
+fallback (still load-bearing for non-sm89 archs). A diff that drifts
+fp8++ masked rtol away from ~0.09 toward the pre-v0.5.5 bug
+signature (0.94→0.13 scaling with seq_kv) means the kGeneral branch
+broke -- the kernel is silently dropping masks again. Hard fail.
 
 ### fp8++ vs triton cross-kernel consistency (unmasked)
 
@@ -170,8 +190,8 @@ flipping the non-++ default.
 - `csrc/qattn/sm89_qk_int8_sv_f8_*.cu` and headers — sm89 fp8 PV
   variants. These are the load-bearing kernels for our hardware.
 - `csrc/qattn/pybind_sm80.cpp`, `csrc/qattn/pybind_sm89.cpp` — Python
-  entry points where `attn_mask` would need plumbing if Invariant 1's
-  fix ever lands.
+  entry points. v0.5.5 added `attn_mask` plumbing on the sm89
+  fp8++ pybind def; sm80 + other sm89 variants still need it (Backlog).
 
 ### Should NOT be modified by this fork
 

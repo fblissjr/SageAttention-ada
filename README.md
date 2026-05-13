@@ -129,27 +129,38 @@ parallelism OOMs an 8-core box.
 
 **Scope.** Pure ergonomics; no kernel-side effect.
 
-### 6. `sageattn()` dispatcher mask-routing fix (v0.3.0)
+### 6. `sageattn()` dispatcher mask-routing fix (v0.3.0) + native CUDA mask on sm89 fp8++ (v0.5.5)
 
-`sageattention/core.py::sageattn` now extracts `attn_mask` from
-`**kwargs` before the arch branch and short-circuits to
-`sageattn_qk_int8_pv_fp16_triton` when non-None. Pre-fix the
-dispatcher routed purely by arch and silently dropped the mask, so
-`sageattn(q, k, v, attn_mask=m)` produced numerically wrong output
-on every CUDA arch.
+**v0.3.0**: `sageattention/core.py::sageattn` extracts `attn_mask`
+from `**kwargs` before the arch branch and routes masked calls to a
+mask-correct kernel. Pre-fix the dispatcher routed purely by arch
+and silently dropped the mask, so `sageattn(q, k, v, attn_mask=m)`
+produced numerically wrong output on every CUDA arch.
 
-**Why it matters.** End-to-end rtol on LTX cross-attn-with-mask at
-kv=226 went from 0.4405 (broken: mask dropped, fp8++ ran unmasked)
-to 0.0391 (correct: routed to fp16_triton). Pinned by
-`tests/test_dispatched_kernel_telemetry.py::test_sageattn_dispatcher_routes_masked_calls_to_triton`.
-v0.3.1 added a soft-warn when consumers bypass the dispatcher and
-hand-pick a `_cuda` kernel with a non-None mask, so the same bug
-class can't reach the CUDA path silently.
+**v0.5.5**: native general-mask support in the sm89 fp8++ kernel
+(`MaskMode::kGeneral` + `apply_general_mask` in
+`csrc/qattn/attn_utils.cuh` + the kGeneral specialization in
+`qk_int_sv_f8_cuda_sm89.cuh`). Masked calls on sm89 + CUDA >= 12.8
+now route to `sageattn_qk_int8_pv_fp8_cuda` with
+`pv_accum_dtype="fp32+fp16"` rather than the Triton fallback. Other
+archs still route to Triton (their CUDA kernels haven't gained mask
+support yet -- Backlog).
 
-**Scope.** Behavior change for any consumer that passes `attn_mask`
-to `sageattn()`. Strictly an improvement — pre-fix, those calls
-were silently wrong; post-fix, they route to the only mask-correct
-kernel.
+**Why it matters.** End-to-end rtol on LTX cross-attn-with-mask
+shapes pre-v0.3.0: 0.94 (broken: mask dropped, fp8++ ran unmasked).
+Post-v0.3.0, pre-v0.5.5: 0.04 (correct via Triton fallback;
+acceptable). Post-v0.5.5: 0.09 (correct via native CUDA;
+fp8++-equivalent accuracy at fp8++ perf). Pinned by
+`tests/test_dispatched_kernel_telemetry.py::test_sageattn_dispatcher_routes_masked_calls_correctly`.
+v0.3.1 added a soft-warn for the bypass-the-dispatcher + hand-pick
++ pass-mask case; v0.5.5 narrowed the warn to non-fp8++ variants
+since fp8++ now supports masks.
+
+**Scope.** v0.3.0 was strictly correctness (silent wrong -> right
+answer via Triton). v0.5.5 is additional perf (right answer via
+Triton -> right answer via CUDA at fp8++ speed). Masked sm89 calls
+that previously paid the Triton overhead now run on the CUDA path
+at the same perf as unmasked.
 
 ### 7. `tests/bench_e2e_ltx.py` — end-to-end gen-time harness (v0.4.0)
 
@@ -215,26 +226,31 @@ Cross-kernel `fp8++ vs fp16_triton` mean rtol on unmasked shapes is
 independent error vs SDPA (`sqrt(0.04² + 0.09²) ≈ 0.098`). No hidden
 discontinuity from mixing the two in one forward pass.
 
-### Mask gap: cross-attn-with-mask, kv-sweep on LTX
+### Mask gap: closed on sm89 fp8++ (v0.5.5); still open on other CUDA paths
 
-`tests/test_sageattn_ltx_shapes.py` sweeps cross-attn seq_kv from 32
-to 1024 with a ~30-position text-padding tail. CUDA kernels show
-mean rtol that scales with `1 / seq_kv` — exactly the signature of
-"the mask was dropped, so the masked positions corrupt softmax
-proportional to how many of them there are":
+Historic measurement (pre-v0.5.5): `tests/test_sageattn_ltx_shapes.py`
+sweeps cross-attn seq_kv from 32 to 1024 with a ~30-position
+text-padding tail. CUDA kernels showed mean rtol that scaled with
+`1 / seq_kv` — the signature of "mask was dropped, so masked
+positions corrupt softmax proportional to how many of them there
+are":
 
-| seq_kv | sage fp8++ rtol | sage fp16_triton rtol |
-|-------:|----------------:|----------------------:|
-|     32 | NaN             | ~0.04                 |
-|     64 | 0.94            | ~0.04                 |
-|    128 | 0.66            | ~0.04                 |
-|    226 | 0.44            | ~0.04                 |
-|    512 | 0.20            | ~0.04                 |
-|   1024 | 0.13            | ~0.04                 |
+| seq_kv | sage fp8++ pre-v0.5.5 | sage fp16_triton |
+|-------:|----------------------:|-----------------:|
+|     32 | NaN                   | ~0.04            |
+|     64 | 0.94                  | ~0.04            |
+|    128 | 0.66                  | ~0.04            |
+|    226 | 0.44                  | ~0.04            |
+|    512 | 0.20                  | ~0.04            |
+|   1024 | 0.13                  | ~0.04            |
 
-The Triton kernel handles masks correctly across the full sweep. See
-[`CHANGELOG.md`](./CHANGELOG.md) "Known kernel bugs" for the root
-cause and the kernel-source pointers if we ever fix it.
+v0.5.5 added native general-mask support to the sm89 fp8++ kernel,
+collapsing the pre-fix scaling-with-seq_kv signature to a flat ~0.09
+across the full sweep (matching the fp8++ unmasked-vs-Triton
+accuracy floor). The Triton kernel still gates other archs + the
+hand-picked-non-fp8++ case. See [`CHANGELOG.md`](./CHANGELOG.md)
+v0.5.5 entry for the per-shape measurement + what remains open
+(sm80, other sm89 variants, sparse-mask whole-block-skip).
 
 ### torch.compile
 
@@ -256,24 +272,27 @@ measurable speedup."
 - A 2–2.7× speedup over torch's flash backend on sm89 self-attn
   (across head_dim ∈ {64, 120, 128} on the model classes we
   validated).
-- A faster cross-attn path via `sageattn_qk_int8_pv_fp16_triton` (the
-  Triton kernel is the only mask-correct path; ~2.8× over
-  `torch_cudnn` at LTX cross-attn shapes).
+- Native mask support on the sm89 fp8++ CUDA path (v0.5.5) -- masked
+  calls now run at fp8++ speed instead of paying the Triton fallback
+  overhead. Triton still gates other archs + the
+  hand-picked-non-fp8++-variant case.
 - Quantization-induced rtol of ~0.097 on unmasked shapes vs SDPA. In
   practice this is below VAE noise on image/video gen workloads we've
   tested; not measured against any task-level quality benchmark.
 
 **You give up:**
 
-- **Mask correctness on hand-picked `_cuda` kernels.** The `_cuda`
-  kernels' wrappers accept `attn_mask` via `**kwargs` but never
-  forward it — the C++ `MaskMode` enum only has `{kNone, kCausal}`.
-  Calling `sageattn_qk_int8_pv_fp8_cuda(q, k, v, attn_mask=m)`
-  directly emits a soft warning and produces numerically wrong
-  output. The top-level `sageattn()` dispatcher routes masked calls
-  to `sageattn_qk_int8_pv_fp16_triton` automatically (since v0.3.0),
-  so consumers calling the dispatcher are safe. Repro:
-  [`tests/repros/repro_cuda_mask_kernel.py`](./tests/repros/repro_cuda_mask_kernel.py).
+- **Mask correctness on hand-picked non-fp8++ `_cuda` kernels.**
+  v0.5.5 added native mask support to `sageattn_qk_int8_pv_fp8_cuda`
+  with `pv_accum_dtype="fp32+fp16"` (the sm89 fp8++ variant). The
+  other CUDA paths (sm80 fp16, sm89 non-fp8++) still accept
+  `attn_mask` via `**kwargs` and silently drop it -- they haven't
+  gained the `MaskMode::kGeneral` kernel-side application yet
+  (Backlog). Calling one of those directly with a mask emits a soft
+  warning. The top-level `sageattn()` dispatcher routes masked calls
+  to a mask-correct kernel automatically (fp8++ on sm89 + CUDA >= 12.8,
+  Triton elsewhere), so consumers calling the dispatcher are safe.
+  Repro: [`tests/repros/repro_cuda_mask_kernel.py`](./tests/repros/repro_cuda_mask_kernel.py).
 - bf16/fp16 input only. No fp32 input path.
 - `torch.compile` around sage. The consumer must wrap calls in
   `torch.compiler.disable()` until the spike's verdict flips.

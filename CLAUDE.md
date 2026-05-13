@@ -39,8 +39,9 @@ attention. Relevant pieces:
   SM80 kernel (INT8 QK + FP16 PV). Forward-compatible to Ada.
 - `csrc/qattn/pybind_sm89.cpp` + `sm89_qk_int8_sv_f8_*.cu` -- SM89
   kernel set (INT8 QK + FP8 PV, multiple accum variants).
-- `sageattention/triton/` -- JIT Triton kernels. The only masked
-  path that's numerically correct (CHANGELOG / Known kernel bugs).
+- `sageattention/triton/` -- JIT Triton kernels. Mask-correct on
+  all archs (the only mask-correct path before v0.5.5; still gates
+  archs that haven't gained native CUDA mask support).
 - `setup.py` -- builds `_qattn_sm80`, `_qattn_sm89`, `_fused`. Our
   patch at line 152 adds sm89 to the SM80 build gate.
 - `build.sh` -- editable-install wrapper. Enforces `VIRTUAL_ENV`,
@@ -180,24 +181,27 @@ Sage exposes two surfaces to downstream consumers:
    `(detected arch, CUDA version, mask presence)`. On sm89 + CUDA >=
    12.8 unmasked: lands on `sageattn_qk_int8_pv_fp8_cuda` with
    `pv_accum_dtype="fp32+fp16"`. With `attn_mask` passed: routes to
-   `sageattn_qk_int8_pv_fp16_triton` regardless of arch, because
-   that's the only mask-correct path. Implementation:
-   `sageattention/core.py::sageattn` pulls `attn_mask` out of
-   `**kwargs` before the arch branch. The mask-routing claim is
-   enforced by a test in `tests/test_dispatched_kernel_telemetry.py`
-   that fails the moment the dispatcher reverts to arch-only routing.
+   the same `sageattn_qk_int8_pv_fp8_cuda` (the v0.5.5 native CUDA
+   mask path); other archs still route to `sageattn_qk_int8_pv_fp16_triton`
+   since their CUDA kernels haven't gained mask support yet.
+   Implementation: `sageattention/core.py::sageattn` pulls `attn_mask`
+   out of `**kwargs` before the arch branch and bifurcates on
+   `(arch, cuda_version, mask_present)`. The routing invariant is
+   enforced by a test in `tests/test_dispatched_kernel_telemetry.py`.
    **Most consumers should just call this and let dispatch decide.**
 2. **Specific kernel exports** -- `sageattn_qk_int8_pv_fp16_cuda`,
    `sageattn_qk_int8_pv_fp8_cuda`, `sageattn_qk_int8_pv_fp16_triton`,
-   etc. Bypass the dispatcher; caller picks. **Masked attention only
-   works with `_fp16_triton`**; passing `attn_mask` to a `_cuda`
-   kernel silently drops the mask and produces numerically wrong
-   output. CUDA wrappers accept `attn_mask` via `**kwargs` but never
-   read it. If a consumer hand-picks a CUDA kernel + mask, that's a
-   consumer bug -- the dispatcher is the safe default.
+   etc. Bypass the dispatcher; caller picks. **Masked attention works
+   on sm89 fp8++ (`pv_accum_dtype="fp32+fp16"`) as of v0.5.5** and on
+   the Triton kernel; other CUDA variants (sm80 fp16, sm89 non-fp8++)
+   still silently drop the mask and warn. If a consumer hand-picks a
+   non-mask-correct CUDA kernel + mask, the v0.3.1 soft-warn fires;
+   the dispatcher is the safe default.
 
 Mask-routing fix landed v0.3.0 (2026-04-26); audit trail in
-`internal/audit_2026-04-26.md`.
+`internal/audit_2026-04-26.md`. Native CUDA mask landed v0.5.5
+(2026-05-13) on sm89 fp8++; scoping doc + measurement trail in
+`internal/design/cuda_mask_kernel_scoping.md` (gitignored).
 
 There is also an undocumented L3 contract -- underscore-prefixed
 symbols and pybind methods that downstream consumers import by name.

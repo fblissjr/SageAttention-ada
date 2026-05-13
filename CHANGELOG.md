@@ -25,53 +25,48 @@ Real defects we've measured in this fork's kernels. We own the fork now;
 these are ours to fix when we want to. If you're debugging
 sage-attention-adjacent correctness problems, start here.
 
-### CUDA kernels have no general attention-mask support
+### CUDA kernels have partial attention-mask support (sm89 fp8++ landed v0.5.5; sm80 + other variants still missing)
 
-Not a bug to patch — a feature that was never implemented, and
-inherited from the `thu-ml/SageAttention` origin by every downstream
-fork. The Python wrappers `sageattn_qk_int8_pv_fp16_cuda` and
-`sageattn_qk_int8_pv_fp8_cuda` accept `attn_mask` via `**kwargs` but
-never pass it through to the C++ layer. The C++ `MaskMode` enum only
-has `{kNone, kCausal}`. Masks are silently dropped on all CUDA code
-paths.
+The original gap inherited from `thu-ml/SageAttention`: Python wrappers
+`sageattn_qk_int8_pv_fp16_cuda` and `sageattn_qk_int8_pv_fp8_cuda`
+accept `attn_mask` via `**kwargs` but never pass it through to the
+C++ layer. The C++ `MaskMode` enum originally had only `{kNone,
+kCausal}`. Masks were silently dropped on all CUDA code paths.
 
-The same pattern exists in `sageattention3_blackwell/sageattn3/api.py`:
-`sageattn3_blackwell(q, k, v, attn_mask=None, ...)` declares the
-parameter but never references it; the Blackwell kernel layer
-(`csrc/blackwell/`) only exposes `is_causal` + sliding-window-causal
-via `window_size_left/right`. So the mask gap is present across sage
-2.x AND sage 3 — the Triton kernel
-(`sageattn_qk_int8_pv_fp16_triton`) remains the only numerically
-correct mask path in the entire lineage.
+**v0.5.5 (2026-05-13) closed this on the load-bearing sm89 path** --
+the `MaskMode::kGeneral` variant + `apply_general_mask` helper landed
+in the fp8++ kernel (`qk_int_sv_f8_cuda_sm89.cuh` +
+`sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf.cu`). The
+dispatcher routes masked calls on sm89 + CUDA >= 12.8 to the new
+path. Measurement at LTX-class shape (bf16, T=2048, D=128) shows
+mean_rtol=0.098 vs Triton reference (same accuracy profile as the
+unmasked fp8++ path); the historic ~0.94 silent-drop signature is
+gone.
 
-Observable effect on LTX-2.3 shapes (bf16, heads=32, head_dim=64,
-seq_q=31776, varying seq_kv with ~30-position text-padding tail):
-rtol 0.26–0.94 across the tested seq_kv range; NaN at very short
-seq_kv (32) with proportionally small pad_tail (16).
-`sageattn_qk_int8_pv_fp16_triton` has proper mask plumbing and is
-correct (rtol ~0.04 across the range).
+**Still missing** (deferred per scope discipline):
+- sm80 fp16_cuda path (`qk_int_sv_f16_cuda_sm80.cu`). Same kernel
+  pattern; deferred until a workload hits sm80 + masks frequently.
+- The other 6 sm89 variants (`accum_f32_*`, `accum_f16_attn_inst_buf`,
+  the no-`inst_buf` versions). Not dispatcher-hit on sm89 + CUDA >= 12.8.
+- The sage 3 Blackwell path (also lacks mask support upstream;
+  removed in v0.5.0).
+- Whole-block-skip optimization on sparse bool masks (Triton has it
+  via the `tl.max(mask_block) == 0 -> skip` short-circuit; the CUDA
+  kernel's pipelined K-iteration loop makes the analog non-trivial
+  to mirror without serializing the pipeline).
 
-Repro: `tests/repros/repro_cuda_mask_kernel.py`.
+Until those land, hand-picking a `_cuda` kernel with a non-None mask
+on those paths still warns + drops (the v0.3.1 soft-warn safety net).
+The dispatcher's safe-default routing handles this for consumers
+that call `sageattn()` without overrides.
 
-Kernel sources to touch when we fix this:
-- `sageattention/core.py:439-451, 616-628` — Python entry points where
-  the mask gets dropped into `**kwargs` and never extracted.
-- `csrc/qattn/pybind_sm80.cpp`, `csrc/qattn/pybind_sm89.cpp` — pybind
-  signatures that would need a new `attn_mask` parameter.
-- `csrc/qattn/attn_cuda_sm80.h`, `attn_cuda_sm89.h` — kernel declarations;
-  `MaskMode` enum needs a `kGeneral` variant.
-- `csrc/qattn/qk_int_sv_f16_cuda_sm80.cu`, `csrc/qattn/sm89_qk_int8_sv_f8_*.cu` —
-  kernel bodies; mask would be applied to scores before the per-block
-  max reduction (see Triton reference in `sageattention/triton/`).
-
-Consumer workaround (sufficient for now): a downstream ComfyUI node
-patches the model's attention with a mask-aware router that sends
-masked calls to `sageattn_qk_int8_pv_fp16_triton` regardless of the
-configured mode.
+Repro: `tests/repros/repro_cuda_mask_kernel.py` (predates the v0.5.5
+fix; documents the original symptom on sm89 fp8++; now passes
+through the kGeneral path).
 
 Discovered: 2026-04-23 via `tests/test_sageattn_ltx_shapes.py` (the
-seq_kv sweep exposes the rtol-vs-seq_kv scaling signature; an Explore
-pass confirmed the missing-feature root cause).
+seq_kv sweep exposed the rtol-vs-seq_kv scaling signature). Closed
+on sm89 fp8++: 2026-05-13 (v0.5.5).
 
 ## Backlog
 
@@ -97,57 +92,42 @@ duplication is currently inert and the import path
 the standalone scripts don't set up today. Mild churn for tiny gain
 unless we're already in the file.
 
-### Add mask support to the sm80/sm89 CUDA kernels
+### Extend CUDA mask support beyond sm89 fp8++ (sm80, other sm89 variants)
 
-Scope, measurement, and consumer workaround are in "Known kernel bugs"
-above. Size estimate: days of kernel work, not hours (pybind signature,
-new `MaskMode::kGeneral`, kernel-loop mask application, plus perf and
-register-pressure regression verification).
+The sm89 fp8++ kernel landed mask support in v0.5.5 (2026-05-13). The
+remaining surfaces:
 
-**Triggers to act (any one of):**
+1. **sm80 fp16_cuda** (`qk_int_sv_f16_cuda_sm80.cu`). Same kernel
+   pattern as sm89; would mirror the `MaskMode::kGeneral` +
+   `apply_general_mask` work. Deferred -- sm89 is the load-bearing
+   arch for this fork and the dispatcher already routes correctly
+   on sm89.
+2. **Other 6 sm89 variants** (`accum_f32_*`, `accum_f16_attn_inst_buf`,
+   the no-`inst_buf` versions). Same kernel template; the call sites
+   already pass nullptr/0 for the mask params after v0.5.5 (the
+   `if constexpr` branches dissolve in the kCausal/kNone
+   specializations). Adding the kGeneral path here would mirror what
+   the fp8++ variant does; deferred until a dispatcher branch hits
+   one of them with a mask.
+3. **Whole-block-skip optimization on sparse bool masks**. Triton has
+   the `tl.max(mask_block) == 0 -> skip=True` early-exit on
+   all-False BLOCK_N tiles. The sm89 fp8++ CUDA kernel's pipelined
+   K-iteration loop (with `cp_async::commit_group` / `wait_group`)
+   makes the analog non-trivial -- a runtime skip would either
+   serialize the pipeline or require restructuring the loop. Real
+   perf win only on sparse masks (LTX-2.3 guide masks are dense);
+   defer until a consumer hits a sparse-mask workload where it
+   matters.
 
-1. *Perf signal*: K = `triton_masked_ms / fp8++_unmasked_ms` crosses
-   5x at a shape the dispatcher hits in production. Last measured:
-   K ~= 1.57 at kv=226 on RTX 4090 (v0.4.1 bench, 2026-04-27) -- well
-   below the threshold. Re-measure after every kernel-side optimization
-   that lands on the unmasked cross-attn path; the probe row
-   `ltx23_video_cross_unmasked_kv226_kratio_probe` exists for this.
-2. *Wall-time signal*: a downstream consumer's per-call JSONL trace
-   over a real production gen reports masked-triton as >5% of total
-   gen wall-time. (See Recurring process items / "Session-level
-   attention telemetry summary.")
-3. *Structural-correctness signal*: a downstream consumer surface
-   raises the CUDA mask gap as a routing or stability concern, not
-   just a perf concern. The original trigger formulation excluded
-   this dimension; v0.5.4's Phase 3 work surfaced that it should be
-   included. Threshold: 2+ independent downstream consumer surfaces,
-   OR 1 high-leverage surface (a core/ecosystem-level PR or a
-   project whose own routing has to compensate for sage's CUDA
-   mask gap is "high-leverage" -- a single individual user's
-   preference is not).
+**Trigger to act on (1) or (2):** the dispatcher routes a masked call
+to a surface that hits one of these kernels in production. Today
+sm89 + CUDA >= 12.8 routes to the v0.5.5 path; other archs route to
+Triton. If a downstream consumer reports masked calls on sm80 (or
+forces a non-fp8++ pv_accum_dtype on sm89 with a mask), revisit.
 
-**Signals received so far:**
-
-- 2026-05-13 -- Comfy-Org/ComfyUI PR 13735 (LTX 2.3 self-attn guide
-  masks). The PR forces SDPA fallback specifically because sage's
-  CUDA path silently drops `attn_mask`; the masked Triton fallback
-  was rejected on memory grounds (4090 OOM in their testing). A
-  ComfyUI core PR is high-leverage by itself: it represents the
-  ComfyUI consumer surface for every LTX 2.3 gen with
-  `guide_strength<1.0`, not one individual's preference, and the
-  ecosystem maintainer has explicitly raised the structural-
-  correctness concern. **Fires trigger #3 on the "1 high-leverage
-  surface" clause.**
-
-**Trigger status: fired 2026-05-13.** Committing to the work.
-Half-day spike scoped in `internal/design/cuda_mask_kernel_scoping.md`
-(gitignored) is the next move; PTX diff of the `kNone` specialization
-against HEAD answers the register-pressure question definitively
-before the full implementation lands.
-
-Until the kernel ships, the dispatcher's masked->triton routing
-(v0.3.0) + the `_warn_if_mask_passed_to_cuda_kernel` soft-warn
-(v0.3.1) remain the consumer-facing safety net.
+**Trigger to act on (3):** a consumer workflow with sparse (>50%
+all-False BLOCK_N tiles) masks reports Triton masked-path wall-time
+> 5% of total gen.
 
 ### `torch.library.custom_op` registration for fused-pybind kernels
 
@@ -473,6 +453,95 @@ a sage-fork kernel push with data. Until then the raw JSONL is
 sufficient.
 
 ## Versions
+
+### v0.5.5 -- 2026-05-13  (native general-mask support in the sm89 fp8++ CUDA kernel)
+
+First downstream-driven kernel-day work on the fork. Lands the
+load-bearing piece of the long-standing CUDA mask gap (in "Known
+kernel bugs" since 2026-04-23): the sm89 fp8++ kernel now applies an
+additive attn_mask to QK scores before the softmax max reduction,
+matching the Triton reference's behavior. Dispatcher routes masked
+calls on sm89 + CUDA >= 12.8 to the new path.
+
+Triggered by Comfy-Org/ComfyUI PR 13735 (LTX 2.3 self-attn guide
+masks) firing the "1 high-leverage surface" clause of the
+structural-correctness trigger (added in v0.5.4 backlog
+reformulation). Scoping note + implementation discipline in
+`internal/design/cuda_mask_kernel_scoping.md` (gitignored).
+
+#### Added
+
+- **`MaskMode::kGeneral`** value in `csrc/qattn/attn_utils.cuh` +
+  **`apply_general_mask<num_tiles_q, num_tiles_k, DTypeMask,
+  DTypeQKAccum>`** helper. Mirrors `apply_causal_mask`'s index math;
+  adds in-bounds-guarded mask load + additive apply per (q_idx,
+  kv_idx) for each thread's 8-entry register fragment. Supports
+  bool masks (translated to additive {-inf, 0} log-weights upstream
+  in Python) and dtype-matching float masks (half or nv_bfloat16),
+  mirroring the two Triton mask paths.
+
+- **`DTypeMask` template parameter + mask runtime params** on
+  `qk_int_sv_f8_attn_kernel` (`qk_int_sv_f8_cuda_sm89.cuh`). Defaults
+  to `nv_bfloat16` / nullptr / 0 strides so existing instantiations
+  compile unchanged. `if constexpr (mask_mode == MaskMode::kGeneral)`
+  branches at the two existing mask-application points (the
+  steady-state K-iteration block + the last-iter block) call the
+  helper; both branches dissolve in the kCausal / kNone
+  specializations.
+
+- **Optional `attn_mask` parameter on `qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf`**
+  (C++ entry + pybind + `sm89_compile.py` custom_op schema +
+  register_fake stub). Backward-compatible: existing positional
+  callers don't need updates. The dispatcher in the .cu branches on
+  `attn_mask.has_value() && attn_mask->numel() > 0`: kGeneral
+  specialization gets launched when the branch is taken, kCausal /
+  kNone otherwise.
+
+- **Python wiring**: `sageattn_qk_int8_pv_fp8_cuda` extracts
+  `attn_mask` from kwargs and passes it to the fp32+fp16 (fp8++)
+  variant. bool->additive {-inf, 0} translation happens here, plus
+  `attn_mask.expand((B, H, qo_len, kv_len))` for broadcast support
+  (mirrors `core.py:441` in the Triton path). Other `pv_accum_dtype`
+  variants still warn + drop the mask (their kernels haven't gained
+  the kGeneral path).
+
+#### Changed
+
+- **Dispatcher routing**: `sageattn()` masked-call routing now
+  arch-aware. On sm89 + CUDA >= 12.8, masked calls land on
+  `sageattn_qk_int8_pv_fp8_cuda` with `pv_accum_dtype="fp32+fp16"`
+  (the new CUDA mask path). On other archs (sm80, sm86, sm87, sm75,
+  sm100/sm120/sm121 fallback), masked calls still route to
+  `sageattn_qk_int8_pv_fp16_triton` since their CUDA kernels haven't
+  gained mask support yet.
+
+- **Test invariant update**: `tests/test_dispatched_kernel_telemetry.py`
+  renamed `test_sageattn_dispatcher_routes_masked_calls_to_triton`
+  -> `*_correctly`. The v0.3.0 "all masked calls -> triton"
+  invariant is superseded; v0.5.5's invariant is arch-aware.
+
+#### Measured
+
+At LTX-class shape (B=1, H=4, T=2048, D=128, bf16, RTX 4090):
+
+| measurement | value |
+|---|---|
+| CUDA mask vs Triton reference (bool mask) | mean_rtol=0.098, max_rtol=2.0, mean_atol=0.0011 |
+| bool->additive translation equivalence | max_atol=0.000000 (bit-identical) |
+| mask actually applied (vs unmasked output) | max_atol=0.055 (changes output meaningfully) |
+| zero-mask sanity (vs unmasked) | max_atol=0.000000 (additive zero is true no-op) |
+| LTX bench fp8_cuda++ unmasked (`ltx23_video_self_attn_init_22932`) | 19.98 ms (baseline 20.20; no regression) |
+| LTX bench fp8_cuda++ masked cross-attn rows | mean_rtol ~0.09 (was ~0.94 pre-v0.5.5 silent-drop) |
+
+The zero-mask bit-identity test is the strongest correctness signal
+for the `if constexpr` discipline: the kGeneral branch infrastructure
+adds no perturbation to the kNone specialization when mask values
+are no-ops. The 0.055 masked-vs-unmasked atol confirms the mask is
+actually applied (not silently dropped, which would produce 0 atol
+like pre-v0.5.5).
+
+What's deferred and on what triggers: see Backlog / "Extend CUDA mask
+support beyond sm89 fp8++".
 
 ### v0.5.4 -- 2026-05-13  (sageattn_partitioned + multi-slice peak-HBM bench + honest negative result on the masked-call scenario)
 

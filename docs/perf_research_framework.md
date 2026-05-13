@@ -138,9 +138,12 @@ the primary row.
   or a foot-gun.
 - **The cross-attn-with-mask kv sweep (32, 64, 128, 226, 512, 1024).**
   Catches regressions in the masked path. Pre-v0.3.0 the dispatcher
-  silently dropped masks here; now it routes to triton. The triton
-  row's rtol should stay ~=0.04 across the sweep; CUDA rows stay
-  pinned at the documented mask-bug fingerprint (0.94->0.13).
+  silently dropped masks here; post-v0.3.0 routed to triton; post-v0.5.5
+  routes to the native CUDA fp8++ kGeneral path on sm89 + CUDA >= 12.8.
+  The triton row's rtol should stay ~=0.04 across the sweep; fp8++
+  rows should stay ~=0.09 (matching the unmasked-vs-Triton accuracy
+  floor); a regression to the 0.94->0.13 silent-drop fingerprint
+  means the kGeneral branch broke and masks are being dropped again.
 - **The cross-kernel `fp8++ vs triton` rtol row** (unmasked shapes
   only). Should sit ~=0.10 -- quadrature of each kernel's independent
   ~0.04 / ~0.09 vs SDPA. If it spikes above 0.15, a kernel-internal
@@ -188,24 +191,22 @@ research hour. Five patterns to look for:
    overhead exceeds the matmul work. The consumer's `nodes_sage.py`
    has a deferred "min-sequence skip" backlog item; this is the
    empirical evidence that gates it.
-5. **The unmasked-vs-masked timing gap quantifies the deferred CUDA
-   mask kernel.** Today triton is the only mask-correct path; if
-   `triton @ kv=N` is K x slower than `fp8++ @ kv=N` (unmasked) at
-   the same shape, K is the speedup ceiling for the deferred Backlog
-   item "Add mask support to the sm80/sm89 CUDA kernels." If K < 2x,
-   the kernel work probably isn't worth days of effort. If K > 5x at
-   shapes the consumer actually hits, the trigger fires. The probe
-   row `ltx23_video_cross_unmasked_kv226_kratio_probe` in
-   `tests/test_sageattn_ltx_shapes.py` exists specifically so K is
-   measurable -- it pairs with `ltx23_video_cross_text_kv226` (same
-   shape, masked) so K = triton_masked_ms / fp8++_unmasked_ms is just
-   two numbers from the bench output. **Measured 2026-04-27 at the
-   corrected d=128 video config:** K ~= 1.57 at kv=226 (triton 1.16ms
-   / fp8++ 0.74ms), still well below the 5x trigger, so the deferred
-   kernel work is not perf-justified today. Re-measure after every
-   kernel-side optimization that lands on the unmasked cross-attn
-   path; if fp8++ at small kv gets meaningfully faster, K grows and
-   the trigger could fire even with no triton change.
+5. **The unmasked-vs-masked timing gap (historical perf signal for
+   the CUDA mask kernel).** Before v0.5.5, this ratio quantified the
+   speedup ceiling of moving the mask path from Triton to CUDA: if
+   `triton @ kv=N` was K x slower than `fp8++ @ kv=N` (unmasked) at
+   the same shape, K was the speedup ceiling for the kernel work.
+   v0.5.5 closed this on sm89 fp8++; masked calls now run on the same
+   CUDA path as unmasked, so the ratio is ~1 at all shapes the
+   dispatcher routes there. The probe row
+   `ltx23_video_cross_unmasked_kv226_kratio_probe` stays as a
+   regression signal: a spike means the autotune-config or kernel
+   optimization regressed the masked Triton path (still load-bearing
+   on non-sm89 archs). **Historical measurement (2026-04-27, pre-v0.5.5):**
+   K ~= 1.57 at kv=226 (triton 1.16ms / fp8++ 0.74ms); the work was
+   not perf-justified at that ratio. The structural-correctness
+   trigger fired instead (v0.5.4 backlog reformulation + Comfy-Org/
+   ComfyUI PR 13735), which is what actually moved the work to land.
 
 ## What we explicitly ignore -- and the trigger that would change that
 
