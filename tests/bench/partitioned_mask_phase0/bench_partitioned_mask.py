@@ -40,7 +40,7 @@ from typing import NamedTuple
 
 import torch
 
-from sageattention import sageattn_qk_int8_pv_fp16_triton
+from sageattention import sageattn_qk_int8_pv_fp16_triton, sageattn_partitioned
 
 
 class SliceSpec(NamedTuple):
@@ -101,6 +101,30 @@ def measure_single_call(
     torch.cuda.synchronize()
     peak = torch.cuda.max_memory_allocated() / (1024 * 1024)
     del out
+    return peak
+
+
+def measure_partitioned_peak(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    slices: list[SliceSpec],
+    with_mask: bool,
+) -> float:
+    """Peak HBM for a single sageattn_partitioned call covering all slices."""
+    reset_peak()
+    slices_arg = [
+        (
+            s.q_start,
+            s.q_end,
+            make_mask(s.mask_q_dim, k.size(2), q.device, q.dtype) if with_mask else None,
+        )
+        for s in slices
+    ]
+    out = sageattn_partitioned(q, k, v, slices_arg)
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() / (1024 * 1024)
+    del out, slices_arg
     return peak
 
 
@@ -202,6 +226,20 @@ def main() -> int:
     cum_no_mask, _ = measure_cumulative_peak(q, k, v, slices, with_mask=False)
     cum_with_mask, mask_bytes = measure_cumulative_peak(q, k, v, slices, with_mask=True)
 
+    # Warm partitioned (own Q-slice shapes are already cached via the
+    # earlier per-slice warmup, but the partitioned entry's K-once /
+    # V-once allocation pattern is a new path -- one prime call here).
+    sageattn_partitioned(
+        q, k, v,
+        [(s.q_start, s.q_end, make_mask(s.mask_q_dim, args.seq, device, dtype)) for s in slices],
+    )
+    torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    partitioned_no_mask = measure_partitioned_peak(q, k, v, slices, with_mask=False)
+    partitioned_with_mask = measure_partitioned_peak(q, k, v, slices, with_mask=True)
+
     if args.snapshot is not None:
         args.snapshot.parent.mkdir(parents=True, exist_ok=True)
         torch.cuda.memory._dump_snapshot(str(args.snapshot))
@@ -219,6 +257,16 @@ def main() -> int:
     print(f"     per-slice mask sizes:                  "
           + ", ".join(f"{b/1024/1024:.2f} MiB" for b in mask_bytes)
           + f"  (total {total_mask_mib:.2f} MiB)")
+    print(f"  E. sageattn_partitioned, no mask:         {fmt(partitioned_no_mask)}")
+    print(f"  F. sageattn_partitioned, with mask:       {fmt(partitioned_with_mask)}")
+    print()
+
+    saved_no_mask = cum_no_mask - partitioned_no_mask
+    saved_with_mask = cum_with_mask - partitioned_with_mask
+    print("PARTITIONED ENTRY SAVINGS (vs N-call cumulative)")
+    print("-" * 64)
+    print(f"  no mask:  {fmt(cum_no_mask)} -> {fmt(partitioned_no_mask)}  ({saved_no_mask:+7.1f} MiB)")
+    print(f"  w/ mask:  {fmt(cum_with_mask)} -> {fmt(partitioned_with_mask)}  ({saved_with_mask:+7.1f} MiB)")
     print()
 
     print("DECISION GATE")
@@ -267,6 +315,10 @@ def main() -> int:
                 "single_full_T_with_broadcast_mask": peak_full_with_mask,
                 "N_call_cumulative_no_mask": cum_no_mask,
                 "N_call_cumulative_with_mask": cum_with_mask,
+                "sageattn_partitioned_no_mask": partitioned_no_mask,
+                "sageattn_partitioned_with_mask": partitioned_with_mask,
+                "savings_no_mask": saved_no_mask,
+                "savings_with_mask": saved_with_mask,
                 "per_call_mask_bytes": mask_bytes,
                 "total_mask_mib": total_mask_mib,
             },

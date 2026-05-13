@@ -145,12 +145,21 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
         l_i = tl.log2(l_i) + m_i
         tl.store(lse_ptrs, l_i, mask = (offs_m < qo_len))
 
-def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None, output_dtype=torch.float16, return_lse=False):
+def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None, output_dtype=torch.float16, return_lse=False, out=None):
     BLOCK_M = 128
     BLOCK_N = 64
     stage = 1
 
-    o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
+    if out is None:
+        o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
+    else:
+        # sageattn_partitioned passes a sliced view of a pre-allocated
+        # full-Q-shaped output so per-slice calls write into the right
+        # rows without re-allocating.
+        assert out.shape == q.shape, f"out.shape {tuple(out.shape)} must match q.shape {tuple(q.shape)}"
+        assert out.dtype == output_dtype, f"out.dtype {out.dtype} must match output_dtype {output_dtype}"
+        assert out.device == q.device
+        o = out
 
     if tensor_layout == "HND":
         b, h_qo, qo_len, head_dim = q.shape

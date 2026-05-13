@@ -18,6 +18,8 @@ import torch
 import torch.nn.functional as F
 
 from .triton.quant_per_block import per_block_int8 as per_block_int8_triton
+from .triton.quant_per_block import per_block_int8_q as per_block_int8_q_triton
+from .triton.quant_per_block import per_block_int8_k as per_block_int8_k_triton
 from .triton.quant_per_block_varlen import per_block_int8 as per_block_int8_varlen_triton
 from .triton.attn_qk_int8_per_block import forward as attn_false
 from .triton.attn_qk_int8_per_block_causal import forward as attn_true
@@ -449,6 +451,145 @@ def sageattn_qk_int8_pv_fp16_triton(
         return o, lse / 1.44269504 + lse_correction * sm_scale if smooth_k else lse / 1.44269504
     else:
         return o
+
+
+def sageattn_partitioned(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    slices: Sequence[Tuple[int, int, Optional[torch.Tensor]]],
+    tensor_layout: str = "HND",
+    smooth_k: bool = True,
+    sm_scale: Optional[float] = None,
+    output_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    """Run sage Triton attention over multiple Q slices sharing K and V.
+
+    Each slice is `(q_start, q_end, attn_mask | None)`. K is quantized
+    once, V is cast to fp16 once, and the output is allocated once;
+    only Q is re-quantized per slice (Q changes per slice, so there's
+    no amortization to gain there). The inner Triton kernel writes
+    each slice's output into a view of the pre-allocated full output.
+
+    Targets the LTX 2.3 guide-mask 2-call partition pattern from
+    Comfy-Org/ComfyUI PR 13735, where stock sageattn() called N times
+    with the same K, V would re-quantize K and re-cast V every call.
+    See tests/bench/partitioned_mask_phase0/ for the peak-HBM
+    characterization.
+
+    Parameters
+    ----------
+    q, k, v : torch.Tensor
+        Same shape/dtype/layout constraints as
+        `sageattn_qk_int8_pv_fp16_triton`. q.dtype must be fp16 or bf16;
+        bf16 V is cast to fp16 internally (matching the existing entry).
+    slices : sequence of (q_start, q_end, attn_mask | None)
+        Q-range and optional mask per call. Slices may overlap or have
+        gaps; only the rows covered by some slice get written into the
+        output (rows outside any slice contain uninitialized memory
+        from torch.empty -- callers covering all of Q is the expected
+        usage).
+    tensor_layout : "HND" | "NHD"
+    smooth_k : bool
+        Subtract per-head K-mean before quantization (improves accuracy).
+    sm_scale : float, optional
+        Defaults to 1 / sqrt(head_dim).
+    output_dtype : torch.dtype
+        Output dtype. Must be fp16 today.
+
+    Returns
+    -------
+    torch.Tensor
+        Full-Q-shaped output. Same shape as q (modulo head_dim padding
+        being stripped to the original head_dim).
+
+    Notes
+    -----
+    - Masked slices stay on the only-mask-correct Triton path, mirroring
+      the dispatcher's masked-call routing.
+    - Records dispatch as `fp16_triton` per call -- the underlying kernel
+      is the same. Consumers wanting partitioned-vs-non distinction can
+      check entry-point identity instead of dispatch telemetry.
+    """
+    dtype = q.dtype
+    assert q.is_cuda, "Input tensors must be on cuda."
+    assert dtype in [torch.float16, torch.bfloat16], "Input tensors must be in dtype of torch.float16 or torch.bfloat16"
+    assert k.dtype == dtype and v.dtype == dtype, "q, k, v must have the same dtype."
+    assert q.device == k.device == v.device, "All tensors must be on the same device."
+    assert output_dtype == torch.float16, "Only fp16 output is supported today."
+    assert len(slices) >= 1, "slices must be non-empty"
+
+    _record_dispatch(KERNEL_FP16_TRITON)
+
+    head_dim_og = q.size(-1)
+    if head_dim_og < 64:
+        pad = 64 - head_dim_og
+        q = torch.nn.functional.pad(q, (0, pad))
+        k = torch.nn.functional.pad(k, (0, pad))
+        v = torch.nn.functional.pad(v, (0, pad))
+    elif head_dim_og > 64 and head_dim_og < 128:
+        pad = 128 - head_dim_og
+        q = torch.nn.functional.pad(q, (0, pad))
+        k = torch.nn.functional.pad(k, (0, pad))
+        v = torch.nn.functional.pad(v, (0, pad))
+    elif head_dim_og > 128:
+        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
+
+    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
+
+    seq_dim = 1 if tensor_layout == "NHD" else 2
+
+    if smooth_k:
+        km = k.mean(dim=seq_dim, keepdim=True)
+    else:
+        km = None
+
+    if dtype == torch.bfloat16:
+        v = v.to(torch.float16)
+
+    if sm_scale is None:
+        sm_scale = 1.0 / (head_dim_og ** 0.5)
+
+    # Amortized across slices: K-quant once, V-cast once (above), output
+    # buffer once. Q-quant stays per-slice because Q changes per slice.
+    k_int8, k_scale = per_block_int8_k_triton(k, km=km, tensor_layout=tensor_layout)
+    full_out = torch.empty(q.shape, dtype=output_dtype, device=q.device)
+
+    for q_start, q_end, attn_mask in slices:
+        assert 0 <= q_start < q_end <= q.size(seq_dim), f"invalid slice ({q_start}, {q_end}) for seq_len {q.size(seq_dim)}"
+
+        if tensor_layout == "HND":
+            q_slice = q[:, :, q_start:q_end, :].contiguous()
+            out_slice = full_out[:, :, q_start:q_end, :]
+        else:
+            q_slice = q[:, q_start:q_end, :, :].contiguous()
+            out_slice = full_out[:, q_start:q_end, :, :]
+
+        q_int8, q_scale = per_block_int8_q_triton(q_slice, sm_scale=sm_scale, tensor_layout=tensor_layout)
+
+        if attn_mask is not None:
+            assert attn_mask.dtype == torch.bool or attn_mask.dtype == dtype, "attn_mask must be bool or match q.dtype"
+            assert attn_mask.device == q.device
+            if tensor_layout == "HND":
+                target_shape = (q.shape[0], q.shape[1], q_end - q_start, k.shape[2])
+            else:
+                target_shape = (q.shape[0], q.shape[2], q_end - q_start, k.shape[1])
+            try:
+                attn_mask = attn_mask.expand(target_shape)
+            except Exception:
+                raise AssertionError(f"attn_mask shape {attn_mask.shape} cannot be broadcast to {target_shape}")
+
+        attn_false(
+            q_int8, k_int8, v, q_scale, k_scale,
+            tensor_layout=tensor_layout,
+            output_dtype=output_dtype,
+            attn_mask=attn_mask,
+            return_lse=False,
+            out=out_slice,
+        )
+
+    full_out = full_out[..., :head_dim_og]
+    return full_out
 
 
 def sageattn_varlen(

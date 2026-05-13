@@ -432,7 +432,92 @@ sufficient.
 
 ## Versions
 
-### v0.5.3 -- 2026-05-01  (fused split-RoPE primitive + bench peak-VRAM column + downstream-symbol contract)
+### v0.5.4 -- 2026-05-13  (sageattn_partitioned + multi-slice peak-HBM bench + honest negative result on the masked-call scenario)
+
+Driven by a consumer-side report (Comfy-Org/ComfyUI PR 13735, LTX
+2.3 self-attn guide masks) that the masked Triton path OOM'd on a
+4090 when the PR partitioned Q into noisy + tracked slices and
+fired two back-to-back `sageattn_qk_int8_pv_fp16_triton` calls per
+layer with the same K, V. Hypothesis: each call re-quantizing K
+and re-casting V is the removable peak-HBM lever. Built the entry,
+measured against the hypothesis, found the masked-call scenario
+already efficient enough that the entry doesn't help in synthetic
+isolation. Documented for future consumers and Phase 4 real-pipeline
+validation.
+
+#### Added
+
+- **`sageattention.sageattn_partitioned(q, k, v, slices, ...)`** --
+  public entry that runs Triton attention over multiple Q slices
+  sharing K and V. Quantizes K once, casts V to fp16 once,
+  allocates the output once; Q is re-quantized per slice (Q
+  changes per slice). Each slice is `(q_start, q_end, attn_mask
+  | None)`. Inner kernel writes each slice's output into a view
+  of the pre-allocated full output via a new optional `out=`
+  parameter on
+  `sageattention.triton.attn_qk_int8_per_block.forward`. Records
+  dispatch as `fp16_triton` (same underlying kernel). Test:
+  `tests/test_partitioned.py` (4 cases: 2-call aligned/unaligned
+  boundary, noisy-only, tracked-only; reuses `accuracy_metrics`
+  from `test_sageattn_ltx_shapes.py` so tolerance budgets match
+  every other rtol-vs-Triton row in the repo).
+
+- **`sageattention.triton.quant_per_block.per_block_int8_q`** and
+  **`per_block_int8_k`** -- factored from the existing
+  `per_block_int8` Q+K quant. `per_block_int8` now wraps both
+  helpers, signature unchanged for existing callers.
+  `sageattn_partitioned` uses them to quantize K once across all
+  slices while Q re-quantizes per slice.
+
+- **`tests/bench/partitioned_mask_phase0/`** -- peak-HBM
+  characterization at the LTX 2.3 self-attn shape (T=23296, h=32,
+  d=128, bf16) for the Kijai PR partition pattern. Six
+  measurement rows: single-call no-mask reference, single-call
+  with broadcast `(1,1,1,T)` mask, 2-independent-call cumulative
+  no-mask, 2-independent-call cumulative with-mask,
+  `sageattn_partitioned` no-mask, `sageattn_partitioned`
+  with-mask. Reports savings vs the 2-independent-call baseline.
+  Checked-in `results.json` + memory snapshot for the audit
+  trail; uncorrected wrong-mask-shape variants preserved as
+  `*.uncorrected.{json,bin}` (caught by a sister-clone grep of
+  the actual PR diff).
+
+#### Measured: synthetic Phase 0 + Phase 3 result
+
+At the LTX 2.3 self-attn shape on RTX 4090, the 2-call
+partition's cumulative peak HBM:
+
+| call pattern | no mask | with PR-shape masks |
+|---|---|---|
+| single full-T call (reference) | 1096 MiB | 1096 MiB |
+| 2 independent sage calls (cumulative) | 1807 MiB | 1272 MiB |
+| `sageattn_partitioned` | 1528 MiB | 1298 MiB |
+| **savings** | **+279 MiB** | **-26 MiB** |
+
+The partitioned entry saves +279 MiB in the no-mask isolation
+(as predicted: K-quant + V-cast amortization is real). But in
+the masked-call scenario -- the Kijai-relevant one -- the
+2-independent-call cumulative peak is already only +176 MiB
+above the single-call reference, and the partitioned entry
+doesn't reduce it further. Cross-clone hypothesis (filed by the
+sister clone as "hypothesis 2" before Phase 3): allocating the
+22 MiB mask first in each call may bias the pytorch caching
+allocator's bucket layout to consolidate K_int8 / V_fp16
+allocations better than the partitioned entry's
+K-first / V-first / output-first pattern. Not investigated;
+matches the observed asymmetry.
+
+**Net for the originating use case**: the partitioned entry
+doesn't address the Kijai OOM in synthetic measurement. Phase 4
+real-pipeline validation (run on the sister-clone side with the
+LTX denoiser loaded, against fragmented post-model-load allocator
+state) may show a different picture; sage-fork side considers
+that an open question. The entry stays shipped because (a) it's
+correct, (b) the no-mask savings are real for any future
+consumer that hits a similar pattern without masks, and (c) it
+provides the primitive to test against in Phase 4.
+
+
 
 Three coupled additions, all driven by a consumer-side comparison
 doc that surfaced (a) one structural kernel-side gap vs KJNodes'
