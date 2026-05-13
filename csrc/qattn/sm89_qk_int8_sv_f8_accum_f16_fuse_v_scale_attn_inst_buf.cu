@@ -11,7 +11,8 @@ torch::Tensor qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(torch::Tensor q
                     int is_causal,
                     int qk_quant_gran,
                     float sm_scale,
-                    int return_lse)
+                    int return_lse,
+                    c10::optional<torch::Tensor> attn_mask)
 {
   CHECK_CUDA(query);
   CHECK_CUDA(key);
@@ -129,8 +130,6 @@ torch::Tensor qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(torch::Tensor q
             assert(value.size(0) == batch_size);
             assert(value.size(3) >= div_ceil(kv_len, CTA_K) * CTA_K);
 
-            constexpr MaskMode mask_mode = IS_CAUSAL ? MaskMode::kCausal : MaskMode::kNone;
-
             if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp))
             {
               CHECK_SHAPE(query_scale, batch_size, num_qo_heads, div_ceil(qo_len, CTA_Q) * (CTA_Q / WARP_Q));
@@ -139,7 +138,7 @@ torch::Tensor qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(torch::Tensor q
             else if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread))
             {
               CHECK_SHAPE(query_scale, batch_size, num_qo_heads, div_ceil(qo_len, CTA_Q) * (CTA_Q / WARP_Q) * 8);
-              CHECK_SHAPE(key_scale, batch_size, num_kv_heads, div_ceil(kv_len, CTA_K) * (CTA_K / WARP_K) * 4);    
+              CHECK_SHAPE(key_scale, batch_size, num_kv_heads, div_ceil(kv_len, CTA_K) * (CTA_K / WARP_K) * 4);
             }
             else
             {
@@ -150,33 +149,78 @@ torch::Tensor qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(torch::Tensor q
 
             //                                     smem_Q                                     smem_K                            smem_V                     smem_O
             size_t smem_max = std::max(CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t), CTA_Q * HEAD_DIM * sizeof(half));
-            
-            auto kernel_func = qk_int_sv_f8_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN),
-                                                        float, true, DTypeOut, ComputeUnit::kCudaCore, mask_mode, RETURN_LSE, true, false, true>;
-
-            cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
 
             dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
             dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
 
-            kernel_func<<<grid, block, smem_max>>>(
-              query.data_ptr<int8_t>(), 
-              key.data_ptr<int8_t>(),
-              reinterpret_cast<int8_t*>(value.data_ptr()),
-              reinterpret_cast<DTypeOut*>(output.data_ptr()),
-              (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
-              reinterpret_cast<float*>(query_scale.data_ptr()),
-              reinterpret_cast<float*>(key_scale.data_ptr()),
-              reinterpret_cast<float*>(value_scale.data_ptr()),
-              nullptr,
-              qo_len,
-              kv_len,
-              num_kv_groups,
-              stride_bz_q, stride_seq_q, stride_h_q,
-              stride_bz_k, stride_seq_k, stride_h_k,
-              stride_bz_v, stride_h_v, stride_d_v,
-              stride_bz_o, stride_seq_o, stride_h_o,
-              sm_scale);
+            const bool has_mask = attn_mask.has_value() && attn_mask->defined() && attn_mask->numel() > 0;
+            if (has_mask)
+            {
+              // v0.5.5 native CUDA general-mask path. The mask is additive
+              // log-weights (Triton's float-dtype mask convention) and must
+              // match output dtype (half or bf16). Caller expands broadcast
+              // dims to a (B,H,M,N) view; stride-0 entries do the broadcast
+              // at zero memory cost.
+              TORCH_CHECK(!IS_CAUSAL, "attn_mask + is_causal is not supported; choose one");
+              auto mask_t = attn_mask.value();
+              TORCH_CHECK(mask_t.is_cuda(), "attn_mask must be on cuda");
+              TORCH_CHECK(mask_t.dim() == 4, "attn_mask must have 4 dims (B, H, qo_len, kv_len) after caller-side expand");
+              TORCH_CHECK(mask_t.scalar_type() == output_dtype, "attn_mask dtype must match output dtype");
+
+              auto kernel_func = qk_int_sv_f8_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN),
+                                                          float, true, DTypeOut, ComputeUnit::kCudaCore, MaskMode::kGeneral, RETURN_LSE, true, false, true, DTypeOut>;
+              cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
+              kernel_func<<<grid, block, smem_max>>>(
+                query.data_ptr<int8_t>(),
+                key.data_ptr<int8_t>(),
+                reinterpret_cast<int8_t*>(value.data_ptr()),
+                reinterpret_cast<DTypeOut*>(output.data_ptr()),
+                (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
+                reinterpret_cast<float*>(query_scale.data_ptr()),
+                reinterpret_cast<float*>(key_scale.data_ptr()),
+                reinterpret_cast<float*>(value_scale.data_ptr()),
+                nullptr,
+                qo_len,
+                kv_len,
+                num_kv_groups,
+                stride_bz_q, stride_seq_q, stride_h_q,
+                stride_bz_k, stride_seq_k, stride_h_k,
+                stride_bz_v, stride_h_v, stride_d_v,
+                stride_bz_o, stride_seq_o, stride_h_o,
+                sm_scale,
+                reinterpret_cast<const DTypeOut*>(mask_t.data_ptr()),
+                static_cast<uint32_t>(mask_t.stride(0)),
+                static_cast<uint32_t>(mask_t.stride(1)),
+                static_cast<uint32_t>(mask_t.stride(2)),
+                static_cast<uint32_t>(mask_t.stride(3)));
+            }
+            else
+            {
+              constexpr MaskMode mask_mode = IS_CAUSAL ? MaskMode::kCausal : MaskMode::kNone;
+              auto kernel_func = qk_int_sv_f8_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN),
+                                                          float, true, DTypeOut, ComputeUnit::kCudaCore, mask_mode, RETURN_LSE, true, false, true>;
+              cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
+              kernel_func<<<grid, block, smem_max>>>(
+                query.data_ptr<int8_t>(),
+                key.data_ptr<int8_t>(),
+                reinterpret_cast<int8_t*>(value.data_ptr()),
+                reinterpret_cast<DTypeOut*>(output.data_ptr()),
+                (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
+                reinterpret_cast<float*>(query_scale.data_ptr()),
+                reinterpret_cast<float*>(key_scale.data_ptr()),
+                reinterpret_cast<float*>(value_scale.data_ptr()),
+                nullptr,
+                qo_len,
+                kv_len,
+                num_kv_groups,
+                stride_bz_q, stride_seq_q, stride_h_q,
+                stride_bz_k, stride_seq_k, stride_h_k,
+                stride_bz_v, stride_h_v, stride_d_v,
+                stride_bz_o, stride_seq_o, stride_h_o,
+                sm_scale,
+                static_cast<const nv_bfloat16*>(nullptr),
+                0u, 0u, 0u, 0u);
+            }
           });
         });
       });

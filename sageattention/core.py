@@ -224,24 +224,31 @@ def sageattn(
     - ``num_qo_heads`` must be divisible by ``num_kv_heads``.
     - The tensors `q`, `k`, and `v` must have the dtype ``torch.float16`` or ``torch.bfloat16``
     - All tensors must be on the same cuda device.
-    - If `attn_mask` is passed (non-None), the call is routed to the
-      Triton kernel regardless of GPU arch. The CUDA kernels in this
-      lineage (sage 2.x sm80/sm89) silently drop `attn_mask` -- their
-      pybind layer never wires it through and the C++ `MaskMode` enum
-      only handles `{kNone, kCausal}`. The Triton kernel
-      `sageattn_qk_int8_pv_fp16_triton` is the only mask-correct path;
-      this dispatcher routes there so consumers don't have to
-      re-implement that decision. `is_causal=True` is unaffected and
-      continues to dispatch by arch (CUDA kernels handle causal mode
-      natively via `MaskMode::kCausal`).
+    - If `attn_mask` is passed (non-None), the routing depends on arch.
+      On sm89 + CUDA >= 12.8, masked calls land on
+      `sageattn_qk_int8_pv_fp8_cuda` with `pv_accum_dtype="fp32+fp16"`
+      (the v0.5.5 native CUDA general-mask path). On other archs, masked
+      calls still route to `sageattn_qk_int8_pv_fp16_triton` because
+      those CUDA kernels haven't gained mask support yet. `is_causal=True`
+      is unaffected and continues to dispatch by arch (CUDA kernels
+      handle causal mode natively via `MaskMode::kCausal`).
     """
 
-    # Route masked calls to the only mask-correct kernel. attn_mask
-    # arrives via **kwargs because the upstream signature exposes it
-    # there; we explicitly extract it so the rest of the function can
-    # forward the remaining kwargs without double-passing.
+    # Extract attn_mask up-front so per-arch dispatch sees a clean kwargs.
     attn_mask = kwargs.pop("attn_mask", None)
+    arch = _cuda_archs[q.device.index]
+
     if attn_mask is not None:
+        # Native CUDA mask only on sm89 + CUDA >= 12.8 today. Other archs
+        # still need the Triton fallback for mask correctness.
+        if arch == "sm89" and get_cuda_version() >= (12, 8):
+            kwargs.setdefault("pv_accum_dtype", "fp32+fp16")
+            return sageattn_qk_int8_pv_fp8_cuda(
+                q, k, v,
+                tensor_layout=tensor_layout, is_causal=is_causal,
+                sm_scale=sm_scale, return_lse=return_lse,
+                attn_mask=attn_mask, **kwargs,
+            )
         return sageattn_qk_int8_pv_fp16_triton(
             q, k, v,
             tensor_layout=tensor_layout, is_causal=is_causal,
@@ -256,7 +263,6 @@ def sageattn(
     # forwarding -- a bug introduced by the v0.3.1 kwargs-forwarding
     # change. Override-wins matches Python's standard "caller-explicit
     # beats callee-default" convention.
-    arch = _cuda_archs[q.device.index]
     if arch == "sm75":
         return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, **kwargs)
     elif arch in {"sm80", "sm86", "sm87"}:
@@ -981,7 +987,22 @@ def sageattn_qk_int8_pv_fp8_cuda(
     assert q.device == k.device == v.device, "All tensors must be on the same device."
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
 
-    _warn_if_mask_passed_to_cuda_kernel(kwargs, "sageattn_qk_int8_pv_fp8_cuda")
+    # v0.5.5: native CUDA general-mask support on the fp32+fp16 (fp8++) variant.
+    # The other pv_accum_dtype variants still silently drop masks and emit the
+    # warn-on-misuse; preserves the v0.3.1 safety net there.
+    attn_mask = kwargs.pop("attn_mask", None)
+    if attn_mask is not None and pv_accum_dtype != "fp32+fp16":
+        # Same soft-warn shape as _warn_if_mask_passed_to_cuda_kernel; can't
+        # use it here because we already popped attn_mask out of kwargs.
+        warnings.warn(
+            f"sageattn_qk_int8_pv_fp8_cuda: attn_mask was passed but "
+            f"pv_accum_dtype={pv_accum_dtype!r} doesn't yet support it. "
+            f"Use pv_accum_dtype='fp32+fp16' (the dispatcher default on sm89), "
+            f"or sageattn_qk_int8_pv_fp16_triton. Falling back to no-mask "
+            f"semantics; results will be numerically wrong if the mask is non-trivial.",
+            stacklevel=2,
+        )
+        attn_mask = None
 
     _tensor_layout = 0 if tensor_layout == "NHD" else 1
     _is_caual = 1 if is_causal else 0
@@ -1060,7 +1081,30 @@ def sageattn_qk_int8_pv_fp8_cuda(
         lse = sm89_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
     elif pv_accum_dtype == "fp32+fp16":
         _record_dispatch(KERNEL_FP8_CUDA_PP)
-        lse = sm89_compile.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+        if attn_mask is not None:
+            # Mirror the Triton path's expand semantics so the kernel sees a
+            # full (B, H, qo_len, kv_len) view with stride-0 dims handling
+            # broadcasts at zero memory cost.
+            assert attn_mask.dtype == torch.bool or attn_mask.dtype == q.dtype, "attn_mask must be bool or match q dtype"
+            assert attn_mask.device == q.device, "attn_mask must be on the same device"
+            assert not is_causal, "attn_mask + is_causal is not supported; choose one"
+            if _tensor_layout == 1:  # HND
+                target_shape = (q.shape[0], q.shape[1], q.shape[2], k.shape[2])
+            else:  # NHD
+                target_shape = (q.shape[0], q.shape[2], q.shape[1], k.shape[1])
+            if attn_mask.dtype == torch.bool:
+                # Translate bool -> additive log-weights (0 / -inf) in q.dtype.
+                # The kernel then adds these to the scores before softmax max.
+                attn_mask = torch.where(
+                    attn_mask, torch.zeros((), dtype=q.dtype, device=q.device),
+                    torch.full((), float("-inf"), dtype=q.dtype, device=q.device),
+                )
+            attn_mask = attn_mask.expand(target_shape)
+        lse = sm89_compile.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
+            q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale,
+            _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse,
+            attn_mask=attn_mask,
+        )
 
     o = o[..., :head_dim_og]
 

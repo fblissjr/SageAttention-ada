@@ -36,6 +36,7 @@
 enum class MaskMode {
     kNone = 0,
     kCausal = 1,
+    kGeneral = 2,
 };
 
 enum class DataType {
@@ -344,6 +345,67 @@ __device__ __forceinline__ void apply_out_of_bound_mask(const uint32_t &K_idx_la
         else if constexpr (std::is_same<DTypeQKAccum, half>::value)
         {
           RS[fq][fk][k] = (out_of_boundary ? __float2half_rn(-50000.0f) : RS[fq][fk][k]);
+        }
+      }
+    }
+  }
+}
+
+// Additive log-weight mask. Mirrors Triton's float-dtype mask path
+// in sageattention/triton/attn_qk_int8_per_block.py:38-51 -- mask
+// values are added to QK scores BEFORE the per-block max reduction.
+// Bool masks should be pre-translated to {-inf, 0} log-weights by
+// the caller before passing to this kernel (the C++ entry handles
+// the conversion). DTypeMask is the mask tensor's element type
+// (half or nv_bfloat16); RS holds the dequantized fp32 QK scores.
+//
+// Index math mirrors apply_causal_mask: each thread owns 8 entries
+// of the (num_tiles_q, num_tiles_k, 8) register fragment, indexed
+// by (q_idx, kv_idx) into the global mask tensor.
+template <uint32_t num_tiles_q, uint32_t num_tiles_k, typename DTypeMask, typename DTypeQKAccum>
+__device__ __forceinline__ void apply_general_mask(
+    const DTypeMask *__restrict__ mask_base,
+    const uint32_t batch_id, const uint32_t head_id,
+    const uint32_t Q_idx_lane_base, const uint32_t K_idx_lane_base,
+    const uint32_t stride_bz_mask, const uint32_t stride_h_mask,
+    const uint32_t stride_seq_q_mask, const uint32_t stride_seq_k_mask,
+    const uint32_t qo_len, const uint32_t kv_len,
+    DTypeQKAccum RS[][num_tiles_k][8])
+{
+  const DTypeMask *mask_bh = mask_base + batch_id * stride_bz_mask + head_id * stride_h_mask;
+#pragma unroll
+  for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+  {
+#pragma unroll
+    for (uint32_t fk = 0; fk < num_tiles_k; fk++)
+    {
+#pragma unroll
+      for (uint32_t k = 0; k < 8; k++)
+      {
+        const uint32_t q_idx = Q_idx_lane_base + fq * 16 + 8 * ((k % 4) / 2);
+        const uint32_t kv_idx = K_idx_lane_base + fk * 16 + 8 * (k / 4) + k % 2;
+        const bool in_bounds = (q_idx < qo_len) && (kv_idx < kv_len);
+        // Cast mask load to float for the add. Mirrors the upcast
+        // already done at the dequantization step at line 401 above.
+        float mask_val = 0.0f;
+        if (in_bounds)
+        {
+          if constexpr (std::is_same<DTypeMask, half>::value)
+          {
+            mask_val = __half2float(mask_bh[q_idx * stride_seq_q_mask + kv_idx * stride_seq_k_mask]);
+          }
+          else if constexpr (std::is_same<DTypeMask, nv_bfloat16>::value)
+          {
+            mask_val = __bfloat162float(mask_bh[q_idx * stride_seq_q_mask + kv_idx * stride_seq_k_mask]);
+          }
+        }
+        if constexpr (std::is_same<DTypeQKAccum, float>::value)
+        {
+          RS[fq][fk][k] = RS[fq][fk][k] + mask_val;
+        }
+        else if constexpr (std::is_same<DTypeQKAccum, half>::value)
+        {
+          RS[fq][fk][k] = __hadd(RS[fq][fk][k], __float2half_rn(mask_val));
         }
       }
     }

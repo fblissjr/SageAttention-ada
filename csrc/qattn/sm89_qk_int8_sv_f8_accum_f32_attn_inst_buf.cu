@@ -168,7 +168,9 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(torch::Tensor query,
               stride_bz_k, stride_seq_k, stride_h_k,
               stride_bz_v, stride_h_v, stride_d_v,
               stride_bz_o, stride_seq_o, stride_h_o,
-              sm_scale);
+              sm_scale,
+              static_cast<const nv_bfloat16*>(nullptr),
+              0u, 0u, 0u, 0u);
           });
         });
       });

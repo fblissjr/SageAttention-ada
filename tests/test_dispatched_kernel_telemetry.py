@@ -77,15 +77,13 @@ def test_sageattn_dispatcher_records_fp8_pp_on_sm89():
     print(f"ok  sageattn() dispatcher recorded {got!r}")
 
 
-def test_sageattn_dispatcher_routes_masked_calls_to_triton():
-    # The CUDA kernels silently drop attn_mask (pybind never wired the
-    # parameter through; MaskMode enum only has {kNone, kCausal}). The
-    # Triton kernel is the only mask-correct path. The dispatcher must
-    # route masked calls there regardless of arch -- and this is the
-    # test that enforces the "sageattn() handles the mask gap so
-    # consumers don't have to" claim from CLAUDE.md / README. If this
-    # test fails, the dispatcher reverted to arch-only routing and
-    # masked calls produce silently wrong output.
+def test_sageattn_dispatcher_routes_masked_calls_correctly():
+    # v0.5.5 changed the masked-call routing invariant. Pre-v0.5.5 all
+    # masked calls went to Triton (the only mask-correct path). v0.5.5
+    # added native CUDA mask support to the sm89 fp8++ kernel, so masked
+    # calls on sm89 + CUDA >= 12.8 now route to fp8_cuda++. Other archs
+    # still route to Triton (their CUDA kernels haven't gained mask
+    # support yet).
     _reset_dispatch_for_test()
     q, k, v = _make_qkv()
     mask = torch.ones(q.shape[0], q.shape[1], q.shape[2], k.shape[2],
@@ -93,9 +91,11 @@ def test_sageattn_dispatcher_routes_masked_calls_to_triton():
     mask[..., -16:] = False  # the typical text-padding-tail shape
     _ = sageattn(q, k, v, attn_mask=mask, is_causal=False)
     got = get_last_dispatched_kernel()
-    assert got == KERNEL_FP16_TRITON, (
-        f"sageattn() with attn_mask must route to {KERNEL_FP16_TRITON!r} "
-        f"(only mask-correct path), got {got!r}"
+    # We're on sm89 + CUDA >= 12.8 in this fork's target environment.
+    expected = KERNEL_FP8_CUDA_PP
+    assert got == expected, (
+        f"sageattn() with attn_mask on sm89+CUDA>=12.8 must route to "
+        f"{expected!r} (v0.5.5 native CUDA mask path), got {got!r}"
     )
     print(f"ok  sageattn() masked call routed to {got!r}")
 
@@ -246,7 +246,7 @@ def main() -> int:
     test_helper_is_exported_from_package()
     test_initial_value_is_none()
     test_sageattn_dispatcher_records_fp8_pp_on_sm89()
-    test_sageattn_dispatcher_routes_masked_calls_to_triton()
+    test_sageattn_dispatcher_routes_masked_calls_correctly()
     test_direct_triton_call_records_fp16_triton()
     test_direct_fp16_cuda_call_records_fp16_cuda()
     test_fp8_cuda_variant_records_correct_subname()
