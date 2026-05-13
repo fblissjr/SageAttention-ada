@@ -116,28 +116,36 @@ register-pressure regression verification).
    over a real production gen reports masked-triton as >5% of total
    gen wall-time. (See Recurring process items / "Session-level
    attention telemetry summary.")
-3. *Structural-correctness signal*: a downstream consumer explicitly
-   asks for the CUDA path to be mask-correct as a routing or
-   stability concern, not just a perf concern. The original trigger
-   formulation excluded this dimension; v0.5.4's Phase 3 work
-   surfaced that it should be included. Threshold: 2+ independent
-   downstream consumers, or 1 consumer with high-leverage rationale
-   (e.g. forced-Triton routing in a load-bearing upstream PR they
-   would otherwise rather not merge).
+3. *Structural-correctness signal*: a downstream consumer surface
+   raises the CUDA mask gap as a routing or stability concern, not
+   just a perf concern. The original trigger formulation excluded
+   this dimension; v0.5.4's Phase 3 work surfaced that it should be
+   included. Threshold: 2+ independent downstream consumer surfaces,
+   OR 1 high-leverage surface (a core/ecosystem-level PR or a
+   project whose own routing has to compensate for sage's CUDA
+   mask gap is "high-leverage" -- a single individual user's
+   preference is not).
 
 **Signals received so far:**
 
-- 2026-05-13 -- Kijai (ComfyUI maintainer, Comfy-Org/ComfyUI PR
-  13735 author): on Discord, "yeah it just feels dangerous to force
-  the triton sage path in general / I'm not sure why their cuda
-  paths don't support it, and would it technically be possible to
-  fix". One signal on dimension #3. Not yet sufficient to fire the
-  trigger alone (threshold is 2+ independent OR high-leverage
-  rationale + commitment). His PR forces SDPA fallback, not
-  Triton, so the "would rather not merge" lever doesn't apply
-  here. Logged for future aggregation.
+- 2026-05-13 -- Comfy-Org/ComfyUI PR 13735 (LTX 2.3 self-attn guide
+  masks). The PR forces SDPA fallback specifically because sage's
+  CUDA path silently drops `attn_mask`; the masked Triton fallback
+  was rejected on memory grounds (4090 OOM in their testing). A
+  ComfyUI core PR is high-leverage by itself: it represents the
+  ComfyUI consumer surface for every LTX 2.3 gen with
+  `guide_strength<1.0`, not one individual's preference, and the
+  ecosystem maintainer has explicitly raised the structural-
+  correctness concern. **Fires trigger #3 on the "1 high-leverage
+  surface" clause.**
 
-Until a trigger fires, the dispatcher's masked->triton routing
+**Trigger status: fired 2026-05-13.** Committing to the work.
+Half-day spike scoped in `internal/design/cuda_mask_kernel_scoping.md`
+(gitignored) is the next move; PTX diff of the `kNone` specialization
+against HEAD answers the register-pressure question definitively
+before the full implementation lands.
+
+Until the kernel ships, the dispatcher's masked->triton routing
 (v0.3.0) + the `_warn_if_mask_passed_to_cuda_kernel` soft-warn
 (v0.3.1) remain the consumer-facing safety net.
 
