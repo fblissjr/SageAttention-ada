@@ -540,6 +540,53 @@ are no-ops. The 0.055 masked-vs-unmasked atol confirms the mask is
 actually applied (not silently dropped, which would produce 0 atol
 like pre-v0.5.5).
 
+#### Measured (in-pipeline, preliminary)
+
+Beyond the synthetic correctness + perf measurements above, we ran
+an A/B comparison on a real LTX 2.3 workflow (FML2V multi-guide at
+768×512×97, audio variant) on a 4090 with dynamic VRAM disabled
+(`--disable-dynamic-vram --disable-async-offload --reserve-vram 0
+--cuda-malloc --supports-fp8-compute --mmap-torch-files
+--cache-none`). The only variable changed between arms was the sage
+routing flag: `auto` (lands on v0.5.5's fp8_cuda++ masked path) vs
+`auto_mask_aware` (forces masked calls to
+`sageattn_qk_int8_pv_fp16_triton`).
+
+| arm | result |
+|---|---|
+| auto -> v0.5.5 fp8_cuda++ masked | completed cleanly; 1056 masked self-attn dispatches; 0 fallbacks |
+| auto_mask_aware -> fp16_triton masked | **OOM at stage-1 step 0** after 48 masked dispatches |
+
+The OOM is at `comfy/ldm/lightricks/model.py:242`
+(`AdaLNSingle.linear`, downstream of attention): allocation
+requested 727 MiB, free 16 MiB, currently allocated 22.40 GiB on a
+23.52 GiB device. Inferred cause: Triton's per-call working set
+(`q_int8` + `k_int8` + `v.to(fp16)` + output) cumulated across ~48
+transformer layer dispatches leaves no headroom for stage-1's
+activation budget on a 24 GiB card. fp8_cuda++'s smaller per-call
+working set means the same render fits.
+
+Per-shape masked p50 latency (auto arm, single-run sample):
+`(1, 41360, 4096)` ≈ 285 μs / `(1, 10340, 4096)` ≈ 167 μs.
+Run-to-run variance at the larger shape is real
+(observed 11.7 ms vs 30.2 ms median across two repetitions; likely
+autotune-cache warmth + per-call mask sparsity); don't read these
+as precision numbers.
+
+**Status**: preliminary. The observation is currently N=1 on the OOM
+arm + N=3 on the success arm. More repetitions and a smaller-mask
+variant are in progress. The synthetic measurements above are the
+primary v0.5.5 validation; this in-pipeline observation is the
+strongest corroboration so far and is reproducible by anyone who
+wants to test (same workflow + the routing flag flip + nodynvram
+config).
+
+Interpretation: v0.5.5 is shaping up as a memory-side win rather
+than purely a perf win -- on sm89 + CUDA >= 12.8, masked LTX 2.3
+workflows that couldn't fit in 24 GiB via the Triton fallback fit
+via the native CUDA mask path. Independent reproduction welcome;
+the framing will firm up as more data lands.
+
 What's deferred and on what triggers: see Backlog / "Extend CUDA mask
 support beyond sm89 fp8++".
 

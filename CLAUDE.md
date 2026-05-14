@@ -135,6 +135,17 @@ GPU OOM mid-test usually means contention, not a bug. Check
 before debugging -- a sibling process likely holds the VRAM Triton
 autotune needs.
 
+**Peak-HBM cumulative measurement benches: do NOT precede the
+cumulative arm with a per-call-reset arm that does
+`gc.collect`/`empty_cache` between calls.** The reset arm trains the
+pytorch caching allocator into a state that biases the cumulative
+number downward. Caught 2026-05-13 by /simplify in
+`tests/bench/partitioned_mask_phase0/`; the pre-fix bench
+underreported the K-quant+V-cast redundancy delta by ~535 MiB and
+nearly shipped wrong numbers to a downstream consumer. Symptom:
+cumulative-with-mask and cumulative-no-mask measurements that look
+identical at a shape where they shouldn't.
+
 ## Conventions
 
 - Python: **always uv**. Never `pip`, never bare `python3`.
@@ -172,6 +183,16 @@ autotune needs.
   come from one measurement; a *mechanism* claim needs both A/B
   arms directly instrumented. Full rule + the v0.5.1 retirement
   story in `docs/perf_research_framework.md`.
+- **Kernel signature changes are a four-place coupling on the sm89
+  path.** Adding a runtime param to a sm89 kernel (e.g. v0.5.5
+  `attn_mask`) needs (a) the `.cuh` template + kernel-launch sites
+  in all 7 sm89 `.cu` files, (b) the C++ entry + `attn_cuda_sm89.h`
+  decl, (c) pybind def with `py::arg(...)=c10::nullopt` defaults,
+  (d) `sageattention/sm89_compile.py::@torch.library.custom_op`
+  schema + matching `register_fake` stub. Forget (d) and the call
+  fails at runtime with "expected at most N argument(s) but
+  received N+1" -- pybind alone isn't enough. Worked example:
+  CHANGELOG v0.5.5 + the kernel-correctness-reviewer agent.
 
 ## The consumer surface
 
@@ -261,6 +282,14 @@ graph-breaks at, the trigger to revisit, and the estimated work in
   experiment log. Edit every session. Mirrors CHANGELOG's Backlog
   and Recurring sections in active form. Pairs with
   `internal/log/log_<date>.md` and `internal/audit_<date>.md`.
+- `internal/design/<name>_scoping.md` (gitignored) -- precedent
+  pattern (v0.5.5 `cuda_mask_kernel_scoping.md`) for any kernel-day
+  work that needs a discipline check (PTX bit-identity diff of the
+  kNone specialization, register-pressure read, four-place-coupling
+  audit) BEFORE committing to the full implementation. Cheap
+  investigation that de-risks the kernel work; produces an
+  effort-estimate refinement that ages better than the "days, not
+  hours" rule of thumb in CHANGELOG / Backlog.
 - `.claude.local.md` (gitignored) -- personal companion to this
   file. Holds the specific local-machine details that would leak
   in committed material: active venv path, consumer-install

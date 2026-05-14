@@ -1,0 +1,55 @@
+{
+  "device": "NVIDIA GeForce RTX 4090",
+  "sage_version": null,
+  "sage_module": ".../sageattention/__init__.py",
+  "dtype": "torch.bfloat16",
+  "B": 1,
+  "H": 32,
+  "D": 128,
+  "configs": [
+    {
+      "name": "unmasked_t23296",
+      "elapsed_ms": 21.02,
+      "pre_alloc_mb": 546.0,
+      "post_alloc_mb": 728.0,
+      "peak_alloc_mb": 1183.9,
+      "delta_mb": 637.9,
+      "snapshot": "tests/bench/sage_kernel_memory/run_2026-05-14/unmasked_t23296.snapshot.bin",
+      "T": 23296,
+      "mask_kind": "none"
+    },
+    {
+      "name": "masked_noisy_t23296",
+      "elapsed_ms": 21.24,
+      "pre_alloc_mb": 546.0,
+      "post_alloc_mb": 728.0,
+      "peak_alloc_mb": 1184.0,
+      "delta_mb": 637.9,
+      "snapshot": "tests/bench/sage_kernel_memory/run_2026-05-14/masked_noisy_t23296.snapshot.bin",
+      "T": 23296,
+      "mask_kind": "noisy"
+    },
+    {
+      "name": "unmasked_t42240",
+      "elapsed_ms": 63.67,
+      "pre_alloc_mb": 990.0,
+      "post_alloc_mb": 1320.0,
+      "peak_alloc_mb": 2146.7,
+      "delta_mb": 1156.7,
+      "snapshot": "tests/bench/sage_kernel_memory/run_2026-05-14/unmasked_t42240.snapshot.bin",
+      "T": 42240,
+      "mask_kind": "none"
+    },
+    {
+      "name": "masked_noisy_t42240",
+      "elapsed_ms": 65.22,
+      "pre_alloc_mb": 990.1,
+      "post_alloc_mb": 1320.1,
+      "peak_alloc_mb": 2146.7,
+      "delta_mb": 1156.7,
+      "snapshot": "tests/bench/sage_kernel_memory/run_2026-05-14/masked_noisy_t42240.snapshot.bin",
+      "T": 42240,
+      "mask_kind": "noisy"
+    }
+  ]
+}

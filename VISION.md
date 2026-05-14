@@ -156,10 +156,12 @@ and we add a perceptual layer.
 - **Correctness before perf.** v0.3.0's silent-mask-drop took a
   10-line dispatcher fix and a regression test. The native CUDA mask
   kernel on sm89 fp8++ landed v0.5.5 — not because the K-ratio
-  trigger (last measured 1.57) crossed 5×, but because a
-  high-leverage downstream consumer surface (Comfy-Org/ComfyUI PR
-  13735) fired the structural-correctness trigger added to the
-  Backlog formulation in v0.5.4. sm80 + other sm89 variants still
+  trigger (last measured 1.57) crossed 5×, but because the
+  structural-correctness trigger fired: the masked Triton fallback
+  isn't a free correctness substitute, it's a real memory footprint
+  that pushes 24 GiB LTX renders over the edge. Preliminary
+  in-pipeline A/B (CHANGELOG v0.5.5) shows the Triton fallback
+  OOM'ing where fp8_cuda++ fits. sm80 + other sm89 variants still
   deferred.
 - **Measurement before decision.** Triggers fire on measurement, not
   speculation. The K-ratio probe row gates perf-based action; the

@@ -248,9 +248,36 @@ v0.5.5 added native general-mask support to the sm89 fp8++ kernel,
 collapsing the pre-fix scaling-with-seq_kv signature to a flat ~0.09
 across the full sweep (matching the fp8++ unmasked-vs-Triton
 accuracy floor). The Triton kernel still gates other archs + the
-hand-picked-non-fp8++ case. See [`CHANGELOG.md`](./CHANGELOG.md)
-v0.5.5 entry for the per-shape measurement + what remains open
-(sm80, other sm89 variants, sparse-mask whole-block-skip).
+hand-picked-non-fp8++ case.
+
+**Preliminary in-pipeline observation** (single-pair A/B, more reps
+in progress): on a real LTX 2.3 multi-guide workflow at 768×512×97
+on a 4090 with dynamic VRAM disabled, swapping the sage routing
+between the v0.5.5 fp8_cuda++ masked path and the
+`sageattn_qk_int8_pv_fp16_triton` fallback (everything else
+identical) produced very different outcomes: the fp8_cuda++ arm
+completed cleanly with 1056 masked dispatches and zero fallbacks;
+the Triton arm OOM'd at stage-1 step 0 after 48 masked dispatches.
+Inferred cause: Triton's per-call working set
+(`q_int8` + `k_int8` + `v->fp16` + output) cumulated across ~48
+transformer layers leaves no headroom for stage-1's activation
+budget on a 24 GiB card; fp8_cuda++'s smaller per-call working set
+means the same render fits.
+
+This is a preliminary observation -- one OOM event, three successful
+completions in the other arm. We're collecting more repetitions to
+firm up reproducibility. Independent reproduction is welcome and the
+recipe is reproducible: same workflow + flip the sage routing flag +
+`--disable-dynamic-vram --disable-async-offload --reserve-vram 0
+--cuda-malloc --cache-none` to remove ComfyUI's offload safety
+valve.
+
+So the v0.5.5 story is shaping up as a memory-side win on sm89, not
+just a perf win -- the native CUDA mask path appears to fit where
+the Triton fallback doesn't at LTX 2.3 multi-guide token budgets.
+See [`CHANGELOG.md`](./CHANGELOG.md) v0.5.5 entry for the synthetic
+measurement + the in-pipeline observation + what remains open (sm80,
+other sm89 variants, sparse-mask whole-block-skip).
 
 ### torch.compile
 
