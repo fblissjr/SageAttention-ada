@@ -130,6 +130,13 @@ OOMs at LTX self-attn scale). Soft-warns when mean_rtol > 0.10.
 Measures five sage kernels and three torch SDPA backends in one run,
 plus an `fp8++vs.triton` cross-kernel rtol row.
 
+Reuse `accuracy_metrics` from `tests/test_sageattn_ltx_shapes.py:160`
+for rtol/atol comparisons (symmetric denominator; matches every
+other accuracy bench in the repo, including `tests/test_partitioned.py`).
+Scripts under `tests/spikes/` need a one-line
+`sys.path.insert(0, str(Path(__file__).resolve().parent.parent))`
+before the import.
+
 `tests/repros/` holds minimal standalone repros for kernel defects.
 
 GPU OOM mid-test usually means contention, not a bug. Check
@@ -195,6 +202,19 @@ identical at a shape where they shouldn't.
   fails at runtime with "expected at most N argument(s) but
   received N+1" -- pybind alone isn't enough. Worked example:
   CHANGELOG v0.5.5 + the kernel-correctness-reviewer agent.
+- **Triton kernel-day discipline.** Three recurring traps:
+  (a) `@triton.jit` can't read module-level Python globals -- inline
+      literals in the kernel body (e.g. `448.0` for FP8_E4M3_MAX).
+  (b) For DiT FFN/MLP kernels, audit BOTH Linear layers for `bias=True`
+      on the target checkpoint. LTX 2.3 distilled has bf16 biases on
+      both `ff.net.0.proj` and `ff.net.2`; shipping a bias-free kernel
+      silently corrupts output (not "fp8 quant noise" wrong, "missing
+      a constant offset everywhere" wrong). Caught pre-day-9 in v0.6.
+  (c) Broad `@triton.autotune` sweeps (>~30 configs) burn minutes of
+      first-render-per-shape on user hardware (126 configs = ~7 min
+      cold). Pattern: tune full sweep once, extract winners via
+      `kernel.cache.items()`, hardcode ~8 configs + neighbors. Worked
+      example: v0.6 sage_ffn (CHANGELOG v0.6.0).
 
 ## The consumer surface
 
@@ -259,6 +279,13 @@ patterns, ignore-triggers, "what we might be wrong about",
 pre-trigger briefing -- in `docs/perf_research_framework.md`. Load
 that before running a perf experiment.
 
+Snapshot `torch` + `triton` versions right before any commit that
+cites perf numbers -- env can drift mid-session via the venv's uv
+pip activity, and a CHANGELOG number is only honest under the
+stack that produced it. One-liner: `${VIRTUAL_ENV}/bin/python -c
+"import torch, triton; print(torch.__version__,
+torch.version.cuda, triton.__version__)"`.
+
 ## Compile / torch.compile
 
 Not used. Consumer wraps sage in `torch.compiler.disable()`. The
@@ -285,7 +312,10 @@ graph-breaks at, the trigger to revisit, and the estimated work in
 - `docs/fp16_matmul_accum.md` -- whether KJ's
   `enable_fp16_accumulation` affects sage output (no).
 - `internal/pyright_noise.md` (gitignored) -- pyright false-positives
-  to ignore in `sageattention/` and `tests/`.
+  to ignore in `sageattention/` and `tests/`. Two recurring categories
+  worth knowing up front: "unreachable code" on `@triton.jit` kernel
+  bodies, and "is not accessed" on package `__init__.py` re-exports.
+  Both are persistent; don't try to fix.
 
 ## Related
 
