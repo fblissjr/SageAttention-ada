@@ -473,13 +473,13 @@ tensor cores at ~330 TFLOPS instead of fp8 tensor cores at
 ~660 TFLOPS. `sage_ffn` loads fp8 weights directly and computes
 in fp8.
 
-**Synthetic-bench numbers (RTX 4090, CUDA 13.0, torch 2.11.0+cu130,
-triton 3.6.0):**
+**Synthetic-bench numbers (RTX 4090, CUDA 13.0, torch 2.12.0+cu130,
+triton 3.7.0):**
 
 | shape | mean_rtol vs torch ref | sage_ffn | torch ref | speedup |
 |---|---|---|---|---|
-| stage-1 (T=10780, h=4096, inner=16384) | 0.0915 | 13.7 ms | 18.4 ms | **1.34x** |
-| stage-2 (T=44880, multi-guide expanded) | 0.0914 | 59.9 ms | 75.6 ms | **1.26x** |
+| stage-1 (T=10780, h=4096, inner=16384) | 0.0915 | 13.7 ms | 18.2 ms | **1.33x** |
+| stage-2 (T=44880, multi-guide expanded) | 0.0914 | 59.7 ms | 75.7 ms | **1.27x** |
 
 These are standalone matmul-GELU-matmul measurements against
 randomly-initialized weights, not end-to-end ComfyUI rendering.
@@ -488,6 +488,11 @@ kernels. The reference is `F.linear(F.gelu(F.linear(x, w1_bf16_ref),
 approximate="tanh"), w2_bf16_ref)` with weights dequantized once
 outside the timing loop -- i.e. torch's best-case fp8-weight path,
 not its naive one.
+
+Validated against the full 126-config sweep at the same env:
+hardcoded 8-config winners deliver 1.33x / 1.27x; full sweep
+delivers 1.33x / 1.27x. Bit-identical numerics, hardcoded matches
+full-sweep perf within run-to-run noise.
 
 **Real-world e2e wall-time impact: not yet measured.** Several
 production factors can shift the ratio either way: L2 cache
@@ -527,19 +532,20 @@ sage_ffn at two new shapes); subsequent calls hit Triton's
 on-disk cache. The full 126-config sweep cost 7+ minutes
 first-render-per-shape on consumer hardware -- unshippable UX.
 The pruned 8-config set preserves the 1.27-1.33x delivered
-number at acceptable cold-start cost. To re-derive winners for a
-new LTX-class shape: run the kernel against the shape, inspect
+numbers at acceptable cold-start cost (validated against the
+full sweep at the same env). To re-derive winners for a new
+LTX-class shape: run the kernel against the shape, inspect
 `_fp8_matmul_gelu_kernel.cache` for the picked config.
 
 **E2e wall-time projection (NOT measured).** At an FFN-time-share
 of 24-27% for LTX 2.3 multi-guide workloads, the synthetic
-1.26-1.34x FFN speedup would project to roughly 4-7% e2e
+1.27-1.33x FFN speedup would project to roughly 4-7% e2e
 reduction *if* synthetic numbers hold in production. They may
 not -- see "Real-world e2e wall-time impact" above. The
 qualitative wedge is what's load-bearing for consumer framing;
 absolute e2e numbers will land when a downstream A/B has run.
 The synthetic fp8-native ceiling is closer to 1.5-2x; the gap
-to delivered 1.26-1.34x is explained by Triton's matmul codegen
+to delivered 1.27-1.33x is explained by Triton's matmul codegen
 vs cuBLASLt's hand-tuned kernels.
 
 **Composes with chunking, doesn't replace it.** Users with a

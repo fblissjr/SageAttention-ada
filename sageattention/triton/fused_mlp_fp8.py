@@ -17,7 +17,7 @@ The wedge against torch reference comes from fp8-native matmul on
 sm89: torch's bf16 matmul against fp8 weights has to dequant first
 (2x weight bandwidth, bf16 tensor cores); this kernel loads fp8
 weights directly and uses sm89 fp8 tensor cores. Delivered
-1.26-1.34x at LTX FFN shapes; theoretical ceiling is closer to
+1.27-1.33x at LTX FFN shapes; theoretical ceiling is closer to
 1.5-2x (gap is Triton's matmul codegen vs cuBLASLt's hand-tuning).
 
 Compose with an FFN-chunking node (e.g. `LTXVChunkFeedForward`) on
@@ -37,7 +37,7 @@ import triton.language as tl
 
 
 # E4M3FN saturation bound. Kernels inline the literal 448.0 because
-# Triton 3.6 @triton.jit can't read module-level Python globals; this
+# @triton.jit can't reference module-level Python globals; this
 # constant exists for the Python wrapper and tests to share the same
 # magic number under one name.
 FP8_E4M3_MAX = 448.0
@@ -104,7 +104,7 @@ def _fp8_matmul_gelu_kernel(
 
         # Per-block-K quantization: one scale per row within this chunk.
         x_abs_max = tl.max(tl.abs(x_chunk_f32), axis=1)
-        # 448.0 = FP8_E4M3_MAX (inlined; Triton 3.6 @jit can't read module globals).
+        # 448.0 = FP8_E4M3_MAX (inlined; @triton.jit can't read module globals).
         x_chunk_scale = tl.maximum(x_abs_max / 448.0, 1e-6)
 
         x_normalized = x_chunk_f32 / x_chunk_scale[:, None]
@@ -182,7 +182,7 @@ def _fp8_matmul_kernel(
         x_chunk_f32 = x_chunk_bf16.to(tl.float32)
 
         x_abs_max = tl.max(tl.abs(x_chunk_f32), axis=1)
-        # 448.0 = FP8_E4M3_MAX (inlined; Triton 3.6 @jit can't read module globals).
+        # 448.0 = FP8_E4M3_MAX (inlined; @triton.jit can't read module globals).
         x_chunk_scale = tl.maximum(x_abs_max / 448.0, 1e-6)
 
         x_normalized = x_chunk_f32 / x_chunk_scale[:, None]
