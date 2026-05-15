@@ -41,7 +41,9 @@ attention. Relevant pieces:
   kernel set (INT8 QK + FP8 PV, multiple accum variants).
 - `sageattention/triton/` -- JIT Triton kernels. Mask-correct on
   all archs (the only mask-correct path before v0.5.5; still gates
-  archs that haven't gained native CUDA mask support).
+  archs that haven't gained native CUDA mask support). Also home
+  of v0.6 `fused_mlp_fp8.py` -- the `sage_ffn` two-kernel fp8 MLP
+  primitive (FFN-side, not attention).
 - `setup.py` -- builds `_qattn_sm80`, `_qattn_sm89`, `_fused`. Our
   patch at line 152 adds sm89 to the SM80 build gate.
 - `build.sh` -- editable-install wrapper. Enforces `VIRTUAL_ENV`,
@@ -196,7 +198,7 @@ identical at a shape where they shouldn't.
 
 ## The consumer surface
 
-Sage exposes two surfaces to downstream consumers:
+Sage exposes three surfaces to downstream consumers:
 
 1. **`sageattn()` top-level dispatcher.** Picks a kernel based on
    `(detected arch, CUDA version, mask presence)`. On sm89 + CUDA >=
@@ -218,11 +220,27 @@ Sage exposes two surfaces to downstream consumers:
    still silently drop the mask and warn. If a consumer hand-picks a
    non-mask-correct CUDA kernel + mask, the v0.3.1 soft-warn fires;
    the dispatcher is the safe default.
+3. **`sage_ffn(x, w1, s1, w2, s2)`** (v0.6) -- a separate FFN
+   primitive, not an attention kernel. Two-kernel Triton fp8 MLP
+   (`Linear(fp8) -> GELU(tanh) -> Linear(fp8)`) targeting LTX
+   2.3-class FFN blocks (hidden=4096, inner=16384, per-tensor fp8
+   E4M3FN weights). Delivered 1.26-1.34x vs torch's fp8-dequant
+   reference at LTX FFN shapes on sm89. Not wired into `sageattn()`;
+   consumer imports it directly from the top-level package. The
+   wedge is qualitative: torch's `F.linear` against fp8 weights
+   dequants to bf16 first; this kernel loads fp8 directly and uses
+   sm89 fp8 tensor cores. Plain GELU only in v0.6 (no
+   SwiGLU/GEGLU); bookend bf16 blocks (`{0, 1, 46, 47}` on the LTX
+   distilled checkpoint) are consumer-side dispatch. Numbers are
+   synthetic-bench only; in-pipeline e2e A/B is pending downstream.
 
 Mask-routing fix landed v0.3.0 (2026-04-26); audit trail in
 `internal/audit_2026-04-26.md`. Native CUDA mask landed v0.5.5
 (2026-05-13) on sm89 fp8++; scoping doc + measurement trail in
-`internal/design/cuda_mask_kernel_scoping.md` (gitignored).
+`internal/design/cuda_mask_kernel_scoping.md` (gitignored). FFN
+fusion landed v0.6.0 (2026-05-15); scoping + day-by-day execution
+journal + cross-claude memo trail in
+`internal/design/ffn_fusion_scoping.md` (gitignored).
 
 There is also an undocumented L3 contract -- underscore-prefixed
 symbols and pybind methods that downstream consumers import by name.

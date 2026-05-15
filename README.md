@@ -1,4 +1,4 @@
-last updated: 2026-05-14
+last updated: 2026-05-15
 
 # SageAttention-ada
 
@@ -35,8 +35,9 @@ for sm89. Treat results elsewhere as "should work" rather than
 - **Specific kernel exports** -- `sageattn_qk_int8_pv_fp8_cuda`,
   `sageattn_qk_int8_pv_fp16_cuda`, `sageattn_qk_int8_pv_fp16_triton`.
   Bypass the dispatcher if you want to pick the kernel yourself.
-- **Native CUDA mask support on sm89 fp8++** (added v0.5.5; preliminary
-  -- see "What we've measured" below).
+- **Native CUDA mask support on sm89 fp8++** (v0.5.5). In-pipeline
+  observation under "What we've measured" is preliminary; the
+  kernel-correctness piece is not.
 - **`sageattn_partitioned(q, k, v, slices)`** -- amortizes K-quant +
   V-cast across multiple Q slices sharing the same K, V. Targets
   multi-slice partition patterns; correctness verified, peak HBM
@@ -45,6 +46,13 @@ for sm89. Treat results elsewhere as "should work" rather than
 - **`fused_rope_split(q, k, freqs_cis)`** -- clean-room Triton
   kernel matching the LTX split-rotary-embed convention; standalone
   helper, not bolted into `sageattn()`.
+- **`sage_ffn(x, w1, s1, w2, s2)`** (v0.6) -- a two-kernel
+  fp8-native fused MLP (`Linear(fp8) -> GELU(tanh) -> Linear(fp8)`)
+  targeting DiT FFN blocks whose weights ship as per-tensor fp8
+  (E4M3FN). Targets LTX 2.3 distilled (hidden=4096, inner=16384;
+  44 of 48 blocks fp8). FFN primitive, not an attention kernel --
+  consumer imports it directly; not wired into `sageattn()`.
+  See "What we've measured" for delivered numbers.
 - **A bench harness** -- `tests/test_sageattn_ltx_shapes.py` measures
   every sage kernel + torch SDPA backend (FLASH / EFFICIENT / CUDNN)
   at the LTX-class shapes our models actually hit, reporting both
@@ -108,7 +116,7 @@ print(get_last_dispatched_kernel())  # 'fp8_cuda++', 'fp16_triton', etc.
 
 ## What we've measured
 
-Setup: RTX 4090, CUDA 13, torch 2.11, bf16 inputs. Speed = median ms
+Setup: RTX 4090, CUDA 13.0, torch 2.11, bf16 inputs. Speed = median ms
 over 3 timed runs after 1 warmup. `MATH` SDPA backend OOMs at LTX
 self-attn scale, so the accuracy reference is `SDPBackend.EFFICIENT_ATTENTION`.
 
@@ -178,6 +186,64 @@ routing flag + ComfyUI flags `--disable-dynamic-vram
 --disable-async-offload --reserve-vram 0 --cuda-malloc --cache-none`.
 Independent reproduction welcome.
 
+### sage_ffn (fp8-native fused MLP, v0.6)
+
+`sage_ffn` is a separate primitive from the attention kernels --
+two Triton kernels (`Linear -> GELU(tanh)` then `Linear`) computing
+in fp8 against per-tensor-fp8 weights. The wedge is qualitative:
+torch's `F.linear` against fp8 weights dequants to bf16 before the
+matmul (paying 2x weight bandwidth and using bf16 tensor cores at
+~330 TFLOPS); `sage_ffn` loads fp8 directly and uses sm89 fp8
+tensor cores at ~660 TFLOPS. No other library ships an fp8-native
+fused MLP for these consumer-app DiT shapes on sm89 (FA's
+`fused_mlp_func` is bf16/fp16 only).
+
+LTX 2.3 distilled FFN shapes (hidden=4096, inner=16384) --
+**synthetic standalone bench, not end-to-end ComfyUI rendering**:
+
+| shape | sage_ffn | torch ref (fp8-dequant) | speedup | mean_rtol |
+|---|---:|---:|---:|---:|
+| stage-1 (T=10780) | 13.7 ms | 18.4 ms | **1.34x** | 0.092 |
+| stage-2 (T=44880 multi-guide) | 59.9 ms | 75.6 ms | **1.26x** | 0.091 |
+
+mean_rtol is well under the 0.10 budget. The reference is
+`F.linear(F.gelu(F.linear(x, w1_bf16), approximate="tanh"), w2_bf16)`
+with weights dequantized once outside the timing loop, so this is
+torch's *best-case* fp8-weight path, not its naive one.
+
+**Real-world e2e wall-time impact: not yet measured.** Production
+factors (L2 cache contention from neighboring sub-modules in the
+DiT block, GPU thermal/clock state during sustained renders,
+ComfyUI's model-patching overhead) can shift the ratio either way
+from synthetic. The v0.5.5 precedent showed synthetic numbers
+project but don't substitute for in-pipeline A/B. A downstream
+consumer's measurement against a chunking-only baseline is the
+gate; that hasn't run yet.
+
+Design notes:
+
+- Two-kernel split, intermediate hits HBM between them. This is
+  the same design FA's `fused_mlp_func` uses on bf16/fp16 -- the
+  single-kernel "intermediate never hits HBM" design hits an
+  sm89 SMEM wall at LTX-class K dims.
+- Compose with an FFN-chunking node (e.g. `LTXVChunkFeedForward`)
+  on 24 GiB cards; the stage-2 intermediate is ~1.47 GiB unchunked.
+  32+ GiB cards can drop chunking and run sage_ffn directly.
+- Plain GELU MLP only in v0.6. No gated SwiGLU/GEGLU variant.
+- Bookend bf16 blocks (LTX 2.3 keeps blocks `{0, 1, 46, 47}` as
+  bf16) need consumer-side dispatch -- `sage_ffn` only handles
+  fp8-weight blocks; the bf16 bookend blocks fall through to
+  `F.linear` in the caller.
+- E2e wall-time impact: synthetic FFN speedup of 1.26-1.34x at an
+  FFN-time-share of ~24-27% *would* project to 4-7% e2e if
+  synthetic numbers held in production. They might not; e2e is
+  pending in-pipeline A/B.
+- First call at a new shape pays ~10-15s Triton autotune-search per
+  kernel (~30s total across both kernels at the two LTX shapes);
+  subsequent calls hit the on-disk cache. Configs are hardcoded
+  winners from a broader sweep so that first-render cost stays
+  bounded.
+
 ### Things we have NOT measured
 
 - Task-level quality (FVD / FID / preference) on any of the
@@ -225,6 +291,11 @@ You get:
 - Native mask support on the sm89 fp8++ CUDA path -- masked calls
   run at fp8++ speed instead of paying the Triton fallback
   overhead. (Other archs still use Triton.)
+- An fp8-native fused MLP primitive (`sage_ffn`, v0.6) for LTX
+  2.3-class FFN blocks. The only fp8-native fused MLP available
+  for these workloads on sm89. Synthetic-bench 1.26-1.34x vs
+  torch's fp8-dequant reference at LTX FFN shapes; production
+  e2e impact is pending in-pipeline measurement.
 
 You give up:
 
@@ -263,6 +334,8 @@ paths.
 sageattention/          # Python package
   core.py               # dispatcher + Python entry points
   triton/               # JIT Triton kernels
+    fused_mlp_fp8.py    # sage_ffn -- v0.6 two-kernel fp8 fused MLP
+    fused_rope.py       # fused_rope_split helper
   sm89_compile.py       # torch.library.custom_op schemas for sm89 kernels
   quant.py              # quantization helpers
 csrc/qattn/             # CUDA kernel sources (sm80 + sm89)

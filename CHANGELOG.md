@@ -454,6 +454,129 @@ sufficient.
 
 ## Versions
 
+### v0.6.0 -- 2026-05-15  (sage_ffn: fp8-native two-kernel fused MLP for LTX 2.3-class FFN blocks on sm89)
+
+Ships `sage_ffn(x, w1, s1, w2, s2)` -- a Triton two-kernel
+`Linear(fp8) -> GELU(tanh) -> Linear(fp8)` MLP path for DiT
+FFN blocks whose weights are stored as per-tensor fp8 (E4M3FN).
+The primary motivating workload is LTX 2.3 distilled, whose
+transformer blocks have hidden=4096, inner=16384 and 44 of 48
+blocks shipped as fp8 (bookend blocks `{0, 1, 46, 47}` stay
+bf16 per the distilled checkpoint's design).
+
+**The wedge is qualitative, not just quantitative.** No other
+library ships an fp8-native fused MLP for ComfyUI consumer-app
+shapes on sm89. FA's `fused_mlp_func` is bf16/fp16 only (cuBLASLt
+epilogue path); torch's `F.linear` against fp8 weights dequants
+to bf16 first, paying 2x the weight-bandwidth and using bf16
+tensor cores at ~330 TFLOPS instead of fp8 tensor cores at
+~660 TFLOPS. `sage_ffn` loads fp8 weights directly and computes
+in fp8.
+
+**Synthetic-bench numbers (RTX 4090, CUDA 13.0, torch 2.11.0+cu130,
+triton 3.6.0):**
+
+| shape | mean_rtol vs torch ref | sage_ffn | torch ref | speedup |
+|---|---|---|---|---|
+| stage-1 (T=10780, h=4096, inner=16384) | 0.0915 | 13.7 ms | 18.4 ms | **1.34x** |
+| stage-2 (T=44880, multi-guide expanded) | 0.0914 | 59.9 ms | 75.6 ms | **1.26x** |
+
+These are standalone matmul-GELU-matmul measurements against
+randomly-initialized weights, not end-to-end ComfyUI rendering.
+mean_rtol is well under the 0.10 budget that gates all sage
+kernels. The reference is `F.linear(F.gelu(F.linear(x, w1_bf16_ref),
+approximate="tanh"), w2_bf16_ref)` with weights dequantized once
+outside the timing loop -- i.e. torch's best-case fp8-weight path,
+not its naive one.
+
+**Real-world e2e wall-time impact: not yet measured.** Several
+production factors can shift the ratio either way: L2 cache
+contention from neighboring sub-modules in the DiT block, GPU
+thermal/clock state during sustained renders, ComfyUI's
+model-patching machinery overhead. The v0.5.5 precedent showed
+that synthetic kernel-bench numbers project but don't substitute
+for in-pipeline measurement. The number that fills this gap will
+come from a downstream consumer's A/B against a chunking-only
+baseline.
+
+**Design: two-kernel split, not single-kernel fusion.** Kernel 1
+matmul + GELU(tanh) epilogue + write intermediate. Kernel 2
+matmul down-projection. Intermediate at LTX stage-2 multi-guide
+is ~1.47 GiB; users on 24 GiB cards should compose with an
+FFN-chunking node (e.g. `LTXVChunkFeedForward` from KJNodes).
+The single-kernel "intermediate never hits HBM" design was
+explored on day 1-2 and rejected at day 2's perf wall: the
+X_tile (1 MB at BLOCK_M=128, K=4096, bf16) won't fit in sm89's
+100 KB SMEM, and the nested-loop structure was forcing Triton
+into L2 evictions. FA's `fused_mlp_func` is also a two-kernel
+split for the same reason -- this design converges on the
+industry standard.
+
+**Per-block-K activation quantization.** Each (BLOCK_M, BLOCK_K)
+chunk of the bf16 activation gets its own f32 scale, computed
+inline during the K-reduction. This avoids a separate amax pass
+over the full K dimension; the slight coarsening (~0.005 rtol
+cost vs per-row) is well within the 0.10 budget.
+
+**Autotune.** Each kernel carries 8 hardcoded `@triton.autotune`
+configs -- the winners from a 126-config sweep against the two
+LTX FFN shapes, plus a few neighbors for shapes the winners may
+not cover. First call at a new shape pays ~10-15 seconds
+autotune-search per kernel (~30-60 sec total across the full
+sage_ffn at two new shapes); subsequent calls hit Triton's
+on-disk cache. The full 126-config sweep cost 7+ minutes
+first-render-per-shape on consumer hardware -- unshippable UX.
+The pruned 8-config set preserves the 1.27-1.33x delivered
+number at acceptable cold-start cost. To re-derive winners for a
+new LTX-class shape: run the kernel against the shape, inspect
+`_fp8_matmul_gelu_kernel.cache` for the picked config.
+
+**E2e wall-time projection (NOT measured).** At an FFN-time-share
+of 24-27% for LTX 2.3 multi-guide workloads, the synthetic
+1.26-1.34x FFN speedup would project to roughly 4-7% e2e
+reduction *if* synthetic numbers hold in production. They may
+not -- see "Real-world e2e wall-time impact" above. The
+qualitative wedge is what's load-bearing for consumer framing;
+absolute e2e numbers will land when a downstream A/B has run.
+The synthetic fp8-native ceiling is closer to 1.5-2x; the gap
+to delivered 1.26-1.34x is explained by Triton's matmul codegen
+vs cuBLASLt's hand-tuned kernels.
+
+**Composes with chunking, doesn't replace it.** Users with a
+chunking node already in place (the common case on 24 GiB
+cards) keep the chunking and gain the FFN wall-time win on each
+chunk's matmul. Users with 32+ GiB headroom can drop chunking
+and run `sage_ffn` against the full multi-guide tensor at the
+cost of the 1.47 GiB intermediate.
+
+**Limitations / scope.**
+
+- Plain GELU MLP only. No gated SwiGLU/GEGLU variant in v0.6;
+  the FFN structure has to be `Linear -> GELU(tanh) -> Linear`.
+- Bookend bf16 blocks must be handled by the caller. Consumer-side
+  dispatch typically inspects `block.ff.net[0].proj.weight.dtype`
+  and falls through to `F.linear` for bf16 blocks.
+- Per-tensor scalar weight scale only. Per-row / per-channel
+  weight scales are a v0.6.1 extension if a workload demands.
+- Not wired into `sageattn()` -- this is a separate FFN primitive,
+  not an attention kernel. Consumer imports `sage_ffn` directly.
+
+**Files added / changed:**
+
+- `sageattention/triton/fused_mlp_fp8.py` (new) -- the two-kernel
+  implementation + `sage_ffn` Python wrapper.
+- `sageattention/__init__.py` -- `sage_ffn` export.
+- `tests/spikes/spike_fp8_mma.py` (new) -- day-1 spike verifying
+  `tl.dot(fp8, fp8) -> f32` on sm89 at small + LTX stage-1
+  shapes.
+- `tests/spikes/test_fused_mlp_fp8_correctness.py` (new) --
+  correctness + perf gate at LTX FFN shapes, median-of-5 timing
+  after autotune-absorbing warmup.
+
+Design narrative (cross-claude memo trail, v0.6 scoping doc,
+day-by-day execution journal, decision-gate framework) lives in
+`internal/design/ffn_fusion_scoping.md` (gitignored).
+
 ### v0.5.5 -- 2026-05-13  (native general-mask support in the sm89 fp8++ CUDA kernel)
 
 First downstream-driven kernel-day work on the fork. Lands the

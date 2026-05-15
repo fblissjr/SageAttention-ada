@@ -156,8 +156,8 @@ def run_spike(M: int, N: int, K: int, BLOCK_M: int, BLOCK_N: int, BLOCK_K: int, 
     a = out.float()
     e = ref.float()
     diff = (a - e).abs()
-    eps = torch.tensor(torch.finfo(a.dtype).eps, dtype=a.dtype, device=device)
-    rdiff = diff / torch.maximum(torch.maximum(a.abs(), e.abs()), eps)
+    eps = torch.finfo(a.dtype).eps
+    rdiff = diff / torch.maximum(torch.maximum(a.abs(), e.abs()), torch.tensor(eps, device=device))
     mean_rtol = rdiff.mean().item()
     max_rtol = rdiff.max().item()
     mean_atol = diff.mean().item()
@@ -193,9 +193,8 @@ def main() -> int:
     ))
 
     print("\n=== Spike verdict ===")
-    all_compiled = all(r.compiled for r in results)
     rtol_budget = 0.10
-    all_rtol_ok = all(r.compiled and r.mean_rtol < rtol_budget for r in results)
+    all_ok = all(r.compiled and r.mean_rtol < rtol_budget for r in results)
     for r in results:
         status = "PASS" if r.compiled and r.mean_rtol < rtol_budget else "FAIL"
         if r.err:
@@ -203,16 +202,14 @@ def main() -> int:
         else:
             print(f"  [{status}] {r.config_name}: compiled={r.compiled} mean_rtol={r.mean_rtol:.4f} (<{rtol_budget})")
     print()
-    if all_compiled and all_rtol_ok:
+    if all_ok:
         print("SPIKE PASSED. tl.dot(fp8, fp8) on sm89 works at both configs; activation-quant pattern produces correct numerics.")
-        print("Proceed to day 2 (core kernel build).")
         return 0
-    elif not all_compiled:
+    if not all(r.compiled for r in results):
         print("SPIKE FAILED: at least one config did not compile. v0.6 plan needs revision.")
         return 1
-    else:
-        print(f"SPIKE FAILED: rtol budget {rtol_budget} exceeded. fp8 quant noise too high; revisit activation-quant scheme.")
-        return 1
+    print(f"SPIKE FAILED: rtol budget {rtol_budget} exceeded. fp8 quant noise too high; revisit activation-quant scheme.")
+    return 1
 
 
 if __name__ == "__main__":

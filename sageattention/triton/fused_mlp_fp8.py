@@ -5,43 +5,64 @@ Implements `sage_ffn(x, w1, s1, w2, s2)` -- a two-step
 as separate Triton kernels; the intermediate (M, inner=16384) is
 written to HBM between them.
 
-Activation quantization is **per-block-K**: each (BLOCK_M, BLOCK_K)
-tile of the activation gets its own f32 scale, computed inline
-during the K-reduction. This eliminates the redundant K-pass that
-per-row quantization would require, at the cost of slightly
-coarser scaling (~0.005 rtol vs per-row in audio-loop's day-1
-estimate; verified empirically here against the 0.10 budget).
+Activation quantization is per-block-K: each (BLOCK_M, BLOCK_K) tile
+of the activation gets its own f32 scale, computed inline during the
+K-reduction. This avoids the separate amax pass over the full K
+dimension that per-row quantization would require, at the cost of
+slightly coarser scaling. The cost is within budget: measured
+mean_rtol against the torch fp8-dequant reference is 0.091-0.092 at
+LTX FFN shapes (0.10 budget).
 
 The wedge against torch reference comes from fp8-native matmul on
 sm89: torch's bf16 matmul against fp8 weights has to dequant first
-(2x memory bandwidth, bf16 tensor cores at ~330 TFLOPS); this
-kernel loads fp8 weights directly + uses sm89 fp8 tensor cores at
-~660 TFLOPS. Realistic delivered: 1.5-2x vs torch reference.
+(2x weight bandwidth, bf16 tensor cores); this kernel loads fp8
+weights directly and uses sm89 fp8 tensor cores. Delivered
+1.26-1.34x at LTX FFN shapes; theoretical ceiling is closer to
+1.5-2x (gap is Triton's matmul codegen vs cuBLASLt's hand-tuning).
 
-Compose with `LTXVChunkFeedForward` on 24 GiB cards (the
-intermediate hits HBM between kernels; on multi-guide T=44880
-it's ~1.47 GiB unchunked).
+Compose with an FFN-chunking node (e.g. `LTXVChunkFeedForward`) on
+24 GiB cards -- the intermediate hits HBM between kernels and is
+~1.47 GiB at multi-guide T=44880.
 
-v1 supports plain GELU MLP only (no gated SwiGLU/GEGLU).
+Supports plain GELU MLP only (no gated SwiGLU/GEGLU).
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 import triton
 import triton.language as tl
 
 
+# E4M3FN saturation bound. Kernels inline the literal 448.0 because
+# Triton 3.6 @triton.jit can't read module-level Python globals; this
+# constant exists for the Python wrapper and tests to share the same
+# magic number under one name.
+FP8_E4M3_MAX = 448.0
+
+
+# Configs hardcoded from the winners of a 126-config sweep against the
+# two LTX FFN shapes (T=10780, T=44880). The full sweep cost 7+ min
+# first-render-per-shape on user hardware; this curated set lands at
+# the same delivered perf (1.27-1.33x vs torch fp8-dequant) for a
+# ~30-60 sec first-render-per-shape autotune. If a new LTX-class shape
+# misses these, the autotuner falls back to the closest match.
+#
+# Re-derive: run the 126-config sweep version (git history) on the new
+# shape, inspect `_fp8_matmul_gelu_kernel.cache` for the winner.
 _FP8_MATMUL_CONFIGS = [
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=4, num_stages=4),
+    # winners from LTX stage-1 / stage-2 sweep -- BLOCK_N=256 dominates kernel 1.
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 64}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 64}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 64}, num_warps=8, num_stages=4),
+    # neighbors for other LTX-class shapes the winners may not cover.
     triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=4, num_stages=4),
     triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64}, num_warps=8, num_stages=4),
-    triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_M": 256, "BLOCK_N": 64, "BLOCK_K": 64}, num_warps=4, num_stages=3),
 ]
 
 
@@ -83,8 +104,8 @@ def _fp8_matmul_gelu_kernel(
 
         # Per-block-K quantization: one scale per row within this chunk.
         x_abs_max = tl.max(tl.abs(x_chunk_f32), axis=1)
-        x_chunk_scale = x_abs_max / 448.0
-        x_chunk_scale = tl.where(x_chunk_scale > 0.0, x_chunk_scale, 1e-6)
+        # 448.0 = FP8_E4M3_MAX (inlined; Triton 3.6 @jit can't read module globals).
+        x_chunk_scale = tl.maximum(x_abs_max / 448.0, 1e-6)
 
         x_normalized = x_chunk_f32 / x_chunk_scale[:, None]
         x_normalized = tl.minimum(tl.maximum(x_normalized, -448.0), 448.0)
@@ -112,15 +133,17 @@ def _fp8_matmul_gelu_kernel(
     tl.store(out_ptrs, out.to(tl.bfloat16), mask=out_mask)
 
 
+# Kernel 2: reduction is over N (the inner=16384 dim). Winners had
+# BN=64 (small reduction tile) + BK=256 (large M-tile) on both shapes.
 _FP8_MATMUL_CONFIGS_K2 = [
-    triton.Config({"BLOCK_M": 64, "BLOCK_K": 128, "BLOCK_N": 64}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_M": 64, "BLOCK_K": 128, "BLOCK_N": 64}, num_warps=4, num_stages=4),
-    triton.Config({"BLOCK_M": 128, "BLOCK_K": 128, "BLOCK_N": 64}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_M": 128, "BLOCK_K": 128, "BLOCK_N": 64}, num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_M": 128, "BLOCK_K": 256, "BLOCK_N": 64}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_K": 256, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_K": 256, "BLOCK_N": 64}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_M": 64, "BLOCK_K": 256, "BLOCK_N": 64}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 128, "BLOCK_K": 256, "BLOCK_N": 64}, num_warps=4, num_stages=2),
     triton.Config({"BLOCK_M": 128, "BLOCK_K": 256, "BLOCK_N": 64}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK_M": 256, "BLOCK_K": 128, "BLOCK_N": 64}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_M": 64, "BLOCK_K": 128, "BLOCK_N": 128}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_M": 128, "BLOCK_K": 128, "BLOCK_N": 128}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_M": 128, "BLOCK_K": 256, "BLOCK_N": 128}, num_warps=8, num_stages=3),
 ]
 
 
@@ -159,8 +182,8 @@ def _fp8_matmul_kernel(
         x_chunk_f32 = x_chunk_bf16.to(tl.float32)
 
         x_abs_max = tl.max(tl.abs(x_chunk_f32), axis=1)
-        x_chunk_scale = x_abs_max / 448.0
-        x_chunk_scale = tl.where(x_chunk_scale > 0.0, x_chunk_scale, 1e-6)
+        # 448.0 = FP8_E4M3_MAX (inlined; Triton 3.6 @jit can't read module globals).
+        x_chunk_scale = tl.maximum(x_abs_max / 448.0, 1e-6)
 
         x_normalized = x_chunk_f32 / x_chunk_scale[:, None]
         x_normalized = tl.minimum(tl.maximum(x_normalized, -448.0), 448.0)
@@ -209,9 +232,7 @@ def sage_ffn(
     assert w1.shape == (inner, hidden)
     assert w2.shape == (hidden, inner)
 
-    M = 1
-    for d in batch_dims:
-        M *= d
+    M = math.prod(batch_dims)
 
     x_flat = x.reshape(M, hidden).contiguous()
     intermediate = torch.empty(M, inner, dtype=torch.bfloat16, device=x.device)

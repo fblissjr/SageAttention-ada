@@ -22,6 +22,7 @@ import time
 
 import torch
 import torch.nn.functional as F
+import triton
 
 from sageattention.triton.fused_mlp_fp8 import sage_ffn
 
@@ -80,7 +81,8 @@ def run_correctness_at(T: int, hidden: int = 4096, inner: int = 16384, seed: int
         out = sage_ffn(x, w1_fp8, w1_scale, w2_fp8, w2_scale)
         torch.cuda.synchronize()
         sage_samples.append((time.perf_counter() - t0) * 1000)
-    ref_samples.sort(); sage_samples.sort()
+    ref_samples.sort()
+    sage_samples.sort()
     ref_ms = ref_samples[2]
     sage_ms = sage_samples[2]
 
@@ -88,8 +90,8 @@ def run_correctness_at(T: int, hidden: int = 4096, inner: int = 16384, seed: int
     a = out.float()
     e = ref.float()
     diff = (a - e).abs()
-    eps = torch.tensor(torch.finfo(a.dtype).eps, dtype=a.dtype, device=device)
-    rdiff = diff / torch.maximum(torch.maximum(a.abs(), e.abs()), eps)
+    eps = torch.finfo(a.dtype).eps
+    rdiff = diff / torch.maximum(torch.maximum(a.abs(), e.abs()), torch.tensor(eps, device=device))
     mean_rtol = rdiff.mean().item()
     max_rtol = rdiff.max().item()
     mean_atol = diff.mean().item()
@@ -113,7 +115,6 @@ def main() -> int:
         print("CUDA not available", file=sys.stderr)
         return 2
 
-    import triton
     print(f"torch: {torch.__version__}  triton: {triton.__version__}  device: {torch.cuda.get_device_name(0)}")
 
     results = []
