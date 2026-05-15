@@ -47,15 +47,14 @@ for sm89. Treat results elsewhere as "should work" rather than
   kernel matching the LTX split-rotary-embed convention; standalone
   helper, not bolted into `sageattn()`.
 - **`sage_ffn(x, w1, s1, w2, s2, b1=None, b2=None)`** (v0.6) -- a
-  two-kernel fp8-native fused MLP (`Linear(fp8) -> GELU(tanh) ->
-  Linear(fp8)`) targeting DiT FFN blocks whose weights ship as
-  per-tensor fp8 (E4M3FN). Targets LTX 2.3 distilled (hidden=4096,
-  inner=16384; 44 of 48 blocks fp8). Optional bf16 biases on both
-  Linear layers; LTX usage passes them through, bias-free callers
-  pass `None` and the kernel compiles the bias load out. FFN
-  primitive, not an attention kernel -- consumer imports it
-  directly; not wired into `sageattn()`. See "What we've measured"
-  for delivered numbers.
+  two-kernel fp8-native fused MLP for DiT FFN blocks with per-tensor
+  fp8 (E4M3FN) weights. Targets LTX 2.3 distilled. **Ships as a
+  completeness primitive, not a perf win**: synthetic-bench shows
+  1.26-1.36x vs torch's fp8-dequant path, but a two-sampler LTX
+  production A/B came back +1.79% e2e slower (+20% at stage-2
+  per-call). Available for users who specifically need fp8-native
+  fused MLP on sm89; no other library provides this combination.
+  See "What we've measured" for the production breakdown.
 - **A bench harness** -- `tests/test_sageattn_ltx_shapes.py` measures
   every sage kernel + torch SDPA backend (FLASH / EFFICIENT / CUDNN)
   at the LTX-class shapes our models actually hit, reporting both
@@ -216,14 +215,46 @@ mean_rtol is well under the 0.10 budget. The reference is
 with weights dequantized once outside the timing loop, so this is
 torch's *best-case* fp8-weight path, not its naive one.
 
-**Real-world e2e wall-time impact: not yet measured.** Production
-factors (L2 cache contention from neighboring sub-modules in the
-DiT block, GPU thermal/clock state during sustained renders,
-ComfyUI's model-patching overhead) can shift the ratio either way
-from synthetic. The v0.5.5 precedent showed synthetic numbers
-project but don't substitute for in-pipeline A/B. A downstream
-consumer's measurement against a chunking-only baseline is the
-gate; that hasn't run yet.
+**Production result on a two-sampler LTX workflow: sage_ffn is
+slower than the chunking-only baseline. Ships as completeness
+primitive, not a perf win.**
+
+In-pipeline A/B on a two-sampler FML2V multi-guide workflow
+(768x512x97, 8-step stage-1 + 3-step stage-2, 4 renders
+interleaved baseline/treatment/baseline/treatment on a 4090 under
+`nodynvram`):
+
+| metric | baseline | with sage_ffn | delta |
+|---|---|---|---|
+| wall-time avg | 148.51s | 151.17s | **+1.79% slower** |
+| ff @ T=10780 med ms/call | 10.36 | 10.67 | +3.0% slower |
+| ff @ T=42240 med ms/call | 48.77 | 58.58 | **+20.1% slower** |
+
+Same workflow / prompt / seed across both sides; interleaving
+controls for time-varying noise; non-FFN sub-modules at 1.00x
+ratio confirm the patching surface is clean. Per-call FFN times
+match between cold-autotune and warm-autotune treatments, so
+autotune amortization is not the explanation.
+
+Why the synthetic 1.26-1.36x didn't translate:
+
+1. **L2 cache contention with neighboring sub-modules.** Synthetic
+   bench ran FFN alone with warm L2. Production runs `attn1` (~107
+   ms at T=42240) immediately before `ff` at stage-2; the attention
+   pass evicts FFN's L2 residency. The X-tile-lives-in-L2
+   assumption breaks when L2 is hostile; cold-L2 FFN is
+   bandwidth-bound and loses the fp8-vs-bf16 advantage. Worse at
+   stage-2 (4x working set) matches the regression shape.
+2. **Cumulative kernel-launch overhead at LTX call count.** LTX
+   2.3 fires ~1056 ff calls per render across transformer blocks.
+   sage_ffn is two kernel launches per call; torch reference is
+   one cuBLASLt call per matmul.
+
+The v0.5.5 precedent played out a second time -- synthetic kernel-
+bench projects a wedge, in-pipeline A/B reveals production
+conditions change the picture. Different workload shapes (e.g.
+single-pass, non-multi-guide) may behave differently; in-pipeline
+measurement is the gate.
 
 Design notes:
 
@@ -231,23 +262,20 @@ Design notes:
   the same design FA's `fused_mlp_func` uses on bf16/fp16 -- the
   single-kernel "intermediate never hits HBM" design hits an
   sm89 SMEM wall at LTX-class K dims.
-- Compose with an FFN-chunking node (e.g. `LTXVChunkFeedForward`)
-  on 24 GiB cards; the stage-2 intermediate is ~1.47 GiB unchunked.
-  32+ GiB cards can drop chunking and run sage_ffn directly.
 - Plain GELU MLP only in v0.6. No gated SwiGLU/GEGLU variant.
 - Bookend bf16 blocks (LTX 2.3 keeps blocks `{0, 1, 46, 47}` as
   bf16) need consumer-side dispatch -- `sage_ffn` only handles
   fp8-weight blocks; the bf16 bookend blocks fall through to
   `F.linear` in the caller.
-- E2e wall-time impact: synthetic FFN speedup of 1.26-1.36x at an
-  FFN-time-share of ~24-27% *would* project to 4-8% e2e if
-  synthetic numbers held in production. They might not; e2e is
-  pending in-pipeline A/B.
 - First call at a new shape pays ~10-15s Triton autotune-search per
   kernel (~30s total across both kernels at the two LTX shapes);
   subsequent calls hit the on-disk cache. Configs are hardcoded
   winners from a broader sweep so that first-render cost stays
   bounded.
+- v0.6.1 candidates for closing the production gap: persistent-CTA
+  hybrid (addresses L2 contention directly) and a CUTLASS-based
+  CUDA backend (closes the Triton-vs-cuBLASLt codegen gap). See
+  CHANGELOG Backlog.
 
 ### Things we have NOT measured
 
@@ -298,9 +326,10 @@ You get:
   overhead. (Other archs still use Triton.)
 - An fp8-native fused MLP primitive (`sage_ffn`, v0.6) for LTX
   2.3-class FFN blocks. The only fp8-native fused MLP available
-  for these workloads on sm89. Synthetic-bench 1.26-1.36x vs
-  torch's fp8-dequant reference at LTX FFN shapes; production
-  e2e impact is pending in-pipeline measurement.
+  for these workloads on sm89. **Note**: synthetic-bench shows
+  1.26-1.36x but a two-sampler LTX production A/B came back
+  net slower; ships as a completeness primitive only. See
+  "What we've measured" for detail.
 
 You give up:
 

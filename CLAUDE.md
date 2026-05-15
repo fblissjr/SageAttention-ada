@@ -202,6 +202,21 @@ identical at a shape where they shouldn't.
   fails at runtime with "expected at most N argument(s) but
   received N+1" -- pybind alone isn't enough. Worked example:
   CHANGELOG v0.5.5 + the kernel-correctness-reviewer agent.
+- **Don't ship a "delivered speedup" perf claim until in-pipeline
+  A/B has run.** Synthetic kernel-bench numbers are useful as
+  isolation measurements (and stay in the docs) but they are not
+  delivered consumer-app numbers. Two precedents in this fork:
+  v0.5.5 chunk-bypass A/B (synthetic mask-kernel win softened
+  once `LTXVChunkFeedForward` was shown to be doing the
+  load-bearing memory work) and v0.6 sage_ffn (synthetic 1.26-1.36x
+  came back +1.79% e2e slower on a two-sampler LTX FML2V workflow
+  due to L2 contention + cumulative launch overhead). Default
+  framing for new kernel-day work: "synthetic-bench above, e2e
+  pending in-pipeline measurement" until a downstream A/B on a
+  representative workload confirms the wedge transfers. Especially
+  load-bearing for per-call-heavy primitives (FFN/MLP fire ~1000
+  times per LTX render -- any per-call overhead compounds and any
+  cache-locality assumption made under isolation can break).
 - **Triton kernel-day discipline.** Three recurring traps:
   (a) `@triton.jit` can't read module-level Python globals -- inline
       literals in the kernel body (e.g. `448.0` for FP8_E4M3_MAX).
@@ -245,15 +260,18 @@ Sage exposes three surfaces to downstream consumers:
    Triton fp8 MLP (`Linear(fp8) -> GELU(tanh) -> Linear(fp8)`)
    targeting LTX 2.3-class FFN blocks (hidden=4096, inner=16384,
    per-tensor fp8 E4M3FN weights, optional bf16 biases on both
-   Linear layers). Delivered 1.26-1.36x vs torch's fp8-dequant
-   reference at LTX FFN shapes on sm89. Not wired into `sageattn()`;
-   consumer imports it directly from the top-level package. The
-   wedge is qualitative: torch's `F.linear` against fp8 weights
-   dequants to bf16 first; this kernel loads fp8 directly and uses
-   sm89 fp8 tensor cores. Plain GELU only in v0.6 (no
-   SwiGLU/GEGLU); bookend bf16 blocks (`{0, 1, 46, 47}` on the LTX
-   distilled checkpoint) are consumer-side dispatch. Numbers are
-   synthetic-bench only; in-pipeline e2e A/B is pending downstream.
+   Linear layers). Synthetic bench shows 1.26-1.36x vs torch's
+   fp8-dequant reference; **in-pipeline A/B on a two-sampler LTX
+   workflow came back +1.79% e2e slower (+20% per-call at stage-2)**,
+   so this ships as a completeness primitive, not a perf win. Root
+   cause is L2 cache contention with neighboring attention modules
+   + cumulative kernel-launch overhead at LTX's ~1000-FFN-calls/render
+   count. Not wired into `sageattn()`; consumer imports it directly
+   from the top-level package. The qualitative wedge holds (no other
+   library ships fp8-native fused MLP for ComfyUI consumer-app on
+   sm89); the quantitative wedge does not on the tested workload.
+   v0.6.1 candidates to close the gap: persistent-CTA hybrid and
+   CUTLASS-based CUDA backend (see CHANGELOG Backlog).
 
 Mask-routing fix landed v0.3.0 (2026-04-26); audit trail in
 `internal/audit_2026-04-26.md`. Native CUDA mask landed v0.5.5

@@ -16,9 +16,20 @@ LTX FFN shapes (0.10 budget).
 The wedge against torch reference comes from fp8-native matmul on
 sm89: torch's bf16 matmul against fp8 weights has to dequant first
 (2x weight bandwidth, bf16 tensor cores); this kernel loads fp8
-weights directly and uses sm89 fp8 tensor cores. Delivered
+weights directly and uses sm89 fp8 tensor cores. Synthetic-bench
 1.26-1.36x at LTX FFN shapes; theoretical ceiling is closer to
 1.5-2x (gap is Triton's matmul codegen vs cuBLASLt's hand-tuning).
+
+**Production caveat: this kernel is NOT currently a perf win in
+end-to-end LTX rendering.** In-pipeline A/B on a two-sampler FML2V
+workflow came back +1.79% e2e slower (+20% per-call at stage-2)
+because L2 cache contention with neighboring attention modules
+breaks the X-tile-lives-in-L2 assumption, and cumulative kernel-
+launch overhead at LTX's ~1000 FFN calls per render compounds.
+Ships as a completeness primitive (the only fp8-native fused MLP
+for ComfyUI consumer-app on sm89) rather than a delivered
+speedup. See CHANGELOG v0.6.0 for the production breakdown +
+v0.6.1 candidates (persistent-CTA hybrid, CUTLASS backend).
 
 Compose with an FFN-chunking node (e.g. `LTXVChunkFeedForward`) on
 24 GiB cards -- the intermediate hits HBM between kernels and is
@@ -66,7 +77,7 @@ _FP8_MATMUL_GELU_CONFIGS = [
 ]
 
 
-@triton.autotune(configs=_FP8_MATMUL_GELU_CONFIGS, key=["M", "N", "K"])
+@triton.autotune(configs=_FP8_MATMUL_GELU_CONFIGS, key=["M", "N", "K"])  # nb: see Backlog for power-of-2-M bucketing trigger
 @triton.jit
 def _fp8_matmul_gelu_kernel(
     X_ptr, W_ptr, B_ptr, Out_ptr,

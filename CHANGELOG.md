@@ -73,6 +73,51 @@ on sm89 fp8++: 2026-05-13 (v0.5.5).
 Real open TODOs. Each has an explicit trigger-to-act; we don't do these
 speculatively.
 
+### Close the sage_ffn production gap on multi-sampler LTX workloads
+
+v0.6.0's sage_ffn is +1.79% e2e slower than the chunking-only
+baseline on a two-sampler FML2V workflow (+20% per-call at stage-2,
++3% at stage-1). Root cause is L2 contention with neighboring
+attention modules + cumulative kernel-launch overhead at LTX's
+~1000-FFN-calls/render count. Two candidates:
+
+1. **Persistent-CTA two-kernel hybrid (option b' from the scoping
+   doc).** Persistent CTAs hold M-tile state in registers / L2
+   across the two matmuls. Addresses L2 contention directly --
+   the intermediate fits in the per-CTA share of L2 if persistent.
+   Significantly more kernel engineering than v0.6.0; probably
+   3-5 days of work.
+2. **CUTLASS-based CUDA backend for the fp8 matmul.** Closes the
+   Triton-vs-cuBLASLt codegen gap that bounds the synthetic
+   ceiling at 1.27-1.36x; unclear whether it would also recover
+   the production loss (#1 attacks the cache-locality root cause
+   more directly). 2-3 weeks of work.
+
+**Trigger to act:** user demand for "actually faster than torch
+reference on a real workload" surfaces, OR a different production
+workload class (single-pass / non-multi-guide) lands net-positive
+under sage_ffn and the priority becomes generalizing that. Until
+then, sage_ffn stays as a completeness primitive and the
+production default is `LTXVChunkFeedForward` (KJNodes).
+
+### sage_ffn autotune key: coarsen to power-of-2 buckets on M
+
+Current cache key is `["M", "N", "K"]`. Every new M re-autotunes
+(~10-15s per kernel). LTX 2.3 uses two stable M values, but other
+modes (chunked FFN, different resolution / frame count) mint
+others. One-line change: `key=[lambda M: triton.next_power_of_2(M),
+"N", "K"]` -- T=10780 and T=11000 share a cache entry.
+
+Risk is bounded: the curated 8-config sweep means bucket-winner
+variance is small. But the two LTX shapes have different winners
+(stage-1: num_warps=4 num_stages=2; stage-2: num_warps=8
+num_stages=4), so bucketing could land a sub-optimal config on a
+neighbor M.
+
+**Trigger to act:** user feedback that first-render-per-shape
+autotune-cost is painful across workflow variations, OR audio-loop
+reports cycling through M values frequently in their consumer flow.
+
 ### Extract `tests/_helpers.py` for shared `make_qkv` + `require_cuda`
 
 Four standalone test files now duplicate near-identical scaffolding:
@@ -454,7 +499,7 @@ sufficient.
 
 ## Versions
 
-### v0.6.0 -- 2026-05-15  (sage_ffn: fp8-native two-kernel fused MLP for LTX 2.3-class FFN blocks on sm89)
+### v0.6.0 -- 2026-05-15  (sage_ffn: fp8-native two-kernel fused MLP for LTX 2.3-class FFN blocks on sm89 -- ships as completeness primitive, not currently a perf win in production)
 
 Ships `sage_ffn(x, w1, s1, w2, s2)` -- a Triton two-kernel
 `Linear(fp8) -> GELU(tanh) -> Linear(fp8)` MLP path for DiT
@@ -501,15 +546,70 @@ hardcoded 8-config winners deliver 1.33-1.36x / 1.26-1.27x; full
 sweep delivers 1.33x / 1.27x. Bit-identical mean_rtol; hardcoded
 matches full-sweep perf within run-to-run noise.
 
-**Real-world e2e wall-time impact: not yet measured.** Several
-production factors can shift the ratio either way: L2 cache
-contention from neighboring sub-modules in the DiT block, GPU
-thermal/clock state during sustained renders, ComfyUI's
-model-patching machinery overhead. The v0.5.5 precedent showed
-that synthetic kernel-bench numbers project but don't substitute
-for in-pipeline measurement. The number that fills this gap will
-come from a downstream consumer's A/B against a chunking-only
-baseline.
+**Production result: sage_ffn is slower than torch in the tested
+workload. Ships as completeness primitive, not a perf win.**
+
+In-pipeline A/B on a two-sampler LTX 2.3 FML2V multi-guide
+workflow (768x512x97, 8-step stage-1 + 3-step stage-2 refine, on
+a 4090 under `nodynvram`, 4 renders interleaved
+treatment/baseline/treatment/baseline in the same ComfyUI
+session):
+
+| metric | baseline (chunking only) | treatment (sage_ffn + chunking) | delta |
+|---|---|---|---|
+| wall-time avg | 148.51s | 151.17s | **+1.79% slower** |
+| ff @ T=10780 med ms/call | 10.36 | 10.67 | +3.0% slower |
+| ff @ T=42240 med ms/call | 48.77 | 58.58 | **+20.1% slower** |
+| All non-FFN sub-modules | unchanged | unchanged | 1.00x (identity) |
+
+Per-call FFN times for the warm-autotune treatments (#2 and #4)
+matched the cold-autotune treatment (#1), so the regression is
+not autotune amortization. Patching surface is clean -- attention
+sub-modules at 1.00x ratio confirm the regression is FFN-specific.
+
+**Why the synthetic 1.27-1.36x didn't translate:**
+
+1. **L2 cache contention with neighboring sub-modules.** Synthetic
+   bench ran FFN alone with warm L2 holding its tensors.
+   Production runs `attn1` (~107 ms at T=42240, large working set)
+   immediately before `ff` at stage-2; the attention pass evicts
+   FFN's L2 residency. The X-tile-lives-in-L2 assumption from the
+   day-3 perf analysis breaks when L2 is hostile. Cold-L2 FFN is
+   bandwidth-bound, no fp8-vs-bf16 advantage realized. Worse at
+   stage-2 (4x the working set, more HBM round-trips) matches the
+   shape of the regression (+20% at T=42240 vs +3% at T=10780).
+2. **Cumulative kernel-launch overhead at LTX call count.** LTX
+   2.3 fires ~1056 ff calls per render across transformer blocks.
+   sage_ffn is two kernel launches per call (matmul+GELU, then
+   matmul). torch reference is one cuBLASLt call per matmul. The
+   per-call launch-overhead delta scales with that 1000+ count.
+
+This is the v0.5.5 precedent playing out a second time: synthetic
+kernel-bench numbers project a wedge, in-pipeline A/B reveals
+that production conditions (cache contention, dispatch overhead,
+neighboring-module behavior) change the picture. The synthetic
+numbers above are real measurements of the kernel in isolation
+and are not retracted -- they characterize what the kernel can
+do under ideal conditions, which is useful information for
+future kernel work. They are not the delivered consumer-app
+number.
+
+**What this means for users:**
+
+- Keep `LTXVChunkFeedForward` (KJNodes) as the production
+  default; don't replace it with `AudioLoopHelperSageFFN` or
+  equivalent expecting a speedup.
+- `sage_ffn` is available for users who specifically need an
+  fp8-native fused MLP for ComfyUI consumer-app on sm89 (no
+  other library provides this combination). The "uncontested
+  availability" wedge holds; the "delivered speedup" wedge does
+  not on the tested workload.
+- Different workload shapes may differ from this result -- the
+  L2-contention picture depends on what other modules are
+  active and what their working sets look like. Single-pass
+  (non-multi-guide) workloads in particular may behave
+  differently. In-pipeline measurement is the gate, not
+  synthetic bench.
 
 **Design: two-kernel split, not single-kernel fusion.** Kernel 1
 matmul + GELU(tanh) epilogue + write intermediate. Kernel 2
@@ -544,23 +644,31 @@ full sweep at the same env). To re-derive winners for a new
 LTX-class shape: run the kernel against the shape, inspect
 `_fp8_matmul_gelu_kernel.cache` for the picked config.
 
-**E2e wall-time projection (NOT measured).** At an FFN-time-share
-of 24-27% for LTX 2.3 multi-guide workloads, the synthetic
-1.27-1.33x FFN speedup would project to roughly 4-7% e2e
-reduction *if* synthetic numbers hold in production. They may
-not -- see "Real-world e2e wall-time impact" above. The
-qualitative wedge is what's load-bearing for consumer framing;
-absolute e2e numbers will land when a downstream A/B has run.
-The synthetic fp8-native ceiling is closer to 1.5-2x; the gap
-to delivered 1.27-1.33x is explained by Triton's matmul codegen
-vs cuBLASLt's hand-tuned kernels.
+**Why the synthetic numbers stay in the docs.** The 1.27-1.36x
+synthetic-bench delta is a real, measurable property of the
+kernel running in isolation against `F.linear(F.gelu(F.linear(...
+)))` with bf16-dequant weights. Removing those numbers would
+hide useful information about the kernel's isolation behavior
+(relevant for future kernel-day work, e.g. evaluating whether a
+v0.6.1 redesign actually moves the isolation number). The
+discipline lesson is "don't *promote* the synthetic number as a
+delivered consumer-app speedup" -- not "don't measure synthetic
+performance."
 
-**Composes with chunking, doesn't replace it.** Users with a
-chunking node already in place (the common case on 24 GiB
-cards) keep the chunking and gain the FFN wall-time win on each
-chunk's matmul. Users with 32+ GiB headroom can drop chunking
-and run `sage_ffn` against the full multi-guide tensor at the
-cost of the 1.47 GiB intermediate.
+**Paths to close the production gap (v0.6.1 candidates, not
+v0.6.0 blockers):**
+
+1. **Persistent-CTA two-kernel hybrid** (the option (b') flagged
+   in the scoping doc). Persistent CTAs hold M-tile state in
+   registers / L2 across the two matmuls, addressing the
+   L2-contention root cause directly. Significantly more kernel
+   engineering than v0.6.0.
+2. **CUTLASS-based CUDA backend** for the fp8 matmul. Closes the
+   Triton-vs-cuBLASLt codegen gap that bounds the synthetic
+   ceiling at 1.27-1.36x; unclear whether it would also recover
+   the production loss. 2-3 weeks of work.
+
+Neither blocks v0.6.0 ship. See Backlog for triggers.
 
 **API.**
 
