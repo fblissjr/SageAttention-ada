@@ -171,7 +171,8 @@ def main() -> int:
 
     # Record the sage module path as basename only to avoid leaking
     # the absolute venv path into committed bench output.
-    sage_module_path = Path(sageattention.__file__)
+    # sageattention.__file__ is typed `str | None` per Pyright; guard.
+    sage_module_path = Path(sageattention.__file__ or "<unknown>")
     sage_module_basename = f".../{sage_module_path.parent.name}/{sage_module_path.name}"
 
     summary = {

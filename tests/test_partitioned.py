@@ -8,9 +8,9 @@ Spec (from partitioned_sage_entry_plan.md):
     full-Q-shaped tensor.
 
 `slices` is `list[(q_start, q_end, attn_mask | None)]`. Mask shapes
-mirror the Kijai PR 13735 pattern: `(1, 1, 1, kv_len)` (broadcast
-across all Q rows in the slice) or `(1, 1, q_end - q_start, kv_len)`
-(per-Q-row).
+mirror the LTX 2.3 guide-mask partition pattern: `(1, 1, 1, kv_len)`
+(broadcast across all Q rows in the slice) or
+`(1, 1, q_end - q_start, kv_len)` (per-Q-row).
 
 Tolerances reuse `accuracy_metrics` from test_sageattn_ltx_shapes so
 the calibration matches every other rtol-vs-Triton row in the repo:
@@ -18,7 +18,7 @@ mean_rtol < 0.05, max_rtol < 0.5 (derived from v0.4.1 LTX self-attn
 logs).
 
 Edge cases:
-    - 2-slice Kijai-PR pattern with unaligned boundary (load-bearing)
+    - 2-slice partition with unaligned boundary (load-bearing)
     - 1-slice noisy-only (tracked_count=0)
     - 1-slice tracked-only (guide_start=0)
     - 2-slice with aligned boundary (control)
@@ -155,7 +155,7 @@ def main() -> int:
     # BLOCK_M=128 block layout.
     assert 1996 % 128 == 76, "unaligned boundary precondition"
 
-    cases_kijai_2call: list[SliceCase] = [
+    cases_two_call_unaligned: list[SliceCase] = [
         SliceCase(q_start=0, q_end=1996, mask_q_dim=1),
         SliceCase(q_start=1996, q_end=2048, mask_q_dim=52),
     ]
@@ -165,16 +165,16 @@ def main() -> int:
     cases_only_tracked: list[SliceCase] = [
         SliceCase(q_start=0, q_end=2048, mask_q_dim=2048),
     ]
-    cases_aligned: list[SliceCase] = [
+    cases_two_call_aligned: list[SliceCase] = [
         SliceCase(q_start=0, q_end=1920, mask_q_dim=1),
         SliceCase(q_start=1920, q_end=2048, mask_q_dim=128),
     ]
 
     results: list[TestResult] = [
-        run_case("kijai_2call_unaligned_boundary", cases_kijai_2call),
+        run_case("two_call_unaligned_boundary", cases_two_call_unaligned),
         run_case("single_slice_noisy_only", cases_only_noisy),
         run_case("single_slice_tracked_only", cases_only_tracked),
-        run_case("kijai_2call_aligned_boundary", cases_aligned),
+        run_case("two_call_aligned_boundary", cases_two_call_aligned),
     ]
 
     print("RESULTS")

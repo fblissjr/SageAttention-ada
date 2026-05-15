@@ -143,30 +143,40 @@ new path automatically; other archs still use the Triton fallback.
 
 ### Preliminary in-pipeline observation
 
-We ran one A/B comparison on a real LTX 2.3 multi-guide workflow
-(768x512x97, audio variant) on a 4090 with dynamic VRAM disabled.
-Only variable changed: the sage routing flag.
+We ran A/B comparisons on a real LTX 2.3 multi-guide workflow at
+768x512x97 on a 4090 with dynamic VRAM disabled. Updated count
+after additional repetitions:
 
-| arm | result |
+| arm | outcome |
 |---|---|
-| v0.5.5 fp8_cuda++ masked path | completed, 1056 masked dispatches, no OOM |
-| Triton fallback (`sageattn_qk_int8_pv_fp16_triton`) | OOM at stage-1 step 0 |
+| fp8_cuda++ masked path + FFN chunking ON | N=3+ success, 0 OOM |
+| Triton masked fallback + FFN chunking ON | N=1 success, N=2 OOM (non-deterministic) |
+| fp8_cuda++ masked path + FFN chunking OFF | deterministic OOM at stage-2 FFN GELU |
 
-The OOM is at `AdaLNSingle.linear` (downstream of attention) -- 727 MiB
-requested, 16 MiB free. Inferred cause: Triton's per-call working set
-(`q_int8` + `k_int8` + `v->fp16` + output) cumulated across ~48
-transformer layer dispatches leaves no headroom for stage-1's
-activation budget on a 24 GiB card. fp8_cuda++'s smaller per-call
-working set means the same render fits.
+Both Triton OOMs hit `AdaLNSingle.linear` (downstream of attention) --
+727 MiB requested, ~16 MiB free, after 48 masked dispatches. The
+chunking-off fp8++ OOM hits the FFN GELU projection at the
+multi-guide expanded shape (proj output `(1, 44880, 16384)` bf16 ≈
+1.47 GiB).
 
-**This is one observation, not a result.** N=1 on the OOM arm, N=3
-on the success arm. We're collecting more repetitions and a
-smaller-mask variant to firm up reproducibility. Don't take "the
-fork fixes OOM" as established -- take it as "looks promising, more
-testing needed." The bench-mode A/B recipe is reproducible: same
-workflow + flip the sage routing flag + ComfyUI flags
-`--disable-dynamic-vram --disable-async-offload --reserve-vram 0
---cuda-malloc --cache-none`. Independent reproduction welcome.
+**Honest reading**: at this workload scale on 24 GiB, the
+`LTXVChunkFeedForward` FFN-chunking node is doing the heavy lifting
+on peak memory. *With chunking on*, sage choice matters at the
+margin -- the v0.5.5 CUDA mask path has more headroom for the
+attention-side delta than the Triton fallback. *Without chunking*,
+both kernels hit a different (FFN-intermediate) memory wall.
+
+So the in-pipeline observation is "with FFN chunking enabled, the
+v0.5.5 CUDA mask path tolerates the workload more reliably than
+the Triton fallback (N=3+ vs N=1 success in the observed sample)."
+This is preliminary, small-N, and contingent on chunking being
+present. **Don't take "the fork fixes OOM" as established** -- take
+it as "looks promising at the margin, more testing needed, and FFN
+chunking is doing most of the load-bearing memory work upstream."
+The A/B recipe is reproducible: same workflow + flip the sage
+routing flag + ComfyUI flags `--disable-dynamic-vram
+--disable-async-offload --reserve-vram 0 --cuda-malloc --cache-none`.
+Independent reproduction welcome.
 
 ### Things we have NOT measured
 

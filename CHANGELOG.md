@@ -463,10 +463,10 @@ additive attn_mask to QK scores before the softmax max reduction,
 matching the Triton reference's behavior. Dispatcher routes masked
 calls on sm89 + CUDA >= 12.8 to the new path.
 
-Triggered by Comfy-Org/ComfyUI PR 13735 (LTX 2.3 self-attn guide
-masks) firing the "1 high-leverage surface" clause of the
-structural-correctness trigger (added in v0.5.4 backlog
-reformulation). Scoping note + implementation discipline in
+Triggered by a high-leverage downstream consumer surface raising
+the structural-correctness concern (the "1 high-leverage surface"
+clause added in v0.5.4 backlog reformulation). Scoping note +
+implementation discipline in
 `internal/design/cuda_mask_kernel_scoping.md` (gitignored).
 
 #### Added
@@ -540,68 +540,72 @@ are no-ops. The 0.055 masked-vs-unmasked atol confirms the mask is
 actually applied (not silently dropped, which would produce 0 atol
 like pre-v0.5.5).
 
-#### Measured (in-pipeline, preliminary)
+#### Measured (in-pipeline, preliminary; framing softened 2026-05-15)
 
 Beyond the synthetic correctness + perf measurements above, we ran
-an A/B comparison on a real LTX 2.3 workflow (FML2V multi-guide at
-768×512×97, audio variant) on a 4090 with dynamic VRAM disabled
+A/B comparisons on a real LTX 2.3 workflow (multi-guide at
+768×512×97) on a 4090 with dynamic VRAM disabled
 (`--disable-dynamic-vram --disable-async-offload --reserve-vram 0
 --cuda-malloc --supports-fp8-compute --mmap-torch-files
---cache-none`). The only variable changed between arms was the sage
-routing flag: `auto` (lands on v0.5.5's fp8_cuda++ masked path) vs
-`auto_mask_aware` (forces masked calls to
-`sageattn_qk_int8_pv_fp16_triton`).
+--cache-none`). Updated count after additional repetitions:
 
-| arm | result |
+| arm | outcome |
 |---|---|
-| auto -> v0.5.5 fp8_cuda++ masked | completed cleanly; 1056 masked self-attn dispatches; 0 fallbacks |
-| auto_mask_aware -> fp16_triton masked | **OOM at stage-1 step 0** after 48 masked dispatches |
+| `auto` (v0.5.5 fp8_cuda++ masked) + FFN chunking ON | N=3+ success, 0 OOM |
+| `auto_mask_aware` (Triton masked) + FFN chunking ON | N=1 success, N=2 OOM (non-deterministic) |
+| `auto` (fp8_cuda++) + FFN chunking OFF | deterministic OOM at stage-2 FFN GELU |
 
-The OOM is at `comfy/ldm/lightricks/model.py:242`
-(`AdaLNSingle.linear`, downstream of attention): allocation
-requested 727 MiB, free 16 MiB, currently allocated 22.40 GiB on a
-23.52 GiB device. Inferred cause: Triton's per-call working set
-(`q_int8` + `k_int8` + `v.to(fp16)` + output) cumulated across ~48
-transformer layer dispatches leaves no headroom for stage-1's
-activation budget on a 24 GiB card. fp8_cuda++'s smaller per-call
-working set means the same render fits.
+Both Triton OOMs hit the same site
+(`comfy/ldm/lightricks/model.py` `AdaLNSingle.linear`,
+downstream of attention; 727 MiB requested, ~16 MiB free,
+~22.4 GiB allocated of 23.52 GiB), at exactly 48 masked dispatches.
+The chunking-off fp8++ OOM hits the FFN GELU projection at
+multi-guide T=44880 (proj output `(1, 44880, 16384)` bf16 ≈ 1.47 GiB).
 
-Per-shape masked p50 latency (auto arm, single-run sample):
-`(1, 41360, 4096)` ≈ 285 μs / `(1, 10340, 4096)` ≈ 167 μs.
-Run-to-run variance at the larger shape is real
-(observed 11.7 ms vs 30.2 ms median across two repetitions; likely
-autotune-cache warmth + per-call mask sparsity); don't read these
-as precision numbers.
+**The corrected reading (after the chunk-bypass A/B)**: at LTX 2.3
+multi-guide scale on 24 GiB, FFN chunking (`LTXVChunkFeedForward`)
+is doing the heavy lifting on peak memory. With chunking on, the
+attention working-set delta between Triton and fp8++ is the knob
+that distinguishes "fits comfortably" (fp8++) from "fits 1/3 of the
+time" (Triton non-determ OOM at AdaLN). Without chunking, both
+kernels hit a different (FFN-intermediate) memory wall.
 
-**Status**: preliminary. The observation is currently N=1 on the OOM
-arm + N=3 on the success arm. More repetitions and a smaller-mask
-variant are in progress. The synthetic measurements above are the
-primary v0.5.5 validation; this in-pipeline observation is the
-strongest corroboration so far and is reproducible by anyone who
-wants to test (same workflow + the routing flag flip + nodynvram
-config).
+So the honest claim becomes: **with FFN chunking enabled, sage's
+v0.5.5 CUDA mask path has more headroom for the attention-side
+delta than the Triton fallback** (N=3+ vs N=1 success in the
+observed sample). The earlier framing -- "fits where Triton
+doesn't" -- was incomplete; sage choice is the second-order win
+once chunking handles the first-order FFN memory cost.
 
-Interpretation: v0.5.5 is shaping up as a memory-side win rather
-than purely a perf win -- on sm89 + CUDA >= 12.8, masked LTX 2.3
-workflows that couldn't fit in 24 GiB via the Triton fallback fit
-via the native CUDA mask path. Independent reproduction welcome;
-the framing will firm up as more data lands.
+Per-shape masked p50 latency (successful arm, single-run sample):
+`(1, 10780, 4096)` masked Triton 195 μs vs fp8++ unmasked 158 μs;
+`(1, 44880, 4096)` masked Triton 482 μs vs fp8++ unmasked 249 μs.
+Run-to-run variance at the larger shape is real and not yet
+attributed (autotune-cache warmth, per-call mask sparsity, thermal
+state are all candidates); don't read p50 as precision.
+
+**Status**: preliminary. Sample sizes are small; the Triton OOM is
+non-deterministic; further repetitions and a smaller-mask variant
+test are in progress. The synthetic measurements above remain the
+primary v0.5.5 validation. The in-pipeline observation is
+corroboration that's reproducible by anyone with the same workflow,
+the routing flag flip, and the nodynvram config -- independent
+reproduction welcome.
 
 What's deferred and on what triggers: see Backlog / "Extend CUDA mask
 support beyond sm89 fp8++".
 
 ### v0.5.4 -- 2026-05-13  (sageattn_partitioned + multi-slice peak-HBM bench + honest negative result on the masked-call scenario)
 
-Driven by a consumer-side report (Comfy-Org/ComfyUI PR 13735, LTX
-2.3 self-attn guide masks) that the masked Triton path OOM'd on a
-4090 when the PR partitioned Q into noisy + tracked slices and
-fired two back-to-back `sageattn_qk_int8_pv_fp16_triton` calls per
-layer with the same K, V. Hypothesis: each call re-quantizing K
-and re-casting V is the removable peak-HBM lever. Built the entry,
-measured against the hypothesis, found the masked-call scenario
-already efficient enough that the entry doesn't help in synthetic
-isolation. Documented for future consumers and Phase 4 real-pipeline
-validation.
+Driven by a consumer-side report that the masked Triton path
+OOM'd on a 4090 in a workflow that partitions Q into noisy + tracked
+slices and fires two back-to-back `sageattn_qk_int8_pv_fp16_triton`
+calls per layer with the same K, V. Hypothesis: each call
+re-quantizing K and re-casting V is the removable peak-HBM lever.
+Built the entry, measured against the hypothesis, found the
+masked-call scenario already efficient enough that the entry doesn't
+help in synthetic isolation. Documented for future consumers and
+real-pipeline validation.
 
 #### Added
 
@@ -629,23 +633,24 @@ validation.
 
 - **`tests/bench/partitioned_mask_phase0/`** -- peak-HBM
   characterization at the LTX 2.3 self-attn shape (T=23296, h=32,
-  d=128, bf16) for the Kijai PR partition pattern. Six
-  measurement rows: single-call no-mask reference, single-call
-  with broadcast `(1,1,1,T)` mask, 2-independent-call cumulative
-  no-mask, 2-independent-call cumulative with-mask,
-  `sageattn_partitioned` no-mask, `sageattn_partitioned`
-  with-mask. Reports savings vs the 2-independent-call baseline.
-  Checked-in `results.json` + memory snapshot for the audit
-  trail; uncorrected wrong-mask-shape variants preserved as
-  `*.uncorrected.{json,bin}` (caught by a sister-clone grep of
-  the actual PR diff).
+  d=128, bf16) for the two-call partition pattern (noisy + tracked
+  slices sharing K, V). Six measurement rows: single-call no-mask
+  reference, single-call with broadcast `(1,1,1,T)` mask,
+  2-independent-call cumulative no-mask, 2-independent-call
+  cumulative with-mask, `sageattn_partitioned` no-mask,
+  `sageattn_partitioned` with-mask. Reports savings vs the
+  2-independent-call baseline. Checked-in `results.json` + memory
+  snapshot for the audit trail; uncorrected wrong-mask-shape
+  variants preserved as `*.uncorrected.{json,bin}` (caught by a
+  sister-clone audit of the actual mask shapes the consumer
+  workflow uses).
 
 #### Measured: synthetic Phase 0 + Phase 3 result
 
 At the LTX 2.3 self-attn shape on RTX 4090, the 2-call
 partition's cumulative peak HBM:
 
-| call pattern | no mask | with PR-shape masks |
+| call pattern | no mask | with two-call partition masks |
 |---|---|---|
 | single full-T call (reference) | 1096 MiB | 1096 MiB |
 | 2 independent sage calls (cumulative) | 1807 MiB | 1272 MiB |
@@ -654,7 +659,7 @@ partition's cumulative peak HBM:
 
 The partitioned entry saves +279 MiB in the no-mask isolation
 (as predicted: K-quant + V-cast amortization is real). But in
-the masked-call scenario -- the Kijai-relevant one -- the
+the masked-call scenario -- the originating use case -- the
 2-independent-call cumulative peak is already only +176 MiB
 above the single-call reference, and the partitioned entry
 doesn't reduce it further. Cross-clone hypothesis (filed by the
@@ -666,14 +671,14 @@ K-first / V-first / output-first pattern. Not investigated;
 matches the observed asymmetry.
 
 **Net for the originating use case**: the partitioned entry
-doesn't address the Kijai OOM in synthetic measurement. Phase 4
-real-pipeline validation (run on the sister-clone side with the
-LTX denoiser loaded, against fragmented post-model-load allocator
-state) may show a different picture; sage-fork side considers
-that an open question. The entry stays shipped because (a) it's
-correct, (b) the no-mask savings are real for any future
-consumer that hits a similar pattern without masks, and (c) it
-provides the primitive to test against in Phase 4.
+doesn't address the consumer-reported OOM in synthetic measurement.
+Real-pipeline validation (sister-clone side with the LTX denoiser
+loaded, against fragmented post-model-load allocator state) may
+show a different picture; sage-fork side considers that an open
+question. The entry stays shipped because (a) it's correct, (b) the
+no-mask savings are real for any future consumer that hits a similar
+pattern without masks, and (c) it provides the primitive to test
+against in real-pipeline scenarios.
 
 
 

@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
-"""Phase 0 measurement: peak HBM for the Kijai-PR-13735 Q-partition pattern.
+"""Phase 0 measurement: peak HBM for a two-call Q-partition pattern.
 
-Context: ComfyUI PR 13735 (LTX 2.3 self-attn guide masks) partitions Q
-into two groups -- noisy `[0, guide_start)` and tracked
-`[guide_start, guide_start + tracked_count)` -- and fires two back-to-
-back `sageattn_qk_int8_pv_fp16_triton` calls per layer with the same
-K, V. Each call independently re-quantizes K and re-casts V to fp16
-even though K, V are identical across calls.
+Context: a downstream consumer workflow (LTX 2.3 self-attn guide
+masks) partitions Q into two groups -- noisy `[0, guide_start)` and
+tracked `[guide_start, guide_start + tracked_count)` -- and fires
+two back-to-back `sageattn_qk_int8_pv_fp16_triton` calls per layer
+with the same K, V. Each call independently re-quantizes K and
+re-casts V to fp16 even though K, V are identical across calls.
 
-PR's actual mask shapes (from `GuideAttentionMask.__init__` in
-`comfy/ldm/lightricks/model.py`):
+The consumer's mask shapes (broadcast-minimal to avoid an
+`(1, 1, T, T)` dense-mask blowup):
   noisy_mask   : (1, 1, 1, T)             bf16  -- broadcast across all noisy Q rows
   tracked_mask : (1, 1, tracked_count, T) bf16
-These are NOT (1, 1, q_slice, kv_len) bool masks; the PR deliberately
-keeps masks minimal to avoid the (1, 1, T, T) dense-mask blowup.
 
 Open question this bench answers: does pytorch's caching allocator
 reuse the K_int8 / V_fp16 buffers across the two calls, or does the
@@ -49,13 +47,13 @@ class SliceSpec(NamedTuple):
     name: str
     q_start: int
     q_end: int
-    # 1 = broadcast across all Q rows in this slice (PR noisy_mask shape);
-    # q_end - q_start = one row per Q row (PR tracked_mask shape).
+    # 1 = broadcast across all Q rows in this slice (noisy-mask shape);
+    # q_end - q_start = one row per Q row (tracked-mask shape).
     mask_q_dim: int
 
 
-def make_kijai_partition(total_t: int, guide_start: int, tracked_count: int) -> list[SliceSpec]:
-    """Match Kijai's PR 13735 partition: 2 calls, noisy + tracked."""
+def make_two_call_partition(total_t: int, guide_start: int, tracked_count: int) -> list[SliceSpec]:
+    """Two-call partition: noisy + tracked slices sharing K, V."""
     assert 0 < guide_start < total_t
     assert tracked_count > 0
     tracked_end = guide_start + tracked_count
@@ -187,7 +185,7 @@ def main() -> int:
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     device = torch.device("cuda")
 
-    slices = make_kijai_partition(args.seq, args.guide_start, args.tracked_count)
+    slices = make_two_call_partition(args.seq, args.guide_start, args.tracked_count)
     partition_name = " + ".join(
         f"{s.name}[{s.q_start}:{s.q_end}] mask_q={s.mask_q_dim}" for s in slices
     )

@@ -205,8 +205,9 @@ research hour. Five patterns to look for:
    on non-sm89 archs). **Historical measurement (2026-04-27, pre-v0.5.5):**
    K ~= 1.57 at kv=226 (triton 1.16ms / fp8++ 0.74ms); the work was
    not perf-justified at that ratio. The structural-correctness
-   trigger fired instead (v0.5.4 backlog reformulation + Comfy-Org/
-   ComfyUI PR 13735), which is what actually moved the work to land.
+   trigger fired instead (v0.5.4 backlog reformulation -- a
+   high-leverage downstream consumer surface raised it), which is what
+   actually moved the work to land.
 
 ## What we explicitly ignore -- and the trigger that would change that
 

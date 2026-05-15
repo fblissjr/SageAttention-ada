@@ -477,10 +477,11 @@ def sageattn_partitioned(
     no amortization to gain there). The inner Triton kernel writes
     each slice's output into a view of the pre-allocated full output.
 
-    Targets the LTX 2.3 guide-mask 2-call partition pattern from
-    Comfy-Org/ComfyUI PR 13735, where stock sageattn() called N times
-    with the same K, V would re-quantize K and re-cast V every call.
-    See tests/bench/partitioned_mask_phase0/ for the peak-HBM
+    Targets multi-slice Q partition patterns (e.g. LTX 2.3 guide-mask
+    workflows that split Q into noisy + tracked groups and dispatch
+    per-group) where stock sageattn() called N times with the same K, V
+    would re-quantize K and re-cast V every call. See
+    tests/bench/partitioned_mask_phase0/ for the peak-HBM
     characterization.
 
     Parameters
