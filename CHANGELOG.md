@@ -474,12 +474,19 @@ tensor cores at ~330 TFLOPS instead of fp8 tensor cores at
 in fp8.
 
 **Synthetic-bench numbers (RTX 4090, CUDA 13.0, torch 2.12.0+cu130,
-triton 3.7.0):**
+triton 3.7.0), bias-inclusive path (matches LTX 2.3 distilled
+checkpoint, which carries bf16 biases on both `ff.net.0.proj` and
+`ff.net.2`):**
 
 | shape | mean_rtol vs torch ref | sage_ffn | torch ref | speedup |
 |---|---|---|---|---|
-| stage-1 (T=10780, h=4096, inner=16384) | 0.0915 | 13.7 ms | 18.2 ms | **1.33x** |
-| stage-2 (T=44880, multi-guide expanded) | 0.0914 | 59.7 ms | 75.7 ms | **1.27x** |
+| stage-1 (T=10780, h=4096, inner=16384) | 0.0914 | 13.3 ms | 18.1 ms | **1.36x** |
+| stage-2 (T=44880, multi-guide expanded) | 0.0914 | 59.8 ms | 75.3 ms | **1.26x** |
+
+Bias-free path (sanity check that the `HAS_BIAS=False` constexpr
+branch is wired correctly) lands at 1.33x / 1.26x, mean_rtol 0.0915
+/ 0.0914 -- statistically identical to the bias-inclusive path
+(bias is an epilogue offset, not in the inner matmul loop).
 
 These are standalone matmul-GELU-matmul measurements against
 randomly-initialized weights, not end-to-end ComfyUI rendering.
@@ -490,9 +497,9 @@ outside the timing loop -- i.e. torch's best-case fp8-weight path,
 not its naive one.
 
 Validated against the full 126-config sweep at the same env:
-hardcoded 8-config winners deliver 1.33x / 1.27x; full sweep
-delivers 1.33x / 1.27x. Bit-identical numerics, hardcoded matches
-full-sweep perf within run-to-run noise.
+hardcoded 8-config winners deliver 1.33-1.36x / 1.26-1.27x; full
+sweep delivers 1.33x / 1.27x. Bit-identical mean_rtol; hardcoded
+matches full-sweep perf within run-to-run noise.
 
 **Real-world e2e wall-time impact: not yet measured.** Several
 production factors can shift the ratio either way: L2 cache
@@ -555,6 +562,15 @@ chunk's matmul. Users with 32+ GiB headroom can drop chunking
 and run `sage_ffn` against the full multi-guide tensor at the
 cost of the 1.47 GiB intermediate.
 
+**API.**
+
+`sage_ffn(x, w1, w1_scale, w2, w2_scale, b1=None, b2=None)`. The
+optional `b1` (inner,) and `b2` (hidden,) bf16 biases match the
+LTX 2.3 distilled checkpoint's FFN layout (`nn.Linear(...,
+bias=True)` defaults on both projections). When a bias is `None`,
+the kernel's `HAS_BIAS=False` constexpr branch compiles the load
+out -- no runtime cost on the bias-free path.
+
 **Limitations / scope.**
 
 - Plain GELU MLP only. No gated SwiGLU/GEGLU variant in v0.6;
@@ -564,6 +580,9 @@ cost of the 1.47 GiB intermediate.
   and falls through to `F.linear` for bf16 blocks.
 - Per-tensor scalar weight scale only. Per-row / per-channel
   weight scales are a v0.6.1 extension if a workload demands.
+- Bias must be bf16. Casting to bf16 at quantization time is
+  trivial; pre-quant bias scales are not supported (biases are
+  small, fp8 is overkill for them).
 - Not wired into `sageattn()` -- this is a separate FFN primitive,
   not an attention kernel. Consumer imports `sage_ffn` directly.
 

@@ -31,11 +31,19 @@ Run with the venv that has sage installed active:
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import NamedTuple
 
 import torch
 import triton
 import triton.language as tl
+
+from sageattention.triton.fused_mlp_fp8 import FP8_E4M3_MAX
+
+# Reuse the symmetric-denominator rtol helper used by every other
+# accuracy bench in this repo.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from test_sageattn_ltx_shapes import accuracy_metrics  # type: ignore[import-not-found]
 
 
 # LTX 2.3 FFN shape constants -- hidden = 4096, inner = 16384, bf16 act.
@@ -93,12 +101,10 @@ def quantize_per_token_fp8(x_bf16: torch.Tensor, fp8_dtype=torch.float8_e4m3fn) 
     Returns (x_fp8, scales_f32). scales_f32 has shape (M,) -- one scalar per row.
     Quantization: x_fp8 = round(x_bf16 / scale * fp8_max); scale = abs(x_row).max() / fp8_max.
     """
-    M = x_bf16.shape[0]
     x_f32 = x_bf16.float()
-    fp8_max = 448.0  # E4M3 max representable
     abs_max = x_f32.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
-    scales = (abs_max / fp8_max).squeeze(-1)  # (M,)
-    x_scaled = (x_f32 / abs_max * fp8_max).clamp(-fp8_max, fp8_max)
+    scales = (abs_max / FP8_E4M3_MAX).squeeze(-1)  # (M,)
+    x_scaled = (x_f32 / abs_max * FP8_E4M3_MAX).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
     x_fp8 = x_scaled.to(fp8_dtype)
     return x_fp8, scales.to(torch.float32)
 
@@ -122,8 +128,8 @@ def run_spike(M: int, N: int, K: int, BLOCK_M: int, BLOCK_N: int, BLOCK_K: int, 
     # fp8 weight with a per-tensor scalar scale (matches LTX 2.3 distilled checkpoint)
     W_f32 = torch.randn(N, K, dtype=torch.float32, device=device) * 0.02  # small init
     W_max = W_f32.abs().amax()
-    W_scale = (W_max / 448.0).item()
-    W_fp8 = (W_f32 / W_max * 448.0).to(torch.float8_e4m3fn)
+    W_scale = (W_max / FP8_E4M3_MAX).item()
+    W_fp8 = (W_f32 / W_max * FP8_E4M3_MAX).to(torch.float8_e4m3fn)
 
     # On-the-fly activation quantization (per-token / per-row)
     X_fp8, X_scales = quantize_per_token_fp8(X_bf16)
@@ -152,15 +158,7 @@ def run_spike(M: int, N: int, K: int, BLOCK_M: int, BLOCK_N: int, BLOCK_K: int, 
     W_bf16_ref = (W_fp8.float() * W_scale).to(torch.bfloat16)
     ref = torch.matmul(X_bf16, W_bf16_ref.T)
 
-    # Rtol comparison
-    a = out.float()
-    e = ref.float()
-    diff = (a - e).abs()
-    eps = torch.finfo(a.dtype).eps
-    rdiff = diff / torch.maximum(torch.maximum(a.abs(), e.abs()), torch.tensor(eps, device=device))
-    mean_rtol = rdiff.mean().item()
-    max_rtol = rdiff.max().item()
-    mean_atol = diff.mean().item()
+    mean_rtol, max_rtol, mean_atol, _ = accuracy_metrics(out, ref)
 
     print(f"  compiled: {compiled}")
     print(f"  mean_rtol={mean_rtol:.4f}  max_rtol={max_rtol:.4f}  mean_atol={mean_atol:.6f}")

@@ -17,7 +17,7 @@ The wedge against torch reference comes from fp8-native matmul on
 sm89: torch's bf16 matmul against fp8 weights has to dequant first
 (2x weight bandwidth, bf16 tensor cores); this kernel loads fp8
 weights directly and uses sm89 fp8 tensor cores. Delivered
-1.27-1.33x at LTX FFN shapes; theoretical ceiling is closer to
+1.26-1.36x at LTX FFN shapes; theoretical ceiling is closer to
 1.5-2x (gap is Triton's matmul codegen vs cuBLASLt's hand-tuning).
 
 Compose with an FFN-chunking node (e.g. `LTXVChunkFeedForward`) on
@@ -52,7 +52,7 @@ FP8_E4M3_MAX = 448.0
 #
 # Re-derive: run the 126-config sweep version (git history) on the new
 # shape, inspect `_fp8_matmul_gelu_kernel.cache` for the winner.
-_FP8_MATMUL_CONFIGS = [
+_FP8_MATMUL_GELU_CONFIGS = [
     # winners from LTX stage-1 / stage-2 sweep -- BLOCK_N=256 dominates kernel 1.
     triton.Config({"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 64}, num_warps=4, num_stages=2),
     triton.Config({"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 64}, num_warps=4, num_stages=3),
@@ -66,22 +66,24 @@ _FP8_MATMUL_CONFIGS = [
 ]
 
 
-@triton.autotune(configs=_FP8_MATMUL_CONFIGS, key=["M", "N", "K"])
+@triton.autotune(configs=_FP8_MATMUL_GELU_CONFIGS, key=["M", "N", "K"])
 @triton.jit
 def _fp8_matmul_gelu_kernel(
-    X_ptr, W_ptr, Out_ptr,
+    X_ptr, W_ptr, B_ptr, Out_ptr,
     W_scale,
     stride_xm, stride_xk,
     stride_wn, stride_wk,
     stride_om, stride_on,
     M, N, K,
+    HAS_BIAS: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    """Compute out = gelu_tanh(X @ W.T * scales) for one (BLOCK_M, BLOCK_N) tile.
+    """Compute out = gelu_tanh(X @ W.T * scales [+ bias]) for one (BLOCK_M, BLOCK_N) tile.
 
     Per-block-K activation quantization: each (BLOCK_M, BLOCK_K) chunk
     of X gets its own f32 scale, applied inline. Eliminates the
-    redundant K-pass that per-row quant would require.
+    redundant K-pass that per-row quant would require. If HAS_BIAS,
+    adds the (N,) bias broadcast across M before the GELU.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -105,6 +107,8 @@ def _fp8_matmul_gelu_kernel(
         # Per-block-K quantization: one scale per row within this chunk.
         x_abs_max = tl.max(tl.abs(x_chunk_f32), axis=1)
         # 448.0 = FP8_E4M3_MAX (inlined; @triton.jit can't read module globals).
+        # 1e-6 floor avoids 0/0 on all-zero activation tiles (rare but possible
+        # at sequence boundaries / padding rows).
         x_chunk_scale = tl.maximum(x_abs_max / 448.0, 1e-6)
 
         x_normalized = x_chunk_f32 / x_chunk_scale[:, None]
@@ -123,7 +127,14 @@ def _fp8_matmul_gelu_kernel(
     # Apply weight scale (scalar).
     acc = acc * W_scale
 
-    # GELU(approximate="tanh")
+    # Optional bias add (broadcast over M). HAS_BIAS is a constexpr so the
+    # no-bias path is compiled away; B_ptr can be any valid pointer when
+    # HAS_BIAS=False since the load is gated out.
+    if HAS_BIAS:
+        b = tl.load(B_ptr + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)
+        acc = acc + b[None, :]
+
+    # GELU(approximate="tanh"): 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     out = 0.5 * acc * (1.0 + tl.extra.libdevice.tanh(
         0.7978845608028654 * (acc + 0.044715 * acc * acc * acc)
     ))
@@ -150,18 +161,20 @@ _FP8_MATMUL_CONFIGS_K2 = [
 @triton.autotune(configs=_FP8_MATMUL_CONFIGS_K2, key=["M", "N", "K"])
 @triton.jit
 def _fp8_matmul_kernel(
-    X_ptr, W_ptr, Out_ptr,
+    X_ptr, W_ptr, B_ptr, Out_ptr,
     W_scale,
     stride_xm, stride_xn,
     stride_wk, stride_wn,
     stride_om, stride_ok,
     M, N, K,
+    HAS_BIAS: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
-    """Compute out = (X @ W.T) * scales for one (BLOCK_M, BLOCK_K) tile.
+    """Compute out = (X @ W.T) * scales [+ bias] for one (BLOCK_M, BLOCK_K) tile.
 
     Same per-block-N activation quant pattern as kernel 1 (here N is
-    the reduction dim). No GELU epilogue.
+    the reduction dim). If HAS_BIAS, adds the (K,) bias broadcast
+    across M after the matmul.
     """
     pid_m = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -183,6 +196,8 @@ def _fp8_matmul_kernel(
 
         x_abs_max = tl.max(tl.abs(x_chunk_f32), axis=1)
         # 448.0 = FP8_E4M3_MAX (inlined; @triton.jit can't read module globals).
+        # 1e-6 floor avoids 0/0 on all-zero activation tiles (rare but possible
+        # at sequence boundaries / padding rows).
         x_chunk_scale = tl.maximum(x_abs_max / 448.0, 1e-6)
 
         x_normalized = x_chunk_f32 / x_chunk_scale[:, None]
@@ -198,6 +213,10 @@ def _fp8_matmul_kernel(
 
     acc = acc * W_scale
 
+    if HAS_BIAS:
+        b = tl.load(B_ptr + offs_k, mask=offs_k < K, other=0.0).to(tl.float32)
+        acc = acc + b[None, :]
+
     out_ptrs = Out_ptr + offs_m[:, None] * stride_om + offs_k[None, :] * stride_ok
     out_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
     tl.store(out_ptrs, acc.to(tl.bfloat16), mask=out_mask)
@@ -209,6 +228,8 @@ def sage_ffn(
     w1_scale: float,
     w2: torch.Tensor,
     w2_scale: float,
+    b1: torch.Tensor | None = None,
+    b2: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Two-kernel fp8 MLP: out = Linear_out(GELU_tanh(Linear_in(x))).
 
@@ -218,6 +239,8 @@ def sage_ffn(
         w1_scale: scalar f32 weight scale for w1.
         w2: (hidden, inner) fp8 e4m3fn down-projection weight.
         w2_scale: scalar f32 weight scale for w2.
+        b1: optional (inner,) bf16 bias applied after Linear_in, before GELU.
+        b2: optional (hidden,) bf16 bias applied after Linear_out.
 
     Returns:
         (B, T, hidden) bf16 output.
@@ -231,32 +254,47 @@ def sage_ffn(
     inner = w1.shape[0]
     assert w1.shape == (inner, hidden)
     assert w2.shape == (hidden, inner)
+    if b1 is not None:
+        assert b1.is_cuda and b1.shape == (inner,) and b1.dtype == torch.bfloat16
+    if b2 is not None:
+        assert b2.is_cuda and b2.shape == (hidden,) and b2.dtype == torch.bfloat16
 
     M = math.prod(batch_dims)
 
-    x_flat = x.reshape(M, hidden).contiguous()
+    # The kernels take strides explicitly, so a non-contiguous reshape just
+    # needs the right strides. Common consumer path -- output of LayerNorm /
+    # Linear -- is already row-major contiguous; .reshape() returns a view
+    # for free. Falling into the .contiguous() slow path here would silently
+    # cost a full M*hidden HBM copy per call (44 blocks * 30 steps).
+    x_flat = x.reshape(M, hidden) if x.is_contiguous() else x.contiguous().reshape(M, hidden)
     intermediate = torch.empty(M, inner, dtype=torch.bfloat16, device=x.device)
     out_flat = torch.empty(M, hidden, dtype=torch.bfloat16, device=x.device)
 
-    # Autotune picks BLOCK_M / BLOCK_N / BLOCK_K + num_warps + num_stages.
+    # When a bias is None, pass any valid CUDA tensor as a placeholder;
+    # HAS_BIAS=False is a constexpr that compiles the load out.
+    b1_arg = b1 if b1 is not None else w1
+    b2_arg = b2 if b2 is not None else w2
+
     grid1 = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(inner, meta["BLOCK_N"]))
     _fp8_matmul_gelu_kernel[grid1](
-        x_flat, w1, intermediate,
+        x_flat, w1, b1_arg, intermediate,
         w1_scale,
         x_flat.stride(0), x_flat.stride(1),
         w1.stride(0), w1.stride(1),
         intermediate.stride(0), intermediate.stride(1),
         M, inner, hidden,
+        HAS_BIAS=b1 is not None,
     )
 
     grid2 = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(hidden, meta["BLOCK_K"]))
     _fp8_matmul_kernel[grid2](
-        intermediate, w2, out_flat,
+        intermediate, w2, b2_arg, out_flat,
         w2_scale,
         intermediate.stride(0), intermediate.stride(1),
         w2.stride(0), w2.stride(1),
         out_flat.stride(0), out_flat.stride(1),
         M, inner, hidden,
+        HAS_BIAS=b2 is not None,
     )
 
     return out_flat.reshape(*batch_dims, hidden)

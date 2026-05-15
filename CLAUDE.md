@@ -220,11 +220,12 @@ Sage exposes three surfaces to downstream consumers:
    still silently drop the mask and warn. If a consumer hand-picks a
    non-mask-correct CUDA kernel + mask, the v0.3.1 soft-warn fires;
    the dispatcher is the safe default.
-3. **`sage_ffn(x, w1, s1, w2, s2)`** (v0.6) -- a separate FFN
-   primitive, not an attention kernel. Two-kernel Triton fp8 MLP
-   (`Linear(fp8) -> GELU(tanh) -> Linear(fp8)`) targeting LTX
-   2.3-class FFN blocks (hidden=4096, inner=16384, per-tensor fp8
-   E4M3FN weights). Delivered 1.27-1.33x vs torch's fp8-dequant
+3. **`sage_ffn(x, w1, s1, w2, s2, b1=None, b2=None)`** (v0.6) -- a
+   separate FFN primitive, not an attention kernel. Two-kernel
+   Triton fp8 MLP (`Linear(fp8) -> GELU(tanh) -> Linear(fp8)`)
+   targeting LTX 2.3-class FFN blocks (hidden=4096, inner=16384,
+   per-tensor fp8 E4M3FN weights, optional bf16 biases on both
+   Linear layers). Delivered 1.26-1.36x vs torch's fp8-dequant
    reference at LTX FFN shapes on sm89. Not wired into `sageattn()`;
    consumer imports it directly from the top-level package. The
    wedge is qualitative: torch's `F.linear` against fp8 weights

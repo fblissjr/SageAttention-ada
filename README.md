@@ -46,13 +46,16 @@ for sm89. Treat results elsewhere as "should work" rather than
 - **`fused_rope_split(q, k, freqs_cis)`** -- clean-room Triton
   kernel matching the LTX split-rotary-embed convention; standalone
   helper, not bolted into `sageattn()`.
-- **`sage_ffn(x, w1, s1, w2, s2)`** (v0.6) -- a two-kernel
-  fp8-native fused MLP (`Linear(fp8) -> GELU(tanh) -> Linear(fp8)`)
-  targeting DiT FFN blocks whose weights ship as per-tensor fp8
-  (E4M3FN). Targets LTX 2.3 distilled (hidden=4096, inner=16384;
-  44 of 48 blocks fp8). FFN primitive, not an attention kernel --
-  consumer imports it directly; not wired into `sageattn()`.
-  See "What we've measured" for delivered numbers.
+- **`sage_ffn(x, w1, s1, w2, s2, b1=None, b2=None)`** (v0.6) -- a
+  two-kernel fp8-native fused MLP (`Linear(fp8) -> GELU(tanh) ->
+  Linear(fp8)`) targeting DiT FFN blocks whose weights ship as
+  per-tensor fp8 (E4M3FN). Targets LTX 2.3 distilled (hidden=4096,
+  inner=16384; 44 of 48 blocks fp8). Optional bf16 biases on both
+  Linear layers; LTX usage passes them through, bias-free callers
+  pass `None` and the kernel compiles the bias load out. FFN
+  primitive, not an attention kernel -- consumer imports it
+  directly; not wired into `sageattn()`. See "What we've measured"
+  for delivered numbers.
 - **A bench harness** -- `tests/test_sageattn_ltx_shapes.py` measures
   every sage kernel + torch SDPA backend (FLASH / EFFICIENT / CUDNN)
   at the LTX-class shapes our models actually hit, reporting both
@@ -198,14 +201,15 @@ tensor cores at ~660 TFLOPS. No other library ships an fp8-native
 fused MLP for these consumer-app DiT shapes on sm89 (FA's
 `fused_mlp_func` is bf16/fp16 only).
 
-LTX 2.3 distilled FFN shapes (hidden=4096, inner=16384), measured
-on RTX 4090, CUDA 13.0, torch 2.12.0+cu130, triton 3.7.0 --
-**synthetic standalone bench, not end-to-end ComfyUI rendering**:
+LTX 2.3 distilled FFN shapes (hidden=4096, inner=16384), bias-inclusive
+(matches the LTX 2.3 distilled checkpoint), measured on RTX 4090,
+CUDA 13.0, torch 2.12.0+cu130, triton 3.7.0 -- **synthetic standalone
+bench, not end-to-end ComfyUI rendering**:
 
 | shape | sage_ffn | torch ref (fp8-dequant) | speedup | mean_rtol |
 |---|---:|---:|---:|---:|
-| stage-1 (T=10780) | 13.7 ms | 18.2 ms | **1.33x** | 0.092 |
-| stage-2 (T=44880 multi-guide) | 59.7 ms | 75.7 ms | **1.27x** | 0.091 |
+| stage-1 (T=10780) | 13.3 ms | 18.1 ms | **1.36x** | 0.091 |
+| stage-2 (T=44880 multi-guide) | 59.8 ms | 75.3 ms | **1.26x** | 0.091 |
 
 mean_rtol is well under the 0.10 budget. The reference is
 `F.linear(F.gelu(F.linear(x, w1_bf16), approximate="tanh"), w2_bf16)`
@@ -235,8 +239,8 @@ Design notes:
   bf16) need consumer-side dispatch -- `sage_ffn` only handles
   fp8-weight blocks; the bf16 bookend blocks fall through to
   `F.linear` in the caller.
-- E2e wall-time impact: synthetic FFN speedup of 1.27-1.33x at an
-  FFN-time-share of ~24-27% *would* project to 4-7% e2e if
+- E2e wall-time impact: synthetic FFN speedup of 1.26-1.36x at an
+  FFN-time-share of ~24-27% *would* project to 4-8% e2e if
   synthetic numbers held in production. They might not; e2e is
   pending in-pipeline A/B.
 - First call at a new shape pays ~10-15s Triton autotune-search per
@@ -294,7 +298,7 @@ You get:
   overhead. (Other archs still use Triton.)
 - An fp8-native fused MLP primitive (`sage_ffn`, v0.6) for LTX
   2.3-class FFN blocks. The only fp8-native fused MLP available
-  for these workloads on sm89. Synthetic-bench 1.27-1.33x vs
+  for these workloads on sm89. Synthetic-bench 1.26-1.36x vs
   torch's fp8-dequant reference at LTX FFN shapes; production
   e2e impact is pending in-pipeline measurement.
 
