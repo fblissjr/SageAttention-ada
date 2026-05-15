@@ -23,7 +23,9 @@ import time
 import torch
 import torch.nn.functional as F
 
-from sageattention.triton.fused_mlp_fp8 import sage_ffn, FP8_E4M3_MAX
+from sageattention.triton.fused_mlp_fp8 import sage_ffn
+
+FP8_E4M3_MAX = 448.0
 
 
 def quantize_weight_per_tensor_fp8(w_f32: torch.Tensor) -> tuple[torch.Tensor, float]:
@@ -58,19 +60,29 @@ def run_correctness_at(T: int, hidden: int = 4096, inner: int = 16384, seed: int
     w1_bf16_ref = (w1_fp8.float() * w1_scale).to(torch.bfloat16)
     w2_bf16_ref = (w2_fp8.float() * w2_scale).to(torch.bfloat16)
 
-    # Time the reference
+    # Warmup (absorbs autotune-search cost + Triton lazy JIT)
+    for _ in range(2):
+        _ = F.linear(F.gelu(F.linear(x, w1_bf16_ref), approximate="tanh"), w2_bf16_ref)
+        _ = sage_ffn(x, w1_fp8, w1_scale, w2_fp8, w2_scale)
     torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    ref = F.linear(F.gelu(F.linear(x, w1_bf16_ref), approximate="tanh"), w2_bf16_ref)
-    torch.cuda.synchronize()
-    ref_ms = (time.perf_counter() - t0) * 1000
 
-    # Time sage_ffn
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    out = sage_ffn(x, w1_fp8, w1_scale, w2_fp8, w2_scale)
-    torch.cuda.synchronize()
-    sage_ms = (time.perf_counter() - t0) * 1000
+    # Median of 5 timed runs for stability
+    ref_samples = []
+    sage_samples = []
+    for _ in range(5):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        ref = F.linear(F.gelu(F.linear(x, w1_bf16_ref), approximate="tanh"), w2_bf16_ref)
+        torch.cuda.synchronize()
+        ref_samples.append((time.perf_counter() - t0) * 1000)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        out = sage_ffn(x, w1_fp8, w1_scale, w2_fp8, w2_scale)
+        torch.cuda.synchronize()
+        sage_samples.append((time.perf_counter() - t0) * 1000)
+    ref_samples.sort(); sage_samples.sort()
+    ref_ms = ref_samples[2]
+    sage_ms = sage_samples[2]
 
     # Rtol
     a = out.float()
