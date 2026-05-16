@@ -76,12 +76,13 @@ speculatively.
 ### Persistent-CTA hybrid for stage-2 attention (highest e2e leverage; v0.7 candidate)
 
 After v0.6.0's production A/B, a downstream consumer characterized
-the wall-time breakdown of the FML2V multi-guide render. **Stage-2 attn1 (video
-self-attention at T=42240) is ~25.7% of total wall-time, the single
-heaviest sub-module across the whole render.** Stage-2 FFN is only
-~12%. The optimization-leverage calculus shifts: attention is a 2.4x
-bigger lever than FFN. See `docs/ltx_workload_profile.md`
-for the full breakdown.
+the wall-time breakdown of the FML2V multi-guide render. **Stage-2
+attn1 (video self-attention at T=42240) is the single heaviest
+sub-module across the whole render** -- materially larger than the
+FFN share that v0.6 targeted. The optimization-leverage calculus
+shifts: attention is the bigger lever. See
+`docs/ltx_workload_profile.md` for the canonical breakdown with
+per-sub-module percentages + the FFN-share triplet.
 
 A persistent-CTA hybrid (CTAs hold M-tile state in registers/L2 across
 kernel calls, attacking the L2-contention root cause) applied to stage-2

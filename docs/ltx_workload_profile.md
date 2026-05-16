@@ -1,17 +1,27 @@
-Last updated: 2026-05-16 (rev 2: replaced rough breakdown estimates with tracer-grounded numbers from the v2 audit; walked back 23% VAE share, 29% stage-2 attn1 share, FFN-share ambiguity)
+Last updated: 2026-05-16
 
 # LTX 2.3 FML2V workload profile -- where the wall-time actually lives
 
 Canonical sage-side copy of the production wall-time breakdown for LTX
 2.3's FML2V multi-guide workflow. Sourced from a downstream consumer's
-in-pipeline A/B measurements + an extended tracer audit (2026-05-15
-A/B + 2026-05-16 v2 tracer audit on the same workflow). This data is
-the input for any "what's the next biggest perf lever" decision on
-sage's side; cite it instead of guessing at workload composition.
+in-pipeline A/B measurements + an extended tracer audit on the same
+workflow. This data is the input for any "what's the next biggest perf
+lever" decision on sage's side; cite it instead of guessing at workload
+composition.
 
-The v2 audit (2026-05-16) replaces the earlier rough breakdown that
-shipped in rev 1. Three numbers tightened materially; see the
-"Reconciliation against rev 1" section below.
+**TL;DR**: Sampler is 81.9% of render. Single heaviest sub-module is
+stage-2 attn1 (~25.7% of render). Total FFN is ~16% of render (see
+the FFN-share triplet below for the right reading for your question).
+VAE decode is ~9.8%. Everything else is small. Persistent-CTA
+attention is the biggest available lever; persistent-CTA FFN is
+secondary; CUTLASS / fp16-accum throughput chasing is off the
+priority list because sage v0.5.5 is already at the sm89 fp8
+hardware ceiling.
+
+This is rev 2; rev 1 carried three rough estimates (23% VAE share,
+29% stage-2 attn1, ambiguous FFN scope) that were inherited from an
+earlier informal breakdown rather than measured. The
+"Reconciliation" section near the bottom records the walk-backs.
 
 ## Top-level render breakdown
 
@@ -48,8 +58,8 @@ The existing tracer covers 75.4% of sampler wall-time. The remaining 24.6% is a 
 
 The 24.6% residual contains:
 
-1. **`audio_to_video_attn`** -- the other direction of AV cross-attn (video Q, audio KV). Present in `BasicAVTransformerBlock` but missing from the v2 tracer's `SUB_MODULE_NAMES`. Estimated 1-6% of sampler; **closed in tracer commit `9575a0f`** on the consumer side, awaiting re-render to populate.
-2. **`cross_attention_adaln`** -- AdaLN-Single applied per transformer block (48 blocks * 22 sampler steps * ~7 calls/block per the dataflow audit). Implemented as `apply_cross_attention_adaln(...)` free function over `nn.Parameter` tables, not a hookable Module. Estimated 3-4% of sampler. **Closed via torch.profile extension in tracer commit `9de86a3`**, awaiting re-render.
+1. **`audio_to_video_attn`** -- the other direction of AV cross-attn (video Q, audio KV). Present in `BasicAVTransformerBlock` but missing from the existing tracer's `SUB_MODULE_NAMES`. Estimated 1-6% of sampler. Tracer extension landed consumer-side, awaiting re-render to populate.
+2. **`cross_attention_adaln`** -- AdaLN-Single applied per transformer block (48 blocks * 22 sampler steps * ~7 calls/block per the dataflow audit). Implemented as `apply_cross_attention_adaln(...)` free function over `nn.Parameter` tables, not a hookable Module. Estimated 3-4% of sampler. torch.profile aten-op trace landed consumer-side, awaiting re-render.
 3. **RoPE rotation kernels** -- sage ships `fused_rope_split` at ~0.55% share.
 4. **Norm layers** -- `norm{1,2,3}` LayerNorm/RMSNorm per block, un-fused.
 5. **NAG cross-attn calls within sampler** -- 5-15% of cross-attn cost when active. Unmeasured directly.
@@ -75,12 +85,29 @@ Stage-2 attn1 + stage-2 ff together = 37.6% of total render. That's the combined
 Lever ranking by structural prize:
 
 - **Stage-2 attn1**: 25.7% of total render. Persistent-CTA-class kernel work targeting L2 contention can plausibly move 20-40% of this -> ~5-10% e2e wall-time. Single largest lever.
-- **Stage-2 ff**: 12.0% of total render (sampler share * sampler-of-render). Persistent-CTA on FFN tested in v0.6.0 ran +20% slower per-call due to L2 contention; persistent-CTA done right could plausibly recover that AND improve, ~3-5% e2e.
-- **Audio + v2a stream (with audio_to_video_attn included once that tracer extension re-renders)**: 10.2% of sampler observable today; expected 13-17% with the missing direction. Concurrent-dispatch parallelism could in principle overlap most of this with the video path's wall-time -- 2-5% e2e if the mechanism works on the 4090. Spike pending.
+- **Stage-2 ff**: 9.8% of total render (the third triplet reading). Persistent-CTA on FFN tested in v0.6.0 ran +20% slower per-call due to L2 contention; persistent-CTA done right could plausibly recover that AND improve, ~3-5% e2e.
+- **Audio + v2a stream**: 8.4% of total render currently observable (10.2% of sampler); expected larger once `audio_to_video_attn` populates from the next render. Concurrent-dispatch parallelism could in principle overlap most of this with the video path's wall-time -- 2-5% e2e if the mechanism works on the 4090. Spike pending.
 - **VAE decode**: 9.8% of render. Kernel-side surface unknown; chrome-trace audit pending. If GPU-bound + sm89-tunable, real lever. If memory-bound, rules it out from kernel-side work.
 - **AdaLN-Single**: ~3-4% of sampler / ~3% of render. Low individual leverage. Composes with RoPE + norms (other small fusion targets) potentially.
 
 CUTLASS / fp16-accum-style matmul throughput work does NOT make the priority list. The bottleneck on stage-2 isn't matmul throughput; it's L2 cache locality + dispatch overhead. See `docs/fp16_accum_fp8_matmul.md`.
+
+## Sequencing implications
+
+The leverage calculus implies this order if appetite exists for kernel-engineering work:
+
+1. **Persistent-CTA hybrid for FFN first.** Smaller payoff (~3-5% e2e), but validates the persistent-CTA technique at lower risk before committing to the larger attention port. 1-2 weeks of work.
+2. **Persistent-CTA hybrid for attention second**, once the pattern is proven on FFN. 2-3 weeks. ~5-10% e2e ceiling.
+3. **Concurrent-dispatch parallelism spike** (independent axis from persistent-CTA -- attacks dispatch-layer scheduling rather than per-kernel cache locality). Half-day gating spike before any infrastructure commitment.
+
+Lower-leverage candidates (AdaLN/RoPE/norm fusion, VAE kernel work pending chrome-trace audit) stay below the line until the higher-leverage levers either ship or rule out.
+
+## What's not in this profile (but matters for context)
+
+- **Workflow-level normalization knobs** (e.g. NAG-class guidance/normalization that's default-on at production-grade strength): disabling or making opt-in can save ~40% wall-time per render on workloads where the knob is the dominant compute. Consumer-side workflow decision, not a kernel-side one. Not actionable from sage-fork. Worth knowing because it's typically the biggest e2e wedge available to a user willing to accept the quality change.
+- **Stage-2 step count** (currently 3 on the measured workload): reducing saves proportional wall-time. Model-side decision, not ours.
+- **AdaLN-Single fusion as an OOM target**: AdaLN-Single fires as the OOM site in some chunk-bypass testing configurations. Wall-time share is low (~3%); fusion here would be a correctness / memory-pressure intervention more than a perf intervention.
+- **Single-pass / non-multi-guide LTX workloads** would have a different profile -- fewer FFN calls per render, less L2 thrash from neighboring attention. v0.6.0's sage_ffn might be net-positive on those; we haven't measured. If a single-pass A/B comes in positive, the persistent-CTA work prioritization could shift.
 
 ## Reconciliation against rev 1
 
@@ -104,12 +131,12 @@ Three numbers in the rev 1 doc were rough estimates from an earlier informal bre
 | Video FFN only, all stages | 15.7% | Closest analog to "what would sage_ffn touch if dispatched across stages 1+2." Audio_ff is small enough (~0.6% of sampler) that the difference vs total is ~0.3pp. |
 | Stage-2 video FFN only | 9.8% | "Amdahl ceiling input" for stage-2-specific analysis. The right number for "what's the max e2e wedge from a stage-2-only kernel optimization." |
 
-The v0.6.0 walk-back analysis used the third reading (stage-2-only) implicitly; future docs should pick one explicitly to stop the next cross-clone exchange from re-deriving.
+The v0.6.0 walk-back analysis used the third reading (stage-2-only) implicitly; future docs should pick one explicitly.
 
 ## Provenance
 
 - v0.6.0 day-9 A/B measurement: 2026-05-15, 4 renders interleaved baseline/treatment/baseline/treatment under fixed-VRAM run conditions. Wall-time deltas + per-call timing in CHANGELOG v0.6.0.
-- v2 tracer audit: 2026-05-16, same workflow, representative render `b71c69d0-9180-438a-b839-366b19a27353`. Other renders in the same set show shape-consistent splits within +/-2%.
+- Extended tracer audit: 2026-05-16, same workflow, one representative render from a set whose splits are shape-consistent within +/-2%.
 - Workflow: LTX 2.3 distilled fp8, FML2V multi-guide, 768x512x97 frames, 4-sec audio, 8-step stage-1 + 3-step stage-2 refine.
 - Hardware/env: 4090, sm89, torch 2.12.0+cu130, triton 3.7.0, sageattention v0.6.0 at sage-fork commit `4f8a090` (bias-inclusive).
 
@@ -119,8 +146,8 @@ This profile is workload-specific. Other LTX workloads (different resolution, di
 
 Two extensions to the existing tracer infrastructure are landed but not yet re-rendered:
 
-- `audio_to_video_attn` coverage (tracer commit `9575a0f`) -- closes the 5-7% sampler undercount in audio-side wall-time. Required for tight sizing of concurrent-dispatch parallelism prize.
-- AdaLN/RoPE/norm aten-op trace via `torch.profile` (tracer commit `9de86a3`) -- characterizes the 24.6% sampler residual. Required for assessing whether AdaLN dominates the residual (gates parallelism payoff) or norms / NAG / hook overhead do.
+- `audio_to_video_attn` coverage -- closes the 5-7% sampler undercount in audio-side wall-time. Required for tight sizing of concurrent-dispatch parallelism prize.
+- AdaLN/RoPE/norm aten-op trace via `torch.profile` -- characterizes the 24.6% sampler residual. Required for assessing whether AdaLN dominates the residual (gates parallelism payoff) or norms / NAG / hook overhead do.
 
 Both will populate on the next render of the FML2V benchmark workflow with the appropriate env vars set. Expected to refine the numbers above but not change the lever ranking.
 

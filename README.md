@@ -143,12 +143,11 @@ workloads we've tested; we haven't run task-level quality benchmarks.
 E2e ratio for the iclora workflow (downstream consumer A/B
 2026-05-07, attention share ~42% of CUDA kernel time): measured
 1.41x wall ratio, matches pure-Amdahl prediction within 1.4%. For
-the FML2V multi-guide workflow (in-pipeline A/B 2026-05-15, stage-2
-attn1 is ~25.7% of total render): the per-kernel ratio above gives a
-much larger e2e lever than the FFN-side primitive (~15% e2e ceiling
-for a hypothetical 2x stage-2 attention vs ~6% for FFN). See the
-canonical workload profile in `docs/ltx_workload_profile.md` for
-the full breakdown.
+the FML2V multi-guide workflow: stage-2 attn1 is the single
+heaviest sub-module and gives a materially larger e2e lever than
+the FFN-side primitive. The canonical breakdown + FFN-share triplet
+(three distinct readings depending on the question being asked) is
+in `docs/ltx_workload_profile.md`.
 
 ### Masked self-attn (post-v0.5.5)
 

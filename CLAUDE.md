@@ -302,12 +302,12 @@ Two complementary inputs for any perf decision:
    at speed X at this shape" -- the isolation question. Synthetic
    kernel-bench number; do not promote as delivered consumer-app
    speedup.
-2. **E2e leverage input**: `docs/ltx_workload_profile.md`.
-   Where wall-time actually lives in the FML2V multi-guide workflow.
-   Currently: stage-2 attn1 is ~25.7% of total render (the single
-   heaviest sub-module), stage-2 FFN ~10%, stage-2 attn2 ~7%, total
-   FFN (video + audio, all stages) ~16% of render.
-   Use this to rank perf bets by leverage. The framework in
+2. **E2e leverage input**: `docs/ltx_workload_profile.md` -- where
+   wall-time actually lives in the FML2V multi-guide workflow.
+   Canonical source for sub-module shares + the FFN-share triplet
+   (total / video-only / stage-2-only readings). Cite that doc
+   rather than restating percentages locally; the next render-data
+   refresh updates one place. The framework in
    `docs/perf_research_framework.md` says: measure attention-share-
    of-CUDA-time on each workload of interest, apply Amdahl with the
    per-kernel ratio observed on that workload's actual call mix.
@@ -351,8 +351,8 @@ graph-breaks at, the trigger to revisit, and the estimated work in
 - `docs/fp16_matmul_accum.md` -- whether KJ's
   `enable_fp16_accumulation` affects sage output (no).
 - `docs/ltx_workload_profile.md` -- canonical FML2V render
-  breakdown. Stage-2 attn1 ~25.7% of render, total FFN ~16%, VAE
-  decode ~10%. Use this for ranking perf bets by leverage.
+  breakdown + FFN-share triplet. Use this for ranking perf bets by
+  leverage.
 - `docs/fp16_accum_fp8_matmul.md` -- analysis of why fp16-accum
   fp8 matmul throughput work (LinkedIn-article-style "473 TFLOPS
   at LLM shape") doesn't help LTX FFN-class workloads. Throughput
@@ -379,14 +379,15 @@ graph-breaks at, the trigger to revisit, and the estimated work in
   experiment log. Edit every session. Mirrors CHANGELOG's Backlog
   and Recurring sections in active form. Pairs with
   `internal/log/log_<date>.md` and `internal/audit_<date>.md`.
-- `internal/design/<name>_scoping.md` (gitignored) -- precedent
-  pattern (v0.5.5 `cuda_mask_kernel_scoping.md`) for any kernel-day
-  work that needs a discipline check (PTX bit-identity diff of the
-  kNone specialization, register-pressure read, four-place-coupling
-  audit) BEFORE committing to the full implementation. Cheap
-  investigation that de-risks the kernel work; produces an
-  effort-estimate refinement that ages better than the "days, not
-  hours" rule of thumb in CHANGELOG / Backlog.
+- Scoping-doc precedent for kernel-day work that needs a discipline
+  check (PTX bit-identity diff of the kNone specialization, register-
+  pressure read, four-place-coupling audit) BEFORE committing to the
+  full implementation. Cheap investigation that de-risks the kernel
+  work; produces an effort-estimate refinement that ages better than
+  the "days, not hours" rule of thumb in CHANGELOG / Backlog. Public
+  worked example shipped at `docs/cuda_mask_kernel_scoping.md`
+  (v0.5.5); current gitignored work-in-progress at
+  `internal/design/ffn_fusion_scoping.md` (v0.6).
 - `.claude.local.md` (gitignored) -- personal companion to this
   file. Holds the specific local-machine details that would leak
   in committed material: active venv path, consumer-install
