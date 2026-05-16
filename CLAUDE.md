@@ -282,7 +282,7 @@ Sage exposes three surfaces to downstream consumers:
 Mask-routing fix landed v0.3.0 (2026-04-26); audit trail in
 `internal/audit_2026-04-26.md`. Native CUDA mask landed v0.5.5
 (2026-05-13) on sm89 fp8++; scoping doc + measurement trail in
-`internal/design/cuda_mask_kernel_scoping.md` (gitignored). FFN
+`docs/cuda_mask_kernel_scoping.md`. FFN
 fusion landed v0.6.0 (2026-05-15); scoping + day-by-day execution
 journal + cross-claude memo trail in
 `internal/design/ffn_fusion_scoping.md` (gitignored).
@@ -302,7 +302,7 @@ Two complementary inputs for any perf decision:
    at speed X at this shape" -- the isolation question. Synthetic
    kernel-bench number; do not promote as delivered consumer-app
    speedup.
-2. **E2e leverage input**: `internal/analysis/ltx_workload_profile.md`.
+2. **E2e leverage input**: `docs/ltx_workload_profile.md`.
    Where wall-time actually lives in the FML2V multi-guide workflow.
    Currently: stage-2 attn1 is ~29% of total render (the single
    heaviest sub-module), stage-2 FFN is ~12%, stage-2 attn2 is ~9%.
@@ -349,18 +349,15 @@ graph-breaks at, the trigger to revisit, and the estimated work in
   regression_baselines.json source-of-truth rule.
 - `docs/fp16_matmul_accum.md` -- whether KJ's
   `enable_fp16_accumulation` affects sage output (no).
-- `internal/analysis/ltx_workload_profile.md` (gitignored) --
-  canonical sage-side copy of audio-loop's FML2V render breakdown.
-  Stage-2 attn1 ~29%, stage-2 FFN ~12%, etc. Use this for ranking
-  perf bets by leverage.
-- `internal/analysis/fp16_accum_fp8_matmul.md` (gitignored) --
-  analysis of why fp16-accum fp8 matmul throughput work
-  (LinkedIn-article-style "473 TFLOPS at LLM shape") doesn't
-  help LTX FFN-class workloads. Kijai independently replicated
-  the throughput AND ran it on LTX 2.3 in ComfyUI; output was
-  "visibly worse" due to fp16 dynamic-range overflow on DiT
-  activation distributions. Direct empirical confirmation of the
-  range-cap rtol cost.
+- `docs/ltx_workload_profile.md` -- canonical FML2V render
+  breakdown. Stage-2 attn1 ~29%, stage-2 FFN ~12%, etc. Use this
+  for ranking perf bets by leverage.
+- `docs/fp16_accum_fp8_matmul.md` -- analysis of why fp16-accum
+  fp8 matmul throughput work (LinkedIn-article-style "473 TFLOPS
+  at LLM shape") doesn't help LTX FFN-class workloads. Throughput
+  claim is real and independently replicated; the per-MMA
+  accumulator overflow constraint kills the rtol budget on DiT
+  activation distributions specifically.
 - `internal/pyright_noise.md` (gitignored) -- pyright false-positives
   to ignore in `sageattention/` and `tests/`. Two recurring categories
   worth knowing up front: "unreachable code" on `@triton.jit` kernel

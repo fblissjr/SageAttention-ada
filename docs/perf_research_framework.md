@@ -49,9 +49,9 @@ varies. Two measurements on file:
   delta is 0.82% of total launches -- ~0.4s, also negligible. The
   full saving comes from sage's faster attention kernel.
 
-- **LTX 2.3 FML2V multi-guide at production scale (audio-loop day-9
-  A/B 2026-05-15)**: full wall-time breakdown is in
-  `internal/analysis/ltx_workload_profile.md`. Stage-2 attn1 is ~29%
+- **LTX 2.3 FML2V multi-guide at production scale (in-pipeline A/B
+  2026-05-15)**: full wall-time breakdown is in
+  `docs/ltx_workload_profile.md`. Stage-2 attn1 is ~29%
   of total render (~107 ms/call at T=42240, the single heaviest
   sub-module). Stage-2 FFN is ~12%. Stage-2 attn2 is ~9%. Stage-1
   segment is ~27% of total, stage-2 is ~50%, VAE encode/decode +
@@ -74,7 +74,7 @@ e2e measurement, the 2026-05-07 cross-claude memo trail
 `internal/SAGE_CLAUDE_TO_AUDIO_LOOP_CLAUDE_MEMO.md`) for the iclora
 A/B decomposition that retired the launch-overhead, FFN-adjacent,
 and cache-footprint hypotheses on that workload, and CHANGELOG v0.6.0
-+ `internal/analysis/ltx_workload_profile.md` for the FML2V profile.
++ `docs/ltx_workload_profile.md` for the FML2V profile.
 
 ## When synthetic-bench projects, but production refuses to follow
 

@@ -75,12 +75,12 @@ speculatively.
 
 ### Persistent-CTA hybrid for stage-2 attention (highest e2e leverage; v0.7 candidate)
 
-After v0.6.0's production A/B, audio-loop characterized the wall-time
-breakdown of the FML2V multi-guide render. **Stage-2 attn1 (video
+After v0.6.0's production A/B, a downstream consumer characterized
+the wall-time breakdown of the FML2V multi-guide render. **Stage-2 attn1 (video
 self-attention at T=42240) is ~29% of total wall-time, the single
 heaviest sub-module across the whole render.** Stage-2 FFN is only
 ~12%. The optimization-leverage calculus shifts: attention is a 2.4x
-bigger lever than FFN. See `internal/analysis/ltx_workload_profile.md`
+bigger lever than FFN. See `docs/ltx_workload_profile.md`
 for the full breakdown.
 
 A persistent-CTA hybrid (CTAs hold M-tile state in registers/L2 across
@@ -138,7 +138,7 @@ not matmul throughput. cuBLASLt-level codegen on a kernel that still
 thrashes L2 doesn't move the needle.
 
 A more detailed analysis of why fp16-accum + CUTLASS-class matmul
-doesn't help here is in `internal/analysis/fp16_accum_fp8_matmul.md`.
+doesn't help here is in `docs/fp16_accum_fp8_matmul.md`.
 
 **Trigger to revisit:** persistent-CTA hybrid lands and the L2-thrash
 hypothesis is validated, AND a workload class surfaces where matmul
@@ -181,8 +181,8 @@ num_stages=4), so bucketing could land a sub-optimal config on a
 neighbor M.
 
 **Trigger to act:** user feedback that first-render-per-shape
-autotune-cost is painful across workflow variations, OR audio-loop
-reports cycling through M values frequently in their consumer flow.
+autotune-cost is painful across workflow variations, OR a downstream
+consumer reports cycling through M values frequently in production.
 
 ### Extract `tests/_helpers.py` for shared `make_qkv` + `require_cuda`
 
@@ -662,9 +662,9 @@ number.
 
 **What this means for users:**
 
-- Keep `LTXVChunkFeedForward` (KJNodes) as the production
-  default; don't replace it with `AudioLoopHelperSageFFN` or
-  equivalent expecting a speedup.
+- Keep an FFN-chunking node (e.g. `LTXVChunkFeedForward` from
+  KJNodes) as the production default; don't replace it with a
+  consumer-side `sage_ffn` patch node expecting a speedup.
 - `sage_ffn` is available for users who specifically need an
   fp8-native fused MLP for ComfyUI consumer-app on sm89 (no
   other library provides this combination). The "uncontested
@@ -789,7 +789,7 @@ Triggered by a high-leverage downstream consumer surface raising
 the structural-correctness concern (the "1 high-leverage surface"
 clause added in v0.5.4 backlog reformulation). Scoping note +
 implementation discipline in
-`internal/design/cuda_mask_kernel_scoping.md` (gitignored).
+`docs/cuda_mask_kernel_scoping.md`.
 
 #### Added
 

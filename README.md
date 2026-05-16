@@ -140,15 +140,15 @@ Quantization-induced rtol is ~0.097 on these shapes (well below the
 work). In practice this is below VAE noise on the image/video gen
 workloads we've tested; we haven't run task-level quality benchmarks.
 
-E2e ratio for the iclora workflow (audio-loop A/B 2026-05-07,
-attention share ~42% of CUDA kernel time): measured 1.41x wall ratio,
-matches pure-Amdahl prediction within 1.4%. For the FML2V multi-guide
-workflow (audio-loop day-9 A/B 2026-05-15, stage-2 attn1 is ~29% of
-total render): the per-kernel ratio above gives a much larger e2e
-lever than the FFN-side primitive (~15% e2e ceiling for a hypothetical
-2x stage-2 attention vs ~6% for FFN). See the canonical workload
-profile in `internal/analysis/ltx_workload_profile.md` (gitignored)
-for the full breakdown.
+E2e ratio for the iclora workflow (downstream consumer A/B
+2026-05-07, attention share ~42% of CUDA kernel time): measured
+1.41x wall ratio, matches pure-Amdahl prediction within 1.4%. For
+the FML2V multi-guide workflow (in-pipeline A/B 2026-05-15, stage-2
+attn1 is ~29% of total render): the per-kernel ratio above gives a
+much larger e2e lever than the FFN-side primitive (~15% e2e ceiling
+for a hypothetical 2x stage-2 attention vs ~6% for FFN). See the
+canonical workload profile in `docs/ltx_workload_profile.md` for
+the full breakdown.
 
 ### Masked self-attn (post-v0.5.5)
 
