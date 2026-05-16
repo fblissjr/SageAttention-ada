@@ -76,6 +76,23 @@ A/B decomposition that retired the launch-overhead, FFN-adjacent,
 and cache-footprint hypotheses on that workload, and CHANGELOG v0.6.0
 + `docs/ltx_workload_profile.md` for the FML2V profile.
 
+## Profiler-aggregation gotcha: cpu_op `dur` is dispatch wall-clock, not serial wall-time
+
+Recorded as a discipline rule after a 2026-05-16 cross-clone analysis chain almost shifted a 2-week infra commit on a misinterpreted aggregation.
+
+Chrome trace events with `cat=cpu_op` have a `dur` field that captures the **CPU-side dispatch wall-clock** for that op -- the time the dispatcher spent issuing the op, not the GPU-side execution time. For async pytorch ops (`aten::copy_`, `aten::to`, most aten ops on CUDA tensors), the dispatcher fires, queues work onto the CUDA stream, returns; the `dur` measures only the dispatcher's CPU portion. The GPU then executes that work concurrently with subsequent CPU dispatch.
+
+Summing `cpu_op.dur` across many async ops on a compute-overlapping render gives an inflated CPU-side total that does NOT correspond to serial render wall-time. A `aten::copy_` total `dur` of 35 s across 40 k calls does not mean 35 s of the render was eaten by copies; most of that CPU dispatch overlapped with GPU compute.
+
+The right aggregation depends on the question:
+
+- **"What op did the dispatcher fire most often / what's the CPU-side dispatch profile?"** -> sum `cat=cpu_op` `dur`. Useful for finding dispatcher-bound bottlenecks or hot operator names.
+- **"What dominates sampler wall-time?"** -> sum `cat=kernel` `dur` (CUDA kernel wall-time) + explicit CPU work that blocks the dispatcher (sync points, `.item()` calls, host-to-device transfers that block). This is the right anchor for "X% of sampler" claims.
+
+The 2026-05-16 retraction: a v3 audit doc claimed "comfy-aimdo offload = `aten::copy_ + aten::to` = 67 s = 47% of sampler" from cpu_op `dur` aggregation. A `nodynvram` A/B disproved the framing by showing that disabling dynamic VRAM made the render slower, not faster, and the `aten::copy_` + `aten::to` call counts went UP while their total `dur` stayed roughly the same. The 47% number was real CPU dispatch time but not serial wall-time; the framing propagated through three cross-clone memos before the A/B caught it.
+
+**Disprove-test discipline**: for any "X% of sampler is Y" claim that would shift a multi-day decision (infra commit, kernel-day work, ship/no-ship), identify the cheapest test that would falsify Y, and run it before the decision. Six minutes of GPU time on the right A/B can save weeks of work pointed at the wrong thing. Same shape as the synthetic-vs-in-pipeline rule below, but applied to interpretation, not measurement.
+
 ## When synthetic-bench projects, but production refuses to follow
 
 There is a recurring failure mode worth naming: a kernel-isolation
