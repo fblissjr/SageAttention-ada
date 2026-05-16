@@ -1,6 +1,6 @@
 # Performance research framework
 
-Last updated: 2026-05-13
+Last updated: 2026-05-16
 
 L3 reference for CLAUDE.md's "Performance research" pointer. Load this
 when you are about to make a kernel change, run a perf experiment, or
@@ -49,7 +49,17 @@ varies. Two measurements on file:
   delta is 0.82% of total launches -- ~0.4s, also negligible. The
   full saving comes from sage's faster attention kernel.
 
-Both numbers are real; they describe different workloads with
+- **LTX 2.3 FML2V multi-guide at production scale (audio-loop day-9
+  A/B 2026-05-15)**: full wall-time breakdown is in
+  `internal/analysis/ltx_workload_profile.md`. Stage-2 attn1 is ~29%
+  of total render (~107 ms/call at T=42240, the single heaviest
+  sub-module). Stage-2 FFN is ~12%. Stage-2 attn2 is ~9%. Stage-1
+  segment is ~27% of total, stage-2 is ~50%, VAE encode/decode +
+  setup is ~23%. This is the canonical render-time profile for any
+  multi-sampler LTX work; cite it before guessing at workload
+  composition.
+
+The three numbers are real; they describe different workloads with
 different attention shares. The framework: measure attention-share-
 of-CUDA-time on each workload of interest, apply Amdahl with the
 per-kernel ratio observed on that workload's actual call mix, and
@@ -59,11 +69,60 @@ ratio to another.
 
 Sourced from real consumer traces; see CHANGELOG v0.4.1 for the
 kernel-bench shape re-derivation, v0.5.1 for the audio_loop_latent
-e2e measurement, and the 2026-05-07 cross-claude memo trail
+e2e measurement, the 2026-05-07 cross-claude memo trail
 (`internal/AUDIO_LOOP_CLAUDE_TO_SAGE_CLAUDE_MEMO.md` +
 `internal/SAGE_CLAUDE_TO_AUDIO_LOOP_CLAUDE_MEMO.md`) for the iclora
 A/B decomposition that retired the launch-overhead, FFN-adjacent,
-and cache-footprint hypotheses on that workload.
+and cache-footprint hypotheses on that workload, and CHANGELOG v0.6.0
++ `internal/analysis/ltx_workload_profile.md` for the FML2V profile.
+
+## When synthetic-bench projects, but production refuses to follow
+
+There is a recurring failure mode worth naming: a kernel-isolation
+bench shows a clean speedup, the speedup gets promoted into a
+delivered claim, the in-pipeline A/B reveals the speedup doesn't
+transfer because production conditions (cache contention, dispatch
+overhead, allocator state, neighboring-module behavior) break an
+assumption the synthetic bench held warm. Two precedents in this fork:
+
+- **v0.5.1 -> 2026-05-07 retirement**: the v0.5.1 release attributed
+  +17pp of an audio_loop_latent e2e ratio to "FFN-adjacent reach
+  within the sampler step" based on a single-data-point inference.
+  The 2026-05-07 iclora A/B directly traced attention time on the
+  actual workload, showed pure-Amdahl matched within 1.4%, and
+  retired the FFN-adjacent / cache-footprint / launch-overhead
+  reach hypotheses. Net: kernel ratio held, the mechanism story
+  didn't.
+- **v0.6.0 sage_ffn (2026-05-15)**: synthetic-bench showed 1.27-1.36x
+  vs torch's fp8-dequant reference at LTX FFN shapes. In-pipeline
+  A/B on a two-sampler FML2V workflow came back +1.79% e2e *slower*
+  (+20% per-call at stage-2). Root cause: L2 cache contention with
+  neighboring attention modules + cumulative kernel-launch overhead
+  at LTX's ~1000-FFN-calls/render count. The synthetic bench ran
+  FFN alone with warm L2; production ran it interleaved with
+  attention's much larger working set. Kernel walked back from
+  "delivered speedup" to "completeness primitive" in the same
+  session. See CHANGELOG v0.6.0 entry for the production-result
+  table.
+
+Discipline rule (codified in CLAUDE.md Conventions, "Gate ship-
+decisions on in-pipeline A/B when synthetic-bench can't measure
+the dominant cost"):
+
+1. Don't *claim* a delivered speedup from a synthetic number;
+   default framing is "synthetic-bench above, e2e pending in-pipeline
+   measurement" until a downstream A/B confirms transfer.
+2. For kernel-day work with structural risk that synthetic-bench
+   *specifically* can't measure -- L2 contention with neighboring
+   modules, cumulative dispatch overhead at high call counts,
+   memory-allocator behavior under fragmentation, thermal/clock
+   state during sustained renders -- gate the v0.X ship commit on
+   an in-pipeline measurement BEFORE the commit lands, not after.
+
+The v0.6 walk-back was the cost of running this rule
+ship-first-validate-later. For per-call-heavy primitives (FFN/MLP,
+RoPE, any kernel called 1000+ times per render), the structural-risk
+list above is the default expected behavior, not the exception.
 
 The earlier metric (`self_attn_large_704x704x497` at seq=31776, D=64)
 was a synthetic shape with the wrong head_dim -- LTX 2.3 video is

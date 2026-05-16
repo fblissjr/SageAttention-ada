@@ -73,32 +73,98 @@ on sm89 fp8++: 2026-05-13 (v0.5.5).
 Real open TODOs. Each has an explicit trigger-to-act; we don't do these
 speculatively.
 
-### Close the sage_ffn production gap on multi-sampler LTX workloads
+### Persistent-CTA hybrid for stage-2 attention (highest e2e leverage; v0.7 candidate)
 
-v0.6.0's sage_ffn is +1.79% e2e slower than the chunking-only
-baseline on a two-sampler FML2V workflow (+20% per-call at stage-2,
-+3% at stage-1). Root cause is L2 contention with neighboring
-attention modules + cumulative kernel-launch overhead at LTX's
-~1000-FFN-calls/render count. Two candidates:
+After v0.6.0's production A/B, audio-loop characterized the wall-time
+breakdown of the FML2V multi-guide render. **Stage-2 attn1 (video
+self-attention at T=42240) is ~29% of total wall-time, the single
+heaviest sub-module across the whole render.** Stage-2 FFN is only
+~12%. The optimization-leverage calculus shifts: attention is a 2.4x
+bigger lever than FFN. See `internal/analysis/ltx_workload_profile.md`
+for the full breakdown.
 
-1. **Persistent-CTA two-kernel hybrid (option b' from the scoping
-   doc).** Persistent CTAs hold M-tile state in registers / L2
-   across the two matmuls. Addresses L2 contention directly --
-   the intermediate fits in the per-CTA share of L2 if persistent.
-   Significantly more kernel engineering than v0.6.0; probably
-   3-5 days of work.
-2. **CUTLASS-based CUDA backend for the fp8 matmul.** Closes the
-   Triton-vs-cuBLASLt codegen gap that bounds the synthetic
-   ceiling at 1.27-1.36x; unclear whether it would also recover
-   the production loss (#1 attacks the cache-locality root cause
-   more directly). 2-3 weeks of work.
+A persistent-CTA hybrid (CTAs hold M-tile state in registers/L2 across
+kernel calls, attacking the L2-contention root cause) applied to stage-2
+attn1 has an estimated ceiling of ~15% e2e wall-time reduction --
+the largest single perf lever in the LTX 2.3 production stack.
+
+Difficulty: high (persistent-CTA Triton is non-trivial). 2-3 weeks of
+kernel-engineering work.
+
+**Trigger to act:** persistent-CTA pattern is validated on FFN first
+(see the FFN entry below), AND user demand for a real attention-side
+e2e win on LTX-class workloads. Sequencing matters: prove the pattern
+on the smaller / lower-risk surface first, then port to the larger /
+higher-payoff surface.
+
+### Persistent-CTA hybrid for sage_ffn (validates the pattern; v0.6.1 candidate)
+
+v0.6.0's sage_ffn is +1.79% e2e slower than the chunking-only baseline
+on a two-sampler FML2V workflow (+20% per-call at stage-2, +3% at
+stage-1). Root cause is L2 contention with neighboring attention
+modules + cumulative kernel-launch overhead at LTX's
+~1000-FFN-calls/render count.
+
+The persistent-CTA hybrid (option b' from the scoping doc) attacks
+the L2-contention root cause directly: persistent CTAs hold M-tile
+state in registers/L2 across the two matmul kernels, so the
+intermediate doesn't have to re-fetch when neighboring attention
+modules thrash L2. Estimated 1-2 weeks of work. Expected delivered:
+~10-20% FFN speedup over current sage_ffn, putting it at parity-or-
+better vs torch reference, plus the memory-side win at stage-2 if
+the intermediate stays in L2.
+
+Smaller e2e gain than the attention port above (~3-5% wall-time vs
+~15%), but builds directly on v0.6 work and validates whether the
+hybrid pattern is viable before committing to the attention port.
 
 **Trigger to act:** user demand for "actually faster than torch
 reference on a real workload" surfaces, OR a different production
 workload class (single-pass / non-multi-guide) lands net-positive
-under sage_ffn and the priority becomes generalizing that. Until
-then, sage_ffn stays as a completeness primitive and the
-production default is `LTXVChunkFeedForward` (KJNodes).
+under sage_ffn and the priority becomes generalizing that.
+
+Recommended sequence: FFN persistent-CTA first (lower risk, faster
+to ship, validates the technique), attention persistent-CTA second
+(higher payoff once the pattern is proven on the smaller surface).
+
+### CUTLASS-based fp8 matmul backend (skip per workload-profile analysis)
+
+Was queued as an option for closing the v0.6.0 production gap; audio-
+loop's workload-profile data + the L2-contention root cause analysis
+showed this is the wrong root-cause attack. CUTLASS addresses matmul
+codegen quality (Triton-vs-cuBLASLt gap, bounded at ~1.27-1.36x in
+isolation); the production gap is L2 contention + dispatch overhead,
+not matmul throughput. cuBLASLt-level codegen on a kernel that still
+thrashes L2 doesn't move the needle.
+
+A more detailed analysis of why fp16-accum + CUTLASS-class matmul
+doesn't help here is in `internal/analysis/fp16_accum_fp8_matmul.md`.
+
+**Trigger to revisit:** persistent-CTA hybrid lands and the L2-thrash
+hypothesis is validated, AND a workload class surfaces where matmul
+throughput IS the bottleneck (not the current case).
+
+### Mask-aware autotune key (measurement hygiene; cheap)
+
+Triton's autotune key on the sm89 mask-correct path doesn't
+discriminate by mask kind. Warm-cache config inherited across mask
+shapes (causal, general, none) pollutes future perf measurements --
+a config tuned for one mask kind gets reused on another. The fix:
+add a mask-kind discriminator to the autotune key.
+
+Variance-class fix, not a perf bet. Disproportionate value because:
+
+- Removes the "warm-cache config inherited across mask kinds" issue
+  that polluted prior measurements
+- Foundational for any future kernel measurement work (persistent-CTA
+  spike measurements would benefit)
+- Catches the synthetic-vs-production trap class earlier next time
+
+Estimated 1-2 hours implementation.
+
+**Trigger to act:** land regardless of whether the larger persistent-
+CTA work happens. Measurement infrastructure compounds; do it before
+the next perf experiment fires.
 
 ### sage_ffn autotune key: coarsen to power-of-2 buckets on M
 

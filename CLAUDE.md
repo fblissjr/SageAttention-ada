@@ -202,18 +202,24 @@ identical at a shape where they shouldn't.
   fails at runtime with "expected at most N argument(s) but
   received N+1" -- pybind alone isn't enough. Worked example:
   CHANGELOG v0.5.5 + the kernel-correctness-reviewer agent.
-- **Don't ship a "delivered speedup" perf claim until in-pipeline
-  A/B has run.** Synthetic kernel-bench numbers are useful as
-  isolation measurements (and stay in the docs) but they are not
-  delivered consumer-app numbers. Two precedents in this fork:
-  v0.5.5 chunk-bypass A/B (synthetic mask-kernel win softened
-  once `LTXVChunkFeedForward` was shown to be doing the
+- **Gate ship-decisions on in-pipeline A/B when synthetic-bench
+  can't measure the dominant cost.** Two layers to this rule:
+  (a) Don't *claim* a delivered speedup from a synthetic number;
+  default framing is "synthetic-bench above, e2e pending in-pipeline
+  measurement" until a downstream A/B confirms the wedge transfers.
+  (b) For kernel-day work with structural risk that synthetic-bench
+  *specifically* can't measure (L2 contention with neighboring
+  modules in the production hot loop, cumulative dispatch overhead
+  at high call counts, memory-allocator behavior under fragmentation,
+  thermal/clock state during sustained renders), gate the v0.X ship
+  commit on an in-pipeline measurement BEFORE the commit lands, not
+  after. The v0.6 walk-back was the cost of running this rule
+  ship-first-validate-later.
+  Two precedents: v0.5.5 chunk-bypass A/B (synthetic mask-kernel win
+  softened once `LTXVChunkFeedForward` was shown to be doing the
   load-bearing memory work) and v0.6 sage_ffn (synthetic 1.26-1.36x
   came back +1.79% e2e slower on a two-sampler LTX FML2V workflow
-  due to L2 contention + cumulative launch overhead). Default
-  framing for new kernel-day work: "synthetic-bench above, e2e
-  pending in-pipeline measurement" until a downstream A/B on a
-  representative workload confirms the wedge transfers. Especially
+  due to L2 contention + cumulative launch overhead). Especially
   load-bearing for per-call-heavy primitives (FFN/MLP fire ~1000
   times per LTX render -- any per-call overhead compounds and any
   cache-locality assumption made under isolation can break).
@@ -288,12 +294,26 @@ Before removing or renaming any of those, read
 
 ## Performance research
 
-ALL perf decisions are graded against one row of one test:
-`tests/test_sageattn_ltx_shapes.py`, shape
-`ltx23_video_self_attn_init_22932`, mode `fp8_cuda++`. E2e ratios are
-workload-dependent (attention share varies). Full framework --
-metric, reasoning chain, side-effect checks, experiment-selection
-patterns, ignore-triggers, "what we might be wrong about",
+Two complementary inputs for any perf decision:
+
+1. **Kernel-isolation gate**: `tests/test_sageattn_ltx_shapes.py`,
+   shape `ltx23_video_self_attn_init_22932`, mode `fp8_cuda++`.
+   This is the single load-bearing row for "does this kernel work
+   at speed X at this shape" -- the isolation question. Synthetic
+   kernel-bench number; do not promote as delivered consumer-app
+   speedup.
+2. **E2e leverage input**: `internal/analysis/ltx_workload_profile.md`.
+   Where wall-time actually lives in the FML2V multi-guide workflow.
+   Currently: stage-2 attn1 is ~29% of total render (the single
+   heaviest sub-module), stage-2 FFN is ~12%, stage-2 attn2 is ~9%.
+   Use this to rank perf bets by leverage. The framework in
+   `docs/perf_research_framework.md` says: measure attention-share-
+   of-CUDA-time on each workload of interest, apply Amdahl with the
+   per-kernel ratio observed on that workload's actual call mix.
+
+E2e ratios are workload-dependent (attention share varies). Full
+framework -- reasoning chain, side-effect checks, experiment-
+selection patterns, ignore-triggers, "what we might be wrong about",
 pre-trigger briefing -- in `docs/perf_research_framework.md`. Load
 that before running a perf experiment.
 
@@ -329,6 +349,18 @@ graph-breaks at, the trigger to revisit, and the estimated work in
   regression_baselines.json source-of-truth rule.
 - `docs/fp16_matmul_accum.md` -- whether KJ's
   `enable_fp16_accumulation` affects sage output (no).
+- `internal/analysis/ltx_workload_profile.md` (gitignored) --
+  canonical sage-side copy of audio-loop's FML2V render breakdown.
+  Stage-2 attn1 ~29%, stage-2 FFN ~12%, etc. Use this for ranking
+  perf bets by leverage.
+- `internal/analysis/fp16_accum_fp8_matmul.md` (gitignored) --
+  analysis of why fp16-accum fp8 matmul throughput work
+  (LinkedIn-article-style "473 TFLOPS at LLM shape") doesn't
+  help LTX FFN-class workloads. Kijai independently replicated
+  the throughput AND ran it on LTX 2.3 in ComfyUI; output was
+  "visibly worse" due to fp16 dynamic-range overflow on DiT
+  activation distributions. Direct empirical confirmation of the
+  range-cap rtol cost.
 - `internal/pyright_noise.md` (gitignored) -- pyright false-positives
   to ignore in `sageattention/` and `tests/`. Two recurring categories
   worth knowing up front: "unreachable code" on `@triton.jit` kernel

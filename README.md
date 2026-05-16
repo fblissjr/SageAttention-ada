@@ -124,6 +124,11 @@ self-attn scale, so the accuracy reference is `SDPBackend.EFFICIENT_ATTENTION`.
 
 ### Unmasked self-attn
 
+Per-kernel speedup at synthetic LTX-class shapes (median over 3 timed
+runs). **These are isolation measurements, not e2e wall-time deltas
+on a render** -- the e2e contribution depends on the workload's
+attention share. Per-workload e2e numbers below.
+
 | shape                                    | sage fp8++ | torch_flash | speedup |
 |------------------------------------------|-----------:|------------:|--------:|
 | LTX self-attn (31776x31776, h=32, d=64)  |  19.95 ms  |   52.23 ms  |  2.62x  |
@@ -134,6 +139,16 @@ Quantization-induced rtol is ~0.097 on these shapes (well below the
 0.10 line we treat as the acceptable ceiling for DiT generation
 work). In practice this is below VAE noise on the image/video gen
 workloads we've tested; we haven't run task-level quality benchmarks.
+
+E2e ratio for the iclora workflow (audio-loop A/B 2026-05-07,
+attention share ~42% of CUDA kernel time): measured 1.41x wall ratio,
+matches pure-Amdahl prediction within 1.4%. For the FML2V multi-guide
+workflow (audio-loop day-9 A/B 2026-05-15, stage-2 attn1 is ~29% of
+total render): the per-kernel ratio above gives a much larger e2e
+lever than the FFN-side primitive (~15% e2e ceiling for a hypothetical
+2x stage-2 attention vs ~6% for FFN). See the canonical workload
+profile in `internal/analysis/ltx_workload_profile.md` (gitignored)
+for the full breakdown.
 
 ### Masked self-attn (post-v0.5.5)
 
@@ -307,9 +322,15 @@ Summary of the things worth knowing:
   (`tl.max(mask_block) == 0 -> skip`); the CUDA pipelined K-iteration
   loop makes the analog non-trivial. Currently relevant only for
   workloads we haven't measured.
-- **Other kernel optimizations under analysis** (mask-aware autotune
-  key, broadcast-mask specialization). See CHANGELOG / Backlog
-  for the actual list with triggers.
+- **Persistent-CTA hybrid for stage-2 attention** (highest e2e lever,
+  ~15% wall-time ceiling on LTX multi-guide workloads) and **for
+  sage_ffn** (validates the technique at lower risk). Both deferred;
+  see CHANGELOG Backlog for triggers. CUTLASS-based fp8 matmul backend
+  was queued and is now demoted to "skip per workload-profile analysis"
+  -- the v0.6 production gap was L2 contention + dispatch overhead,
+  not matmul codegen.
+- **Mask-aware autotune key** as measurement-hygiene infrastructure
+  (1-2 hour change, recommended regardless of larger work).
 
 ---
 
@@ -317,10 +338,14 @@ Summary of the things worth knowing:
 
 You get:
 
-- 2-2.7x speedup over torch's flash backend on sm89 self-attn at the
-  DiT-class shapes we validated (head_dim ∈ {64, 120, 128}).
+- 2-2.7x per-call speedup over torch's flash backend on sm89 self-attn
+  at the DiT-class shapes we validated (head_dim ∈ {64, 120, 128}).
+  Synthetic kernel-bench measurement; e2e wall-time wedge depends on
+  the workload's attention share. Measured: 1.41x e2e on the iclora
+  workflow at ~42% attention share, matches pure-Amdahl within 1.4%.
 - A faster cross-attn path via `sageattn_qk_int8_pv_fp16_triton`
-  (~2.8x over `torch_cudnn` at LTX cross-attn shapes).
+  (~2.8x over `torch_cudnn` at LTX cross-attn shapes). Same caveat:
+  per-call, not e2e.
 - Native mask support on the sm89 fp8++ CUDA path -- masked calls
   run at fp8++ speed instead of paying the Triton fallback
   overhead. (Other archs still use Triton.)
