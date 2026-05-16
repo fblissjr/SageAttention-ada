@@ -137,6 +137,15 @@ Scripts under `tests/spikes/` need a one-line
 `sys.path.insert(0, str(Path(__file__).resolve().parent.parent))`
 before the import.
 
+Spike scripts under `tests/spikes/` wrap measurement loops in
+`torch.inference_mode()` (stricter than `no_grad` -- drops
+version-counter tracking; matches the sampler/consumer path under
+which these kernels actually run). Add NVTX ranges
+(`torch.cuda.nvtx.range("label")`) on every measurement region so
+`nsys profile` timeline view shows labeled kernels in addition to
+raw aggregation. Both conventions applied in
+`tests/spikes/spike_concurrent_dispatch{,_submodule}.py`.
+
 `tests/repros/` holds minimal standalone repros for kernel defects.
 
 GPU OOM mid-test usually means contention, not a bug. Check
@@ -163,6 +172,16 @@ identical at a shape where they shouldn't.
 - Comments: only non-obvious WHY.
 - **Never push without being asked.** Origin is the maintainer's
   personal fork.
+- **Retract wrong-framing in committed docs via `git revert`, not
+  in-place edit.** The revert preserves the wrong commit + its
+  message in `git log` and supersedes it with a revert commit on
+  top; the audit trail of "we believed X, then disproved X" stays
+  reconstructible. An in-place edit leaves the wrong framing in the
+  diff history as an unflagged precursor that future `git log -p
+  <file>` would surface without context. Worked example: the
+  2026-05-16 "47% comfy-aimdo offload" workload-profile claim
+  (commit `a05fdf4`) retracted via `git revert` at `95af2cf` after
+  a `nodynvram` A/B disproved the framing.
 - **Consumer-agnostic framing in committed material.** Refer to
   downstream callers as "downstream consumer" / "consumer" --
   generic. Model class is fine (LTX 2.3, Flux, Z-Image-Turbo); a
@@ -170,6 +189,14 @@ identical at a shape where they shouldn't.
   the name is itself load-bearing: the downstream-known-symbols
   audit (specific importer) and measurement provenance (workflow
   filename in perf claims).
+- **Task/caller refs in committed code don't age.** Memo timestamps
+  ("07:45Z"), cross-clone references ("per X's note"), and
+  session-specific framings ("today's spike showed") decay -- the
+  memo trail isn't in the repo, and a reader six months later can't
+  reconstruct context. Replace with the substantive reason: cite the
+  production precedent, the cross-version stability concern, or the
+  file:line of the canonical source. Easy to introduce; easy to
+  scrub in /simplify; the second cycle is wasted effort.
 - **Project-internal phase numbers don't ship.** Belong in the plan
   file, not in code / CLI / CHANGELOG.
 - **Path discipline.** Every committed path is repo-relative. The
@@ -223,7 +250,7 @@ identical at a shape where they shouldn't.
   load-bearing for per-call-heavy primitives (FFN/MLP fire ~1000
   times per LTX render -- any per-call overhead compounds and any
   cache-locality assumption made under isolation can break).
-- **Triton kernel-day discipline.** Three recurring traps:
+- **Triton kernel-day discipline.** Four recurring traps:
   (a) `@triton.jit` can't read module-level Python globals -- inline
       literals in the kernel body (e.g. `448.0` for FP8_E4M3_MAX).
   (b) For DiT FFN/MLP kernels, audit BOTH Linear layers for `bias=True`
@@ -236,6 +263,15 @@ identical at a shape where they shouldn't.
       cold). Pattern: tune full sweep once, extract winners via
       `kernel.cache.items()`, hardcode ~8 configs + neighbors. Worked
       example: v0.6 sage_ffn (CHANGELOG v0.6.0).
+  (d) CUDA event timing across streams captures queue-wait + execution,
+      not just kernel duration. When `e_start.record()` is on the
+      default stream and `e_end.record(s_other)`, `elapsed_time` between
+      them measures `s_other`'s wait-for-SMs plus the kernel. A `t_ms`
+      variable name telegraphs "this is kernel time"; future readers
+      will misread. Use `*_end_offset_ms` or similar to signal the
+      asymmetry vs single-stream timing. Worked example:
+      `tests/spikes/spike_concurrent_dispatch.py` (renamed in /simplify
+      pass after the bare metric misread).
 
 ## The consumer surface
 
