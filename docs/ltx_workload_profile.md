@@ -80,38 +80,17 @@ The tracer's T-buckets are stream-bucketed, not stage-bucketed: T=100 is the aud
 
 Stage-2 attn1 + stage-2 ff together = 37.6% of total render. That's the combined target for stage-2 persistent-CTA work.
 
-## Dynamic VRAM offload dominates the sampler under production conditions
-
-A subsequent torch.profiler chrome-trace audit (2026-05-16, fingerprint-on so absolute timing is inflated ~1.5-2x vs the table above but the proportional split is meaningful) revealed that ComfyUI's dynamic VRAM offload (comfy-aimdo / `--reserve-vram 0.5`) accounts for ~47% of sampler wall-time on this workload:
-
-| aten op | count | total ms | what it is |
-|---|---:|---:|---|
-| `aten::copy_` | 39,989 | ~35,300 | weight shuttle CPU<->GPU |
-| `aten::to` | 65,171 | ~31,700 | dtype/device conversion |
-| `aten::linear` | 25,976 | ~1,700 | qkv + out_proj + ff Linears (the work) |
-
-**~47% of sampler wall-time is PCIe weight-shuttle, NOT GPU compute.**
-
-This is a critical reframing for kernel-side perf decisions:
-
-- Concurrent-dispatch parallelism overlaps GPU compute with GPU compute; it cannot overlap with `aten::copy_` (PCIe-bandwidth-bound, not on the GPU compute engine). The 47% offload pool is outside sage's reach.
-- Persistent-CTA-class kernel work targets L2 contention within GPU compute. The 47% offload pool is unaffected by L2 work either.
-- The "biggest single lever" reshuffles. Stage-2 attn1 at ~25.7% of total render is still the largest single GPU-compute lever, but it competes for engineering attention against the larger offload-share that no kernel work touches.
-
-A `--reserve-vram 0`-style follow-up audit (less VRAM pressure -> less offload) is pending; would tell us whether this 47% is structural to LTX 2.3's working set on 24 GiB or specific to the production VRAM-reserve setting. Until that runs, treat the offload share as audit-derived under one VRAM-reserve config, not as a fixed property of the workload.
-
 ## What this means for sage-side perf work
 
-Lever ranking by structural prize. **Wedges below are bounded by Amdahl against the ~53% of sampler that is GPU compute under production VRAM-pressure conditions (the other ~47% is offload that no kernel-side work touches).** Numbers cited as `% of render` already include the offload-Amdahl ceiling implicitly.
+Lever ranking by structural prize:
 
-- **Stage-2 attn1**: 25.7% of total render. Persistent-CTA-class kernel work targeting L2 contention can plausibly move 20-40% of this -> ~5-10% e2e wall-time. Single largest GPU-compute lever.
-- **Stage-2 ff**: 9.8% of total render (the third FFN-share-triplet reading). Persistent-CTA on FFN tested in v0.6.0 ran +20% slower per-call due to L2 contention; persistent-CTA done right could plausibly recover that AND improve, ~3-5% e2e.
-- **Audio + v2a stream**: 8.4% of total render currently observable, expected slightly larger with full Window-B (V2A || A2V) accounted for. Concurrent-dispatch parallelism could in principle overlap most of this with the video path's wall-time -- mechanism confirmed by 3-run path-B sub-module spike (audio fully absorbed into video bulk work, video slowdown -0.6% to -1.7% under concurrent issue). Prize ceiling revised down to 3-7% e2e under VRAM-pressure conditions because the offload pool reduces overlappable surface; could be higher under nodynvram conditions pending audit.
+- **Stage-2 attn1**: 25.7% of total render. Persistent-CTA-class kernel work targeting L2 contention can plausibly move 20-40% of this -> ~5-10% e2e wall-time. Single largest lever.
+- **Stage-2 ff**: 9.8% of total render (the third triplet reading). Persistent-CTA on FFN tested in v0.6.0 ran +20% slower per-call due to L2 contention; persistent-CTA done right could plausibly recover that AND improve, ~3-5% e2e.
+- **Audio + v2a stream**: 8.4% of total render currently observable (10.2% of sampler); expected larger once `audio_to_video_attn` populates from the next render. Concurrent-dispatch parallelism could in principle overlap most of this with the video path's wall-time -- 2-5% e2e if the mechanism works on the 4090. Spike pending.
 - **VAE decode**: 9.8% of render. Kernel-side surface unknown; chrome-trace audit pending. If GPU-bound + sm89-tunable, real lever. If memory-bound, rules it out from kernel-side work.
 - **AdaLN-Single**: ~3-4% of sampler / ~3% of render. Low individual leverage. Composes with RoPE + norms (other small fusion targets) potentially.
-- **Workflow-level VRAM-reserve tuning**: NOT a sage-side lever, but worth noting -- if a user can run with less aggressive VRAM-reserve (`--reserve-vram 0` or model-offload-disabled), the 47% offload pool shrinks and EVERY kernel-side optimization gets correspondingly more leverage on the new (mostly-GPU-compute) sampler total. Bigger impact than any single kernel-side intervention.
 
-CUTLASS / fp16-accum-style matmul throughput work does NOT make the priority list. The bottleneck on stage-2 isn't matmul throughput; it's L2 cache locality + dispatch overhead under VRAM-pressure conditions. See `docs/fp16_accum_fp8_matmul.md`.
+CUTLASS / fp16-accum-style matmul throughput work does NOT make the priority list. The bottleneck on stage-2 isn't matmul throughput; it's L2 cache locality + dispatch overhead. See `docs/fp16_accum_fp8_matmul.md`.
 
 ## Sequencing implications
 
