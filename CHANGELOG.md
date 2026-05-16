@@ -77,7 +77,7 @@ speculatively.
 
 After v0.6.0's production A/B, a downstream consumer characterized
 the wall-time breakdown of the FML2V multi-guide render. **Stage-2 attn1 (video
-self-attention at T=42240) is ~29% of total wall-time, the single
+self-attention at T=42240) is ~25.7% of total wall-time, the single
 heaviest sub-module across the whole render.** Stage-2 FFN is only
 ~12%. The optimization-leverage calculus shifts: attention is a 2.4x
 bigger lever than FFN. See `docs/ltx_workload_profile.md`

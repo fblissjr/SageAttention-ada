@@ -118,18 +118,21 @@ LLM workloads stay in range because trained LLM weights are well-conditioned. Th
 Even granting an optimistic counterfactual where fp16-accum gives sage_ffn
 a 2x matmul-throughput boost AND that boost transfers to production
 (neither is true today, both would have to be earned), the e2e impact
-is bounded by Amdahl. Per `docs/ltx_workload_profile.md`:
+is bounded by Amdahl. Per `docs/ltx_workload_profile.md` (rev 2,
+tracer-grounded numbers):
 
-- Stage-2 FFN is ~12% of total FML2V render wall-time
-- Hypothetical 2x speedup on a 12%-of-render component caps e2e
-  reduction at ~6%
-- 1.5x speedup caps e2e reduction at ~4%
+- Total FFN (video + audio, all stages) = ~16% of total FML2V render
+  wall-time
+- Stage-2 video FFN alone = ~10% of total render
+- Hypothetical 2x speedup on total FFN caps e2e reduction at ~8%
+- Hypothetical 2x speedup on stage-2 ff specifically caps it at ~5%
+- 1.5x speedup caps e2e reduction at ~3-5% depending on FFN scope
 
 So even in the best-case fp16-accum scenario where the throughput
 transfers AND the rtol stays in budget AND L2 contention isn't a
 problem, the e2e ceiling is single-digit percent. By contrast,
-persistent-CTA on stage-2 attention (29% of render) has a ~15% e2e
-ceiling at the same kernel-side speedup. The leverage calculus
+persistent-CTA on stage-2 attention (25.7% of render) has a ~10-13%
+e2e ceiling at the same kernel-side speedup. The leverage calculus
 strongly prefers attention over FFN-matmul-throughput as the next
 sage-side perf investment.
 

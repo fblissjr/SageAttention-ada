@@ -304,8 +304,9 @@ Two complementary inputs for any perf decision:
    speedup.
 2. **E2e leverage input**: `docs/ltx_workload_profile.md`.
    Where wall-time actually lives in the FML2V multi-guide workflow.
-   Currently: stage-2 attn1 is ~29% of total render (the single
-   heaviest sub-module), stage-2 FFN is ~12%, stage-2 attn2 is ~9%.
+   Currently: stage-2 attn1 is ~25.7% of total render (the single
+   heaviest sub-module), stage-2 FFN ~10%, stage-2 attn2 ~7%, total
+   FFN (video + audio, all stages) ~16% of render.
    Use this to rank perf bets by leverage. The framework in
    `docs/perf_research_framework.md` says: measure attention-share-
    of-CUDA-time on each workload of interest, apply Amdahl with the
@@ -350,8 +351,8 @@ graph-breaks at, the trigger to revisit, and the estimated work in
 - `docs/fp16_matmul_accum.md` -- whether KJ's
   `enable_fp16_accumulation` affects sage output (no).
 - `docs/ltx_workload_profile.md` -- canonical FML2V render
-  breakdown. Stage-2 attn1 ~29%, stage-2 FFN ~12%, etc. Use this
-  for ranking perf bets by leverage.
+  breakdown. Stage-2 attn1 ~25.7% of render, total FFN ~16%, VAE
+  decode ~10%. Use this for ranking perf bets by leverage.
 - `docs/fp16_accum_fp8_matmul.md` -- analysis of why fp16-accum
   fp8 matmul throughput work (LinkedIn-article-style "473 TFLOPS
   at LLM shape") doesn't help LTX FFN-class workloads. Throughput

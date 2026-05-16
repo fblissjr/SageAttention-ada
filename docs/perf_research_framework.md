@@ -50,14 +50,14 @@ varies. Two measurements on file:
   full saving comes from sage's faster attention kernel.
 
 - **LTX 2.3 FML2V multi-guide at production scale (in-pipeline A/B
-  2026-05-15)**: full wall-time breakdown is in
-  `docs/ltx_workload_profile.md`. Stage-2 attn1 is ~29%
-  of total render (~107 ms/call at T=42240, the single heaviest
-  sub-module). Stage-2 FFN is ~12%. Stage-2 attn2 is ~9%. Stage-1
-  segment is ~27% of total, stage-2 is ~50%, VAE encode/decode +
-  setup is ~23%. This is the canonical render-time profile for any
-  multi-sampler LTX work; cite it before guessing at workload
-  composition.
+  2026-05-15, v2 tracer audit 2026-05-16)**: full wall-time
+  breakdown is in `docs/ltx_workload_profile.md`. Tracer-grounded
+  numbers: stage-2 attn1 ~25.7% of total render (the single
+  heaviest sub-module), stage-2 ff ~10% of render, stage-2 attn2
+  ~7%, total FFN (video + audio, all stages) ~16% of render, VAE
+  decode ~9.8%. Sampler is 81.9% of render. This is the canonical
+  render-time profile for any multi-sampler LTX work; cite it
+  before guessing at workload composition.
 
 The three numbers are real; they describe different workloads with
 different attention shares. The framework: measure attention-share-
