@@ -137,6 +137,14 @@ Scripts under `tests/spikes/` need a one-line
 `sys.path.insert(0, str(Path(__file__).resolve().parent.parent))`
 before the import.
 
+For bit-identicality checks on bf16/fp16 outputs (e.g. stream-safety
+spikes), use `torch.equal(a.view(torch.uint16), b.view(torch.uint16))`
+-- bare `torch.equal(a, b)` returns False whenever either tensor has
+NaN even at identical bit patterns, and random mockup weights at LTX
+shapes frequently produce NaN positions. The uint16-view sidesteps
+NaN-equality semantics. Worked example:
+`tests/spikes/spike_concurrent_dispatch_submodule.py::correctness_sanity`.
+
 Spike scripts under `tests/spikes/` wrap measurement loops in
 `torch.inference_mode()` (stricter than `no_grad` -- drops
 version-counter tracking; matches the sampler/consumer path under
@@ -272,6 +280,18 @@ identical at a shape where they shouldn't.
       asymmetry vs single-stream timing. Worked example:
       `tests/spikes/spike_concurrent_dispatch.py` (renamed in /simplify
       pass after the bare metric misread).
+  (e) Raw CUDA kernel launches default to stream 0 if the 4th arg is
+      omitted. `<<<grid, block, smem>>>` silently breaks any caller that
+      wraps sage in `with torch.cuda.stream(...)` -- Triton kernels in
+      the same Python call respect current stream, the CUDA launch
+      doesn't, and the race surfaces as small-but-stable rtol drift
+      (~0.02) or NaN under a partial fix that only patches the attn
+      kernel but leaves `csrc/fused/fused.cu`'s quant pre-kernels on
+      stream 0. Use `<<<grid, block, smem,
+      at::cuda::getCurrentCUDAStream()>>>` and
+      `#include <ATen/cuda/CUDAContext.h>` on every site (`csrc/qattn/`
+      sm89/sm80 + `csrc/fused/fused.cu`). Worked example: v0.6.1
+      (CHANGELOG).
 
 ## The consumer surface
 
