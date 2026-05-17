@@ -566,6 +566,71 @@ sufficient.
 
 ## Versions
 
+### v0.6.1 -- 2026-05-17  (stream-safety fix: kernel launches now honor the current CUDA stream)
+
+Every CUDA kernel launch in `csrc/qattn/sm89_*.cu`,
+`csrc/qattn/qk_int_sv_f16_cuda_sm80.cu`, and `csrc/fused/fused.cu`
+used the 3-argument launch configuration `<<<grid, block, smem>>>`,
+which omits the stream argument and defaults to the legacy default
+stream (stream 0). Triton kernels (used both directly via the
+`*_triton` paths and as the QK quant pre-step for `fp8_cuda` paths)
+correctly respect `at::cuda::getCurrentCUDAStream()`, but sage's
+own CUDA launches silently ignored the caller's stream context.
+
+For default-stream callers this is a no-op: `getCurrentCUDAStream()`
+returns the default stream, so the launch lands on the same stream
+it always did. For callers that wrap sage in `with
+torch.cuda.stream(s_other):`, the launch was landing on the
+default stream while preceding kernels (`Linear` projections, etc.)
+were correctly enqueued on `s_other`. Without an explicit
+`cudaStreamWaitEvent`, the sage kernel saw whatever state the
+default stream happened to have, which is racy.
+
+**Fix.** Pass `at::cuda::getCurrentCUDAStream()` as the fourth
+launch argument on every kernel launch in the three files above
+(1 in each of 7 sm89 .cu files, 4 in the sm80 .cu, 8 in fused.cu).
+Add `#include <ATen/cuda/CUDAContext.h>` where it was missing
+(fused.cu already had it).
+
+**Verification.** `tests/spikes/spike_concurrent_dispatch_submodule.py`
+previously measured a stable ~0.02 mean_rtol drift between
+sequential dispatch and side-stream dispatch on the video
+self-attention path; post-fix the same spike measures
+`bits_equal=True, mean_rtol=0.000000` on both video (sage fp8++)
+and audio (FA via SDPA) arms. The same shape under un-patched
+quant pre-kernels (fused.cu) but patched attn kernel produced NaN
+in the side-stream output -- the quant kernel was racing with the
+preceding Linear on the side stream. With all launch sites patched
+both stages of the pipeline sequence correctly on the caller's
+stream.
+
+`tests/test_sageattn_ltx_shapes.py` shows no rtol or perf drift
+on the default-stream path; the two `--check-regression` flags
+fired are pre-existing stale baselines from v0.3.0 that predate
+the v0.5.5 dispatcher mask-routing change (the `auto` row at
+`ltx23_video_cross_text_kv226` now lands on `fp8_cuda++` rather
+than `fp16_triton`, which is the v0.5.5-shipped behavior).
+Separate from this fix.
+
+**Files touched.** 9 .cu files in csrc + 1 spike (added bit-equality
+diagnostic alongside the rtol report).
+
+**Why this surfaced now.** The concurrent-dispatch spikes under
+`tests/spikes/spike_concurrent_dispatch*.py` ran sage from inside
+a side-stream context for the first time; default-stream callers
+never exercise the failure mode (current stream == default stream
+makes the missing argument semantically equivalent to the
+fix). A cross-render fingerprint check on the production
+default-stream path was bit-deterministic at every sage call
+position, which scoped the drift to the side-stream path
+specifically and motivated the source read that found the
+3-argument launches.
+
+**Scope note.** This is a correctness fix, not a perf change. The
+default-stream hot path is bit-identical before/after. The fix
+unblocks correctness for any consumer that wants to dispatch sage
+on a side stream.
+
 ### v0.6.0 -- 2026-05-15  (sage_ffn: fp8-native two-kernel fused MLP for LTX 2.3-class FFN blocks on sm89 -- ships as completeness primitive, not currently a perf win in production)
 
 Ships `sage_ffn(x, w1, s1, w2, s2)` -- a Triton two-kernel

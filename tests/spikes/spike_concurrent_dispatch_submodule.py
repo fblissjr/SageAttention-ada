@@ -269,8 +269,15 @@ def correctness_sanity(video_block, audio_block, video_x, video_ts, audio_x, aud
 
     v_mean_rtol, _, _, _ = accuracy_metrics(v_conc, v_seq)
     a_mean_rtol, _, _, _ = accuracy_metrics(a_conc, a_seq)
-    print(f"  video seq vs concurrent: mean_rtol = {v_mean_rtol:.6f}")
-    print(f"  audio seq vs concurrent: mean_rtol = {a_mean_rtol:.6f}")
+    # view-as-uint16 because torch.equal treats NaN != NaN, while the
+    # stream-safety question is whether bit patterns match regardless of
+    # NaN semantics. Random mockup weights can produce NaN positions
+    # naturally; what matters is whether the side-stream path produces
+    # the same bits as the default-stream path.
+    v_bits_eq = torch.equal(v_seq.view(torch.uint16), v_conc.view(torch.uint16))
+    a_bits_eq = torch.equal(a_seq.view(torch.uint16), a_conc.view(torch.uint16))
+    print(f"  video seq vs concurrent: bits_equal={v_bits_eq}  mean_rtol={v_mean_rtol:.6f}")
+    print(f"  audio seq vs concurrent: bits_equal={a_bits_eq}  mean_rtol={a_mean_rtol:.6f}")
     if v_mean_rtol > 1e-5 or a_mean_rtol > 1e-5:
         print("  WARN: drift between sequential and concurrent. Investigate.")
 
