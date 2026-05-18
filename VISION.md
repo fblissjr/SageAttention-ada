@@ -1,14 +1,16 @@
-last updated: 2026-04-26
+last updated: 2026-05-19
 
 # sage-fork
 
-A 4090 / Ada attention-kernel optimization repo for **DiT-class local
+A 4090 / Ada sm89 kernel optimization repo for **DiT-class local
 generation**: LTX 2.3 video, Flux-class image (Flux 2 Klein and
 predecessors), Z-Image-Turbo S3-DiT, and other diffusion transformers
-we run locally. The kernel base is sage attention; the bench harness
-measures it alongside SpargeAttention, FlashInfer, and torch SDPA at
-the actual shapes our models run, on the actual GPU we have (RTX
-4090). One number drives every decision.
+we run locally. The kernel base is sage attention (the attention
+primitive); v0.6 added `sage_ffn`, an fp8-native fused MLP for
+DiT FFN blocks. The bench harness measures these alongside
+SpargeAttention, FlashInfer, and torch SDPA at the actual shapes our
+models run, on the actual GPU we have (RTX 4090). One number drives
+every attention decision; sage_ffn has its own measurement surface.
 
 ## How this works
 
@@ -130,6 +132,20 @@ and we add a perceptual layer.
   so it actually compiles from source on Ada (woct0rdho's `setup.py`
   refactor accidentally dropped it). Load-bearing only because every
   kernel-side change ships through the editable install.
+- **A fused fp8 MLP primitive (`sage_ffn`, v0.6)** for DiT FFN
+  blocks. Two-kernel Triton fp8 path
+  (`Linear(fp8) -> GELU(tanh) -> Linear(fp8)`) targeting LTX 2.3-
+  class FFN. Ships as completeness primitive while the v0.6 e2e gap
+  is investigated; the qualitative wedge holds, the quantitative
+  one is workload-dependent. Not wired into the `sageattn()`
+  dispatcher; consumer imports it directly.
+- **A perf-research methodology framework** (`docs/perf_research_framework.md`)
+  that codifies the rules every kernel-day decision is graded
+  against: load-bearing metric, synthetic-vs-in-pipeline gap,
+  evidence ladder for kernel-replacement audits (kernel-name
+  presence > per-call logs > attribution coverage > sub-module
+  time delta), disprove-test discipline. Reusable across any
+  future kernel work on this fork.
 - **A decision log** that grades every kernel-side change against the
   metric above. Deferrals carry concrete reopen-numbers, not vague
   "trigger fires."
@@ -182,6 +198,13 @@ and we add a perceptual layer.
   metric" — the full perf-research framework: side-effect checks,
   next-experiment patterns, what we ignore and the trigger that
   would change that.
+- [`docs/perf_research_framework.md`](./docs/perf_research_framework.md)
+  — the methodology framework in full, including the evidence
+  ladder for kernel-replacement audits.
+- [`docs/roadmap.md`](./docs/roadmap.md) — forward-looking record
+  of directions worth pursuing, tiered by relevance and trigger-
+  conditional. Not a committed schedule; the user remains the
+  scheduler.
 - [`internal/PLAN.md`](./internal/) (gitignored) — live operational
   doc. Backlog with triggers, experiment log (TSV), the research
   loop. Edit every session.
@@ -209,19 +232,39 @@ The metric and framework reflect the workload mix on this box as of
    (PSNR / SSIM / LPIPS).
 3. **Kernel ms is not gen ms.** A 2× kernel speedup is invisible
    end-to-end if attention is already < 50 % of step time.
-   **Status: confirmed (with refinement) per v0.5.1.** First e2e
-   measurement on the canonical LTX 2.3 audio-loop workload
-   (832×480×497 / 25fps / 8-step distilled): sage's 2.66×
-   kernel-row speedup translates to **1.22× end-to-end**, with
-   attention at 8.2% of wall. Pure-attention Amdahl predicts
-   ~1.05×; observed 1.22× is +17 points higher because sage's
-   reach extends beyond the per-call attention rows into
-   FFN-adjacent amortization within the sampler step. Concrete
-   answer: kernel work IS justified; the simplification "kernel
-   ms = gen ms" isn't literally true; non-attention bottlenecks
-   (VAE decode, caching, scheduler overhead) are where the next
-   round of e2e wins routes. See CHANGELOG v0.5.1 for the
-   measurement detail.
+   **Status: confirmed (with two refinements).**
+
+   *v0.5.1 first e2e measurement* on the canonical LTX 2.3 audio-
+   loop workload (832×480×497 / 25fps / 8-step distilled): sage's
+   2.66× kernel-row speedup translates to **1.22× end-to-end**,
+   with attention at 8.2% of wall. Pure-attention Amdahl predicts
+   ~1.05×; observed 1.22× is +17 points higher because sage's reach
+   extends beyond the per-call attention rows into FFN-adjacent
+   amortization within the sampler step.
+
+   *v0.6 sage_ffn e2e walk-back* on a two-sampler LTX FML2V
+   workflow (CHANGELOG v0.6.0): synthetic kernel-bench projected
+   1.26-1.36× vs torch fp8-dequant reference, but the in-pipeline
+   A/B came back **+1.79% e2e SLOWER** (+20% per-call at stage-2).
+   Root cause was L2 cache contention with neighboring attention
+   modules + cumulative kernel-launch overhead at LTX's ~1000-FFN-
+   calls/render count. **This is the cost of running synthetic-
+   first / in-pipeline-validate-later** for kernel work with
+   structural risk that synthetic bench specifically can't measure
+   (L2 contention, dispatch overhead, fragmentation, sustained
+   thermal). Codified as the discipline rule in CLAUDE.md
+   "Gate ship-decisions on in-pipeline A/B when synthetic-bench
+   can't measure the dominant cost." Going forward, kernel-day
+   work with this risk shape gates the v0.X ship commit on in-
+   pipeline A/B BEFORE the commit lands, not after.
+
+   Concrete answer at the VISION level: kernel work IS justified
+   per v0.5.1; the simplification "kernel ms = gen ms" isn't
+   literally true; non-attention bottlenecks (VAE decode, caching,
+   scheduler overhead) are where the next round of e2e wins routes;
+   and synthetic-bench projections need in-pipeline validation
+   before being claimed as e2e wins, especially for per-call-heavy
+   primitives.
 4. **The next-experiment framework is V1.** It codifies a strategy;
    the strategy hasn't been validated by running through it on a
    real perf change yet. The first time we use it to pick a

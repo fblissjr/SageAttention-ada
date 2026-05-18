@@ -429,6 +429,12 @@ graph-breaks at, the trigger to revisit, and the estimated work in
 - `VISION.md` -- canonical scope doc. What this fork is, what it
   isn't, the single load-bearing metric, what we might be wrong
   about. Rare edits.
+- `docs/roadmap.md` -- forward-looking record of directions worth
+  pursuing, tiered by relevance to the current workload + trigger-
+  conditional. Not a committed schedule; the user remains the
+  scheduler. Edited when the option space shifts (a tier item gets
+  promoted to CHANGELOG Backlog, demoted to Decision-log, or a new
+  candidate is enumerated).
 - `README.md` -- attribution + minimal user-facing summary.
 - `CHANGELOG.md` -- versioned divergence + Known kernel bugs +
   Backlog + Decision log + Recurring process items. Source of truth
