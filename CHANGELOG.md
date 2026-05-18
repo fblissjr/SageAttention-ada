@@ -566,6 +566,45 @@ sufficient.
 
 ## Versions
 
+### v0.6.3 -- 2026-05-19  (session-start dispatch log in `sageattn()`)
+
+`sageattn()` now emits one `[INFO] sage routing: arch=... cuda=...
+mask=... pv_accum=... -> <kernel>` line to stderr per unique
+`(arch, cuda_version, mask_present, pv_accum_dtype, kernel_name)`
+tuple observed in the current process. Subsequent calls with the
+same tuple are silent.
+
+Sample output (sm89 + CUDA >= 12.8, unmasked):
+
+```
+[INFO] sage routing: arch=sm89 cuda=13.0 mask=False pv_accum=fp32+fp16 -> fp8_cuda++
+```
+
+This gives consumers a grep-able ground-truth record of which kernel
+the dispatcher actually chose for their `(arch, cuda_version, mask
+presence, pv_accum_dtype)` config, without forcing a programmatic
+call to `get_last_dispatched_kernel()`. The dispatcher audit on
+2026-05-18 identified this as the "observability of happy path" gap
+between our exhaustive-with-explicit-raise dispatch and the lesson
+that "every dispatch leaf should surface its choice once per session"
+from a cross-clone wrapper postmortem.
+
+Helpers added to `sageattention.core`:
+
+- `_log_routing_choice_once(arch, mask_present, pv_accum_dtype, kernel_name)`
+  -- called from each branch of `sageattn()`. Module-level dedup set;
+  thread-safe enough for the one-write-per-tuple semantics.
+- `_reset_routing_log_for_test()` -- test-only state reset.
+
+Test coverage at `tests/test_dispatcher_routing_log.py` (5 standalone
+cases: first-call emits, second-call deduped, different routing
+tuple emits separately, reset helper clears state, kernel name in
+log matches `get_last_dispatched_kernel()`).
+
+The existing telemetry test (`tests/test_dispatched_kernel_telemetry.py`)
+still passes -- the routing log is additive and orthogonal to the
+`_record_dispatch` / `get_last_dispatched_kernel` telemetry API.
+
 ### v0.6.2 -- 2026-05-18  (informative `sage_ffn` precondition asserts)
 
 Every `assert` inside `sage_ffn(...)` now carries a message naming

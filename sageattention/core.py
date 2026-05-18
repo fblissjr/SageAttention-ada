@@ -47,6 +47,7 @@ from .quant import per_channel_fp8
 
 from typing import Any, Callable, List, Literal, Optional, Sequence, Tuple, Union
 import threading
+import sys
 import warnings
 
 
@@ -114,6 +115,37 @@ def _reset_dispatch_for_test() -> None:
     returns None. Not part of the public API."""
     if hasattr(_dispatch_state, "last"):
         del _dispatch_state.last
+
+
+# Session-start routing log: one stderr line per unique routing
+# tuple, dedup'd process-wide. Module-level (not thread-local) so a
+# multi-thread consumer sees one log per tuple regardless of which
+# thread called first; matches "session start" semantics.
+_CUDA_VERSION_AT_IMPORT = torch.version.cuda or "unknown"
+_seen_routing_tuples: set[tuple[str, bool, str, str]] = set()
+
+
+def _log_routing_choice_once(
+    arch: str,
+    mask_present: bool,
+    pv_accum_dtype: str,
+    kernel_name: str,
+) -> None:
+    key = (arch, mask_present, pv_accum_dtype, kernel_name)
+    if key in _seen_routing_tuples:
+        return
+    _seen_routing_tuples.add(key)
+    sys.stderr.write(
+        f"[INFO] sage routing: arch={arch} cuda={_CUDA_VERSION_AT_IMPORT} "
+        f"mask={mask_present} pv_accum={pv_accum_dtype} -> {kernel_name}\n"
+    )
+
+
+def _reset_routing_log_for_test() -> None:
+    """Test-only: clear the seen-routing-tuples set so the next
+    sageattn() call re-emits its routing line. Not part of the
+    public API."""
+    _seen_routing_tuples.clear()
 
 
 def _warn_if_mask_passed_to_cuda_kernel(kwargs: dict, kernel_label: str) -> None:
@@ -243,12 +275,14 @@ def sageattn(
         # still need the Triton fallback for mask correctness.
         if arch == "sm89" and get_cuda_version() >= (12, 8):
             kwargs.setdefault("pv_accum_dtype", "fp32+fp16")
+            _log_routing_choice_once(arch, True, "fp32+fp16", KERNEL_FP8_CUDA_PP)
             return sageattn_qk_int8_pv_fp8_cuda(
                 q, k, v,
                 tensor_layout=tensor_layout, is_causal=is_causal,
                 sm_scale=sm_scale, return_lse=return_lse,
                 attn_mask=attn_mask, **kwargs,
             )
+        _log_routing_choice_once(arch, True, "n/a", KERNEL_FP16_TRITON)
         return sageattn_qk_int8_pv_fp16_triton(
             q, k, v,
             tensor_layout=tensor_layout, is_causal=is_causal,
@@ -264,16 +298,20 @@ def sageattn(
     # change. Override-wins matches Python's standard "caller-explicit
     # beats callee-default" convention.
     if arch == "sm75":
+        _log_routing_choice_once(arch, False, "n/a", KERNEL_FP16_TRITON)
         return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, **kwargs)
     elif arch in {"sm80", "sm86", "sm87"}:
         kwargs.setdefault("pv_accum_dtype", "fp32")
+        _log_routing_choice_once(arch, False, kwargs["pv_accum_dtype"], KERNEL_FP16_CUDA)
         return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, **kwargs)
     elif arch == "sm89":
         if get_cuda_version() < (12, 8):
             kwargs.setdefault("pv_accum_dtype", "fp32+fp32")
+            _log_routing_choice_once(arch, False, kwargs["pv_accum_dtype"], KERNEL_FP8_CUDA_FP32)
         else:
             # SageAttention2++
             kwargs.setdefault("pv_accum_dtype", "fp32+fp16")
+            _log_routing_choice_once(arch, False, kwargs["pv_accum_dtype"], KERNEL_FP8_CUDA_PP)
         return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, **kwargs)
     elif arch in {"sm100", "sm120", "sm121"}:
         # Looks superficially mergeable with the sm89 branch but isn't:
@@ -283,8 +321,10 @@ def sageattn(
         if get_cuda_version() < (12, 8):
             # sm120 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm120.
             kwargs.setdefault("pv_accum_dtype", "fp32")
+            _log_routing_choice_once(arch, False, kwargs["pv_accum_dtype"], KERNEL_FP8_CUDA)
         else:
             kwargs.setdefault("pv_accum_dtype", "fp32+fp16")
+            _log_routing_choice_once(arch, False, kwargs["pv_accum_dtype"], KERNEL_FP8_CUDA_PP)
         kwargs.setdefault("qk_quant_gran", "per_warp")
         return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, **kwargs)
     else:
