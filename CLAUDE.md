@@ -393,7 +393,10 @@ graph-breaks at, the trigger to revisit, and the estimated work in
 - `docs/perf_research_framework.md` -- load-bearing metric, reasoning
   chain, side-effect checks, five experiment-selection patterns,
   ignore-triggers, uncertainty record, mechanism-claim + aspirational-
-  claim discipline, prior-recording, pre-trigger briefing.
+  claim discipline, prior-recording, pre-trigger briefing, evidence
+  ladder for kernel-replacement audits (kernel-name presence >
+  per-call logs > attribution coverage > sub-module time delta;
+  every fallback path needs a log line).
 - `docs/whats_ours_vs_upstream.md` -- file-by-file inventory: upstream
   unmodified, removed-in-v0.5.0, our additions + status of each.
 - `docs/downstream_symbols.md` -- de-facto public surface (underscore
