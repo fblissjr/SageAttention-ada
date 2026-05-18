@@ -1,6 +1,6 @@
 # Performance research framework
 
-Last updated: 2026-05-16
+Last updated: 2026-05-18
 
 L3 reference for CLAUDE.md's "Performance research" pointer. Load this
 when you are about to make a kernel change, run a perf experiment, or
@@ -90,6 +90,21 @@ The right aggregation depends on the question:
 Worked example (2026-05-16 retraction): a v3 audit doc claimed "comfy-aimdo offload = `aten::copy_ + aten::to` = 67 s = 47% of sampler" from cpu_op `dur` aggregation. A `nodynvram` A/B disproved the framing by showing that disabling dynamic VRAM made the render slower, not faster, and the `aten::copy_` + `aten::to` call counts went UP while their total `dur` stayed roughly the same. The 47% number was real CPU dispatch time but not serial wall-time; the framing propagated through three cross-clone memos before the A/B caught it -- almost shifted a 2-week infra commit on the misinterpreted aggregation.
 
 **Disprove-test discipline**: for any "X% of sampler is Y" claim that would shift a multi-day decision (infra commit, kernel-day work, ship/no-ship), identify the cheapest test that would falsify Y, and run it before the decision. Six minutes of GPU time on the right A/B can save weeks of work pointed at the wrong thing. Same shape as the synthetic-vs-in-pipeline rule below, but applied to interpretation, not measurement.
+
+## Evidence ladder for kernel-replacement audits: did the kernel actually fire?
+
+When a patch replaces a kernel (or wraps a forward, or monkey-patches a Linear), the first question a follow-up audit has to answer is **not** "is it faster?" but **"is the replacement actually firing in production?"** A patch that silently no-ops because of a missing-attribute early-return, a swallowed exception, or a dispatcher branch that fell through to the original code path will look indistinguishable from a working patch in coarse aggregations -- attribution coverage moves, sub-module time deltas move, kernel-count *totals* move -- while the actual replacement never executed once.
+
+The right evidence ladder, primary to weakest:
+
+1. **Kernel-name presence in the Chrome trace.** If your patch dispatches to a Triton kernel, the trace should contain `_your_kernel_name[autotuned_grid]` (or equivalent symbol) at least once in the relevant sub-module. If the trace is 100% cuBLAS XMMA / 100% the kernel set that was there before the patch, the patch is not firing -- regardless of what aggregation numbers say. This is the strongest signal because kernel names are a direct read from the GPU's actual execution, not an inference from CPU-side timing.
+2. **Per-call instrumentation logs.** A one-shot log at install time (`[INFO] patched 44 blocks with sage_ffn`, `[WARN] could not extract fp8 weight_scale on a patched block`) tells you the patch attempt happened and which fork it took. Per-call logging is finer-grained but noisier and only useful when you suspect a subset of calls is misbehaving. **Every fallback path needs a log line**, including silent early-returns on missing attributes -- not just the explicit `except` clause. Otherwise the observer can't distinguish "patch fired and the new kernel won" from "patch never ran." Worked example: AudioLoopHelperSageFFN's wrapper had three fallback paths (explicit except, early-return on missing `weight_scale`, implicit dispatch to `self_module.net(x)`) but only the explicit except logged. The other two ran silently for a full A/B cycle before the missing log was diagnosed (cross-claude memo trail 2026-05-18, root cause `e983191`).
+3. **Attribution coverage delta.** "Coverage went from 51% to 77% under TREATMENT" feels like a strong signal but it can move for reasons unrelated to whether the new kernel fired -- a composition fix that restored per-block `record_function` annotation will move it, even if the actual kernel replacement is no-op. Coverage delta is a useful corroboration that *something* changed about the patch surface; it is not evidence that the new kernel ran.
+4. **Sub-module time delta.** Weakest of the four. A "+12% on `ff` sub-module" looks like a sage_ffn-vs-stock measurement but can be entirely explained by chunk-policy changes, allocator state, autotune cache state, or anything else the patch perturbed besides the kernel itself. Cite this only after the kernel-name signal is established; never as standalone evidence.
+
+The asymmetry: kernel-name presence is cheap to check (one chrome trace, ctrl-F for the expected symbol). Attribution coverage and time deltas are what bench harnesses report by default and what one is tempted to read first. Read kernel-name presence first regardless of what the aggregations show.
+
+This rule generalizes the synthetic-vs-in-pipeline discipline below: a synthetic bench can confirm a kernel fires (because you wrote the bench to call it directly), but in-pipeline only proves dispatch worked if you verify kernel-name presence in the actual production trace. Don't assume "my patch overrides forward, therefore my kernel is firing"; verify.
 
 ## When synthetic-bench projects, but production refuses to follow
 
