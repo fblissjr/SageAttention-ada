@@ -1,4 +1,4 @@
-last updated: 2026-05-19
+last updated: 2026-05-19 (Cell C verdict folded into "what we might be wrong about" #3)
 
 # sage-fork
 
@@ -258,13 +258,32 @@ The metric and framework reflect the workload mix on this box as of
    work with this risk shape gates the v0.X ship commit on in-
    pipeline A/B BEFORE the commit lands, not after.
 
+   *v0.6 Cell C verdict at the per-kernel level (2026-05-19).* With
+   the consumer-side integration chain fully closed (six bugs across
+   two A/B cycles) and sage_ffn dispatching end-to-end, the v0.6
+   synthetic-vs-production gap was measured at the per-stage kernel
+   boundary: sage_ffn is 22% slower at stage-1 (T=10780) and 5%
+   slower at stage-2 (T=42240) vs production stock fp8, despite
+   synthetic isolation showing 1.39x / 1.60x sage advantage at the
+   same shapes. **Production has the sign flipped.** The gap is not
+   framework overhead -- it sits at the kernel boundary itself. Two
+   open hypotheses (CHANGELOG Decision log): stock comparand
+   identity (synthetic vs `torch._scaled_mm`, production vs
+   `comfy.ops.fp8_linear`), and sage autotune state under
+   interleaved dispatch. Neither is a sage correctness bug; the
+   kernel works as designed and the bench just isn't measuring the
+   production-relevant thing.
+
    Concrete answer at the VISION level: kernel work IS justified
    per v0.5.1; the simplification "kernel ms = gen ms" isn't
    literally true; non-attention bottlenecks (VAE decode, caching,
    scheduler overhead) are where the next round of e2e wins routes;
-   and synthetic-bench projections need in-pipeline validation
-   before being claimed as e2e wins, especially for per-call-heavy
-   primitives.
+   synthetic-bench projections need in-pipeline validation before
+   being claimed as e2e wins, especially for per-call-heavy
+   primitives; and the in-pipeline validation needs to verify the
+   *comparand* is what production actually runs, not just an
+   isolated reference. v0.6 Cell C exposed comparand-identity as
+   the hidden assumption synthetic bench glosses over.
 4. **The next-experiment framework is V1.** It codifies a strategy;
    the strategy hasn't been validated by running through it on a
    real perf change yet. The first time we use it to pick a

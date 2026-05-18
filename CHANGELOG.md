@@ -119,10 +119,37 @@ Smaller e2e gain than the attention port above (~3-5% wall-time vs
 ~15%), but builds directly on v0.6 work and validates whether the
 hybrid pattern is viable before committing to the attention port.
 
+**v0.6.5 Cell C confirmation refines this item's framing.** With the
+6-bug consumer integration chain fully closed and sage_ffn dispatching
+end-to-end, per-stage FFN kernel time measures sage 22% slower at
+stage-1 (T=10780) and 5% slower at stage-2 (T=42240) vs production
+stock fp8 path -- despite synthetic isolation showing 1.39x / 1.60x
+sage advantage at the same shapes. The inverted sign means the
+synthetic-vs-production gap concentrates at the kernel boundary itself,
+not framework overhead. Two open hypotheses (not blocking, neither yet
+preferred):
+
+  (1) Stock comparand identity -- synthetic compares vs
+      `torch._scaled_mm`; production stock is `comfy.ops.fp8_linear`
+      wrapped in KJNodes' `LTXVChunkFeedForward` (chunked at 4096
+      with cached compilation state). Different baseline.
+  (2) Sage autotune state under interleaving -- production has sage
+      attention + sage_ffn dispatches interleaved at varying shapes.
+      Autotune may pick a different tile config than synthetic
+      isolation converges on.
+
+Either explains the gap; neither is a sage correctness bug.
+Persistent-CTA targets (1)/(2) symmetrically by removing the L2-thrash
+pathway between matmuls, so the item stays load-bearing for closing
+the v0.6 e2e gap. The "**ships as completeness primitive, not perf
+win**" docstring framing remains correct for v0.6 specifically.
+
 **Trigger to act:** user demand for "actually faster than torch
 reference on a real workload" surfaces, OR a different production
 workload class (single-pass / non-multi-guide) lands net-positive
-under sage_ffn and the priority becomes generalizing that.
+under sage_ffn and the priority becomes generalizing that, OR
+concurrent-dispatch consumer wrapper (consumer-side §6.1 candidate)
+ships ahead of this and closes the e2e gap by a different path.
 
 Recommended sequence: FFN persistent-CTA first (lower risk, faster
 to ship, validates the technique), attention persistent-CTA second
@@ -339,6 +366,63 @@ spend on a "kernel-side gap" finding.
 
 Investigations that closed without action. Recorded so we don't
 re-derive them. Each entry has an explicit reopen-trigger.
+
+### v0.6 sage_ffn Cell C verdict (synthetic-vs-production gap concentrates at the kernel boundary)
+
+**Closed 2026-05-19** after a multi-cycle cross-clone diagnostic
+session that bottomed out the consumer-side integration chain (six
+distinct bugs surfaced and fixed: scale-lookup probe, QuantizedTensor
+unwrap, `prior_forward` chaining, `str(exc)` logger, call-time weight
+resolve + device guard, `.item()` hoist for scalar ABI). With the
+chain fully closed, sage_ffn dispatches end-to-end -- rung-1 evidence
+(`_fp8_matmul_gelu_kernel` + `_fp8_matmul_kernel` rows in `cat=kernel`
+of every TREATMENT chrome trace) confirms.
+
+The verdict is **Cell C** of the synthetic-vs-production 2x2 matrix
+at *both* wall-time and per-stage-kernel-time levels:
+
+| measurement | sage_ffn | stock (prod) | ratio |
+|---|---:|---:|---:|
+| wall time, mean of 3 runs each | 188.3s | 185.7s | +1.4s (+0.75%) |
+| stage-1 (T=10780) FFN kernel | 8930 ms | ~7290 ms | sage 22% SLOWER |
+| stage-2 (T=42240) FFN kernel | 12920 ms | ~12300 ms | sage 5% SLOWER |
+
+Synthetic isolation at the same shapes (v0.6.5 `tests/bench_sage_ffn_shapes.py`):
+sage_ffn 1.39x faster at T=10780, 1.60x at T=42240. **Production has
+the sign flipped** -- largest synthetic gain is the smallest production
+gap; smallest synthetic gain is the largest production loss. Inverted
+relationship.
+
+Two open hypotheses for the inversion (neither preferred yet):
+
+  (1) Stock comparand identity -- synthetic compares vs
+      `torch._scaled_mm`; production stock is `comfy.ops.fp8_linear`
+      wrapped in KJNodes' `LTXVChunkFeedForward`. Different baseline.
+  (2) Sage autotune state under interleaving -- production interleaves
+      sage attention + sage_ffn at varying shapes; autotune may pick
+      a different tile config than synthetic isolation.
+
+Either explains the gap; neither is a sage correctness bug.
+
+**Disposition:** v0.6 sage_ffn "ships as completeness primitive, not
+perf win" framing reaffirmed. Diagnostic instrumentation work paid
+off -- the chain that closed the verdict spanned v0.6.2 (informative
+asserts), v0.6.3 (dispatch log), v0.6.4 (`extract_fp8_weight_and_scale`
++ framework rung 2 with pattern (d)), v0.6.5 (`w*_scale` precondition
+assert + stage-1/stage-2 bench rows), and `70d1984` (framework rung 2
+pattern (e) fold). Each new failure mode after v0.6.2 was diagnosed
+in 1 render rather than the multi-cycle loop earlier.
+
+**Reopen-trigger:** persistent-CTA hybrid lands (Backlog item) AND
+re-render shows wall-time improvement OR per-stage parity-or-better
+vs production stock. At that point Cell C would close to Cell A and
+v0.6 docstring framing flips. Alternative reopen: a `comfy.ops.fp8_linear`-
+direct bench (hypothesis 1) lands data showing sage_ffn beats the
+production comparand -- routes investigation to autotune-state
+(hypothesis 2) and may not need persistent-CTA at all.
+
+Memo trail: `coderef/ComfyUI-AudioLoopHelper/internal/AUDIO_LOOP_CLAUDE_TO_SAGE_CLAUDE_MEMO.md`
+(2026-05-19T08:00Z verdict memo, audio-loop-side outbox-mirror).
 
 ### "FFN-adjacent reach" / launch-overhead / cache-footprint hypotheses on iclora: all three falsified
 

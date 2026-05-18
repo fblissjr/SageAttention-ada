@@ -1,6 +1,6 @@
 # Roadmap
 
-Last updated: 2026-05-19
+Last updated: 2026-05-19 (Cell C verdict folded into Tier 1.3 trigger)
 
 Forward-looking record of directions worth pursuing on this fork --
 ranked by relevance to the current workload, technically scoped, and
@@ -145,11 +145,31 @@ shape in the LTX FFN coverage.
 FFN first (concrete e2e regression data); attention follows if the
 pattern holds.
 
-**Trigger to act:** v0.6 e2e gap confirmed not closable via
-consumer-side `prior_forward` chaining alone (re-baseline render
-data, pending). If TREATMENT lands faster than chunked-BASELINE
-under `prior_forward` chaining, persistent-CTA's priority drops.
-If TREATMENT is wash or slower, this stays top-3 priority.
+**Trigger refined 2026-05-19 (Cell C verdict confirmed):** the
+v0.6 e2e gap is NOT closable via consumer-side `prior_forward`
+chaining alone. The re-baseline render landed with TREATMENT at
++0.75% wall (188.3s vs 185.7s, within ±3s noise) AND with sage_ffn
+*per-kernel* at 22% slower (stage-1) / 5% slower (stage-2) vs
+production stock fp8. Synthetic 1.39x/1.60x advantage at the same
+shapes did not transfer; production has the sign flipped. Two open
+hypotheses for the inversion documented in CHANGELOG Decision log:
+
+  (1) Stock comparand identity (synthetic vs `torch._scaled_mm`,
+      production vs `comfy.ops.fp8_linear` + ChunkFFN).
+  (2) Sage autotune state under interleaved attention + FFN dispatch.
+
+Persistent-CTA targets (1)/(2) symmetrically by removing the
+L2-thrash pathway between matmuls; this item stays load-bearing for
+closing the v0.6 e2e gap. Promotes to **active Backlog status** in
+CHANGELOG (was conditional; now confirmed).
+
+Alternative attack vector worth considering before committing to
+the 2-3 week kernel-day spend: §6.1 (concurrent-dispatch consumer
+wrapper, ~5-13% e2e prize untapped per the v0.6.1 stream-safety
+fix). If concurrent-dispatch ships first and closes the e2e gap by
+launching attention + FFN streams concurrently, persistent-CTA's
+priority drops back to "validates the technique" rather than
+"closes the gap."
 
 ## Tier 2: Medium-relevance, conditional
 
