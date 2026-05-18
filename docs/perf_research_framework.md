@@ -1,6 +1,6 @@
 # Performance research framework
 
-Last updated: 2026-05-18
+Last updated: 2026-05-19
 
 L3 reference for CLAUDE.md's "Performance research" pointer. Load this
 when you are about to make a kernel change, run a perf experiment, or
@@ -98,7 +98,16 @@ When a patch replaces a kernel (or wraps a forward, or monkey-patches a Linear),
 The right evidence ladder, primary to weakest:
 
 1. **Kernel-name presence in the Chrome trace.** If your patch dispatches to a Triton kernel, the trace should contain `_your_kernel_name[autotuned_grid]` (or equivalent symbol) at least once in the relevant sub-module. If the trace is 100% cuBLAS XMMA / 100% the kernel set that was there before the patch, the patch is not firing -- regardless of what aggregation numbers say. This is the strongest signal because kernel names are a direct read from the GPU's actual execution, not an inference from CPU-side timing.
-2. **Per-call instrumentation logs.** A one-shot log at install time (`[INFO] patched N blocks with kernel X`, `[WARN] could not extract required attribute on a patched block`) tells you the patch attempt happened and which fork it took. Per-call logging is finer-grained but noisier and only useful when you suspect a subset of calls is misbehaving. **Every fallback path needs a log line**, including silent early-returns on missing attributes -- not just the explicit `except` clause. Otherwise the observer can't distinguish "patch fired and the new kernel won" from "patch never ran." A downstream consumer wrapper recently hit this: three fallback paths (explicit `except`, early-return on missing attribute, implicit dispatch to the pre-patch forward) but only the explicit `except` logged. The other two ran silently for a full A/B cycle and the "+12% slower" reading was a chunk-policy artifact, not the kernel-replacement claim the bench appeared to make.
+2. **Per-call instrumentation logs.** A one-shot log at install time (`[INFO] patched N blocks with kernel X`, `[WARN] could not extract required attribute on a patched block`) tells you the patch attempt happened and which fork it took. Per-call logging is finer-grained but noisier and only useful when you suspect a subset of calls is misbehaving. **Every fallback path needs a log line, and every fallback log line must carry the underlying error's message (not just its class name).** Four distinct ways this rule gets violated, all functionally equivalent for debugging utility:
+
+   (a) Explicit `except` clause **without** logging (the obvious one).
+   (b) Early-return guard **before** the protected call (silent because the protected call never happened, so even an `except` clause downstream of it never fires).
+   (c) Implicit dispatch to a fallback (the patched forward calls the pre-patch forward on miss, with no log).
+   (d) Log line that strips the underlying error's message -- e.g. `log.info(f"fallback: {type(exc).__name__}")` discards `str(exc)`. The log line exists but carries no diagnostic; surfaces "something failed" without "what" or "why."
+
+   (d) is the trap (a)-(c) graduate to once the obvious silent layers are fixed: the observer thinks they've solved the logging problem because a line appears, but the line is dead weight. Worked example from a 2026-05-18 cross-clone session: an upstream kernel (`sage_ffn`) had informative assert messages, and a downstream wrapper's fallback logger DID fire on each AssertionError -- but the logger formatted `type(exc).__name__` only, so the diagnostic ("sage_ffn: w1.dtype must be float8_e4m3fn, got QuantizedTensor wrapper") never reached the operator. The bug ran for two full A/B cycles before the logger format was fixed AND the underlying cause (a missed QuantizedTensor unwrap) surfaced in a single line of stderr.
+
+   Rule of thumb: when writing or reviewing a fallback `except` block, ask "what does an operator reading stderr know about WHY the fallback fired?" If the answer is "the class of the exception but not the message and not the input that triggered it," the log is at rung (d) and is a debugging dead end disguised as instrumentation.
 3. **Attribution coverage delta.** "Coverage went from 51% to 77% under TREATMENT" feels like a strong signal but it can move for reasons unrelated to whether the new kernel fired -- a composition fix that restored per-block `record_function` annotation will move it, even if the actual kernel replacement is no-op. Coverage delta is a useful corroboration that *something* changed about the patch surface; it is not evidence that the new kernel ran.
 4. **Sub-module time delta.** Weakest of the four. A "+12% on `ff` sub-module" looks like a sage_ffn-vs-stock measurement but can be entirely explained by chunk-policy changes, allocator state, autotune cache state, or anything else the patch perturbed besides the kernel itself. Cite this only after the kernel-name signal is established; never as standalone evidence.
 

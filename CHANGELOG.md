@@ -566,6 +566,63 @@ sufficient.
 
 ## Versions
 
+### v0.6.4 -- 2026-05-19  (`extract_fp8_weight_and_scale` + framework: 4th silent-fallback rung)
+
+Two coordinated additions surfacing what a cross-clone diagnostic
+session learned about silent-fallback patterns in kernel-replacement
+wrappers.
+
+**New public utility: `sageattention.extract_fp8_weight_and_scale(linear)`**
+
+Probes a ComfyUI `Linear`-like for fp8 weight + scale across the
+four known storage conventions:
+
+1. Modern `QuantizedTensor` with `weight.layout_params.scale` (public
+   alias; preferred surface, comfy_kitchen v0.2.8+).
+2. Modern `QuantizedTensor` with `weight._params.scale` (raw alias;
+   fallback when public alias is absent).
+3. Legacy `Linear.scale_weight` attribute (older `fp8_ops` convention).
+4. Older `Linear.weight_scale` attribute (some custom-node patches).
+
+Returns `(raw_weight_fp8_tensor, scale_tensor, path_label)` on hit,
+`None` on miss. Modern path returns the unwrapped `weight._qdata`,
+not the `QuantizedTensor` wrapper -- sage kernels assert
+`dtype == float8_e4m3fn` and the wrapper itself doesn't satisfy that.
+
+Source: `sageattention/comfyui_compat.py`. Test coverage:
+`tests/test_comfyui_compat.py` (10 standalone cases covering each
+probe path, priority order, and miss conditions; mock objects, no
+ComfyUI runtime dependency).
+
+Trigger to add this utility: a consumer-side wrapper hit the missing-
+unwrap silently for two A/B cycles (passed `weight` rather than
+`weight._qdata` to `sage_ffn`; the resulting AssertionError was
+swallowed by a logger that stripped `str(exc)`). Centralizing the
+probe protects every future consumer from re-deriving the four
+storage conventions and getting bitten by the same trap. Reference
+intel: `internal/design/comfyui_fp8_storage_conventions.md`.
+
+**Framework: 4th silent-fallback rung in `docs/perf_research_framework.md`**
+
+Rung 2 of the evidence ladder for kernel-replacement audits is
+expanded from "every fallback path needs a log line" to "...and the
+log line must carry the underlying error's message, not just its
+class name." Four distinct failure modes enumerated:
+
+  (a) Explicit `except` without logging.
+  (b) Early-return guard before the protected call.
+  (c) Implicit dispatch to a pre-patch forward on miss.
+  (d) Log fires but strips the error's message (informative-log-but-
+      strips-message).
+
+(d) is the trap (a)-(c) graduate to once obvious silent layers are
+fixed: surface looks like (a) but is functionally equivalent to (a)
+for debugging. The 2026-05-18 cross-clone session that surfaced this
+ran for two A/B cycles before the logger was unstripped AND the
+underlying QuantizedTensor unwrap surfaced. Worked example captured
+in the framework without naming the specific wrapper (consumer-
+agnostic framing).
+
 ### v0.6.3 -- 2026-05-19  (session-start dispatch log in `sageattn()`)
 
 `sageattn()` now emits one `[INFO] sage routing: arch=... cuda=...
