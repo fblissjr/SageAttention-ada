@@ -265,6 +265,20 @@ def sage_ffn(
     assert x.dtype == torch.bfloat16, f"sage_ffn: x.dtype must be bfloat16, got {x.dtype}"
     assert w1.dtype == torch.float8_e4m3fn, f"sage_ffn: w1.dtype must be float8_e4m3fn, got {w1.dtype}"
     assert w2.dtype == torch.float8_e4m3fn, f"sage_ffn: w2.dtype must be float8_e4m3fn, got {w2.dtype}"
+    # Scales must be Python scalars: the Triton kernels declare W_scale
+    # as an unannotated argument, so Triton interprets a torch.Tensor
+    # input as a pointer and the `acc * W_scale` multiply fails at
+    # compile time with `IncompatibleTypeErrorImpl(pointer<fp32>
+    # vs float32)`. A consumer extracting the scale from a quantized
+    # checkpoint (0-d Tensor) must `.item()` it before calling sage_ffn.
+    assert isinstance(w1_scale, (int, float)), (
+        f"sage_ffn: w1_scale must be a Python scalar (call .item() on the 0-d "
+        f"Tensor if extracting from a quantized weight), got {type(w1_scale).__name__}"
+    )
+    assert isinstance(w2_scale, (int, float)), (
+        f"sage_ffn: w2_scale must be a Python scalar (call .item() on the 0-d "
+        f"Tensor if extracting from a quantized weight), got {type(w2_scale).__name__}"
+    )
 
     *batch_dims, hidden = x.shape
     inner = w1.shape[0]

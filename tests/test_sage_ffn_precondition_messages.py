@@ -99,6 +99,20 @@ def test_device_message():
     print(f"  device: {msg}")
 
 
+def test_w1_scale_must_be_python_scalar():
+    x, w1, s1, w2, s2 = _ok_inputs()
+    s1_bad = torch.tensor(0.01, dtype=torch.float32, device="cuda")
+    msg = _expect_assertion_with(["w1_scale", "scalar", ".item()", "Tensor"], x, w1, s1_bad, w2, s2)
+    print(f"  w1_scale-as-tensor: {msg}")
+
+
+def test_w2_scale_must_be_python_scalar():
+    x, w1, s1, w2, s2 = _ok_inputs()
+    s2_bad = torch.tensor(0.01, dtype=torch.float32, device="cuda")
+    msg = _expect_assertion_with(["w2_scale", "scalar", ".item()", "Tensor"], x, w1, s1, w2, s2_bad)
+    print(f"  w2_scale-as-tensor: {msg}")
+
+
 def main() -> int:
     if not torch.cuda.is_available():
         print("CUDA not available; skipping.")
@@ -111,6 +125,8 @@ def main() -> int:
         test_w2_shape_message,
         test_b1_shape_message,
         test_device_message,
+        test_w1_scale_must_be_python_scalar,
+        test_w2_scale_must_be_python_scalar,
     ]
     failures = 0
     for fn in cases:

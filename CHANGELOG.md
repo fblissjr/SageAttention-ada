@@ -566,6 +566,62 @@ sufficient.
 
 ## Versions
 
+### v0.6.5 -- 2026-05-19  (informative precondition assert on `w*_scale` type + stage-1/stage-2 bench rows)
+
+Two coordinated additions surfacing the contract violation that hides
+behind a Triton kernel-compile error.
+
+**Precondition assert: `w*_scale` must be Python scalar.**
+
+`sage_ffn(...)` documents `w1_scale: float, w2_scale: float`. When a
+consumer passes a 0-d `torch.Tensor` instead (the natural shape from
+extracting `weight._params.scale` on a ComfyUI `QuantizedTensor`),
+the underlying Triton kernel sees the unannotated `W_scale` argument
+as a `pointer<fp32>` and the `acc = acc * W_scale` multiply fails
+compilation with `IncompatibleTypeErrorImpl('invalid operands of
+type pointer<fp32> and triton.language.float32')`. The error surfaces
+inside Triton's autotune machinery, not at the sage_ffn boundary,
+making the actual contract violation hard to diagnose.
+
+`sage_ffn` now asserts at the boundary:
+
+```
+sage_ffn: w1_scale must be a Python scalar (call .item() on the 0-d
+Tensor if extracting from a quantized weight), got Tensor
+```
+
+Same pattern as v0.6.2's dtype/shape asserts. The remedy (`.item()`)
+is named in the message. The `extract_fp8_weight_and_scale` utility
+from v0.6.4 still returns a Tensor (forward-compatible with per-
+channel scales); consumers extracting per-tensor scales for sage_ffn
+specifically call `.item()` to get a Python float.
+
+Edit at `sageattention/triton/fused_mlp_fp8.py:265-275`. Test
+coverage adds 2 cases to `tests/test_sage_ffn_precondition_messages.py`
+(now 9 total).
+
+**Bench: stage-1 + stage-2 synthetic rows at production unchunked shapes.**
+
+`tests/bench_sage_ffn_shapes.py` now bench's `T=10780` (stage-1) and
+`T=42240` (stage-2) alongside the chunked-call-site shapes already
+present (T=4096 + T=1808). Useful for direct synthetic-vs-in-pipeline
+comparison; eliminates "the chunk-sweep interpolation was off" as a
+noise source in Cell A vs Cell C diagnosis.
+
+Sample run on RTX 4090 / sm89 / torch 2.11+cu130:
+
+| T (seq) | sage_ffn ms | torch stock fp8 ms | stock/sage |
+|---:|---:|---:|---:|
+| 4096 (full chunk) | 4.68 | 7.00 | 1.50x |
+| 1808 (residual chunk) | 2.32 | 3.02 | 1.30x |
+| 10780 (stage-1 unchunked) | 13.34 | 18.55 | **1.39x** |
+| 42240 (stage-2 unchunked) | 56.41 | 90.52 | **1.60x** |
+
+T=42240 holds ~1.4 GiB bf16 intermediate per FFN call; the bench
+now explicitly reclaims tensor refs + calls `empty_cache()` between
+shapes so the allocator high-water mark during Triton autotune
+doesn't OOM on a 24 GiB card.
+
 ### v0.6.4 -- 2026-05-19  (`extract_fp8_weight_and_scale` + framework: 4th silent-fallback rung)
 
 Two coordinated additions surfacing what a cross-clone diagnostic

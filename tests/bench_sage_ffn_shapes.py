@@ -154,6 +154,13 @@ def bench_one_shape(T: int, hidden: int, inner: int, with_bias: bool = True) -> 
     sage_ms = _time_call(call_sage)
     stock_ms = _time_call(call_stock)
 
+    # T=42240 holds ~1.4 GiB bf16 intermediate per FFN call; the allocator's
+    # high-water mark across the warmup + sample loop can stack multiple
+    # intermediates if Triton autotune is compiling configs concurrently.
+    # Explicit reclaim between shapes keeps the bench safe on a 24 GiB card.
+    del x, w1, w2, b1, b2, out_sage, out_stock
+    torch.cuda.empty_cache()
+
     return {
         "T": T, "hidden": hidden, "inner": inner,
         "sage_ms": sage_ms, "stock_ms": stock_ms,
@@ -175,10 +182,20 @@ def _print_markdown_table(rows: list[dict], title: str) -> None:
 
 
 def part_a_production_shapes() -> list[dict]:
-    """Audio claude's Ask 1 shapes: the exact chunked call sites."""
+    """The exact chunked call sites + the two stage-level call sites
+    consumer-side reports at production:
+
+    - T=4096 (full chunk) / T=1808 (residual chunk): the per-chunk
+      shapes a consumer-side seq-chunking wrapper emits.
+    - T=10780 / T=42240: stage-1 / stage-2 unchunked FFN call sites
+      seen in a canonical LTX 2.3 video render. Useful for direct
+      comparison against in-pipeline measurements.
+    """
     shapes = [
         (4096, 4096, 16384),
         (1808, 4096, 16384),
+        (10780, 4096, 16384),
+        (42240, 4096, 16384),
     ]
     rows = []
     for T, hidden, inner in shapes:
