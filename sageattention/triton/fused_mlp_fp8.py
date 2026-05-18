@@ -256,19 +256,34 @@ def sage_ffn(
     Returns:
         (B, T, hidden) bf16 output.
     """
-    assert x.is_cuda and w1.is_cuda and w2.is_cuda
-    assert x.dtype == torch.bfloat16
-    assert w1.dtype == torch.float8_e4m3fn
-    assert w2.dtype == torch.float8_e4m3fn
+    # Assert messages name the precondition AND the actual offending value
+    # so downstream wrappers that catch AssertionError and log `str(exc)`
+    # get an actionable diagnostic without instrumenting their own wrapper.
+    assert x.is_cuda and w1.is_cuda and w2.is_cuda, (
+        f"sage_ffn: all tensors must be on CUDA, got x={x.device} w1={w1.device} w2={w2.device}"
+    )
+    assert x.dtype == torch.bfloat16, f"sage_ffn: x.dtype must be bfloat16, got {x.dtype}"
+    assert w1.dtype == torch.float8_e4m3fn, f"sage_ffn: w1.dtype must be float8_e4m3fn, got {w1.dtype}"
+    assert w2.dtype == torch.float8_e4m3fn, f"sage_ffn: w2.dtype must be float8_e4m3fn, got {w2.dtype}"
 
     *batch_dims, hidden = x.shape
     inner = w1.shape[0]
-    assert w1.shape == (inner, hidden)
-    assert w2.shape == (hidden, inner)
+    assert w1.shape == (inner, hidden), (
+        f"sage_ffn: w1.shape must be (inner={inner}, hidden={hidden}), got {tuple(w1.shape)}"
+    )
+    assert w2.shape == (hidden, inner), (
+        f"sage_ffn: w2.shape must be (hidden={hidden}, inner={inner}), got {tuple(w2.shape)}"
+    )
     if b1 is not None:
-        assert b1.is_cuda and b1.shape == (inner,) and b1.dtype == torch.bfloat16
+        assert b1.is_cuda and b1.shape == (inner,) and b1.dtype == torch.bfloat16, (
+            f"sage_ffn: b1 must be CUDA bfloat16 with shape (inner={inner},), "
+            f"got device={b1.device} dtype={b1.dtype} shape={tuple(b1.shape)}"
+        )
     if b2 is not None:
-        assert b2.is_cuda and b2.shape == (hidden,) and b2.dtype == torch.bfloat16
+        assert b2.is_cuda and b2.shape == (hidden,) and b2.dtype == torch.bfloat16, (
+            f"sage_ffn: b2 must be CUDA bfloat16 with shape (hidden={hidden},), "
+            f"got device={b2.device} dtype={b2.dtype} shape={tuple(b2.shape)}"
+        )
 
     M = math.prod(batch_dims)
 

@@ -566,6 +566,31 @@ sufficient.
 
 ## Versions
 
+### v0.6.2 -- 2026-05-18  (informative `sage_ffn` precondition asserts)
+
+Every `assert` inside `sage_ffn(...)` now carries a message naming
+the precondition and the actual offending value. Previously the
+asserts had no message, so a downstream wrapper catching
+`AssertionError` and logging `str(exc)` received an empty string --
+un-actionable for diagnosing dtype/shape mismatches.
+
+Sample messages now surfaced:
+
+```
+sage_ffn: x.dtype must be bfloat16, got torch.float16
+sage_ffn: w1.dtype must be float8_e4m3fn, got torch.bfloat16
+sage_ffn: w1.shape must be (inner=256, hidden=64), got (256, 65)
+sage_ffn: b1 must be CUDA bfloat16 with shape (inner=256,), got device=cuda:0 dtype=torch.bfloat16 shape=(257,)
+```
+
+Zero runtime cost on the happy path -- Python only formats assert
+messages on failure. Edit at
+`sageattention/triton/fused_mlp_fp8.py:259-285`.
+
+Test coverage at `tests/test_sage_ffn_precondition_messages.py` (7
+standalone cases, one per assert: x.dtype, w1.dtype, w2.dtype,
+w1.shape, w2.shape, b1.shape, device).
+
 ### v0.6.1 -- 2026-05-17  (stream-safety fix: kernel launches now honor the current CUDA stream)
 
 Every CUDA kernel launch in `csrc/qattn/sm89_*.cu`,
