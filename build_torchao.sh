@@ -20,7 +20,7 @@
 # Usage:
 #   source /path/to/venv/bin/activate
 #   ./build_torchao.sh              # full build + editable install
-#   ./build_torchao.sh clean        # wipe prior .so / build/ artifacts
+#   ./build_torchao.sh clean        # wipe prior artifacts, then rebuild
 #   ./build_torchao.sh verify       # import-check only, no rebuild
 #
 # Env overrides:
@@ -49,8 +49,10 @@ if [[ ! -x "${PYTHON}" ]]; then
     exit 1
 fi
 
-# Subcommand dispatch
-CMD="${1:-build}"
+# Subcommand dispatch -- matches build.sh's fall-through pattern:
+# `clean` performs cleanup and continues into the build, `verify` exits
+# after the import-check, unknown subcommands error out.
+ACTION="${1:-build}"
 
 verify_import() {
     "${PYTHON}" - <<'PY'
@@ -82,55 +84,55 @@ except Exception as e:
 PY
 }
 
-case "${CMD}" in
+case "${ACTION}" in
     clean)
-        if [[ ! -d "${TORCHAO_DIR}" ]]; then
-            echo "Nothing to clean: ${TORCHAO_DIR} not found." >&2
-            exit 0
+        if [[ -d "${TORCHAO_DIR}" ]]; then
+            echo "==> Cleaning torchao build artifacts at ${TORCHAO_DIR}"
+            find "${TORCHAO_DIR}/torchao" -name '*.so' -delete 2>/dev/null || true
+            rm -rf "${TORCHAO_DIR}/build" "${TORCHAO_DIR}/torchao.egg-info"
         fi
-        echo "Cleaning torchao build artifacts at ${TORCHAO_DIR}..."
-        find "${TORCHAO_DIR}/torchao" -name '*.so' -delete 2>/dev/null || true
-        rm -rf "${TORCHAO_DIR}/build" "${TORCHAO_DIR}/torchao.egg-info"
-        echo "Clean done."
+        ACTION="build"
         ;;
-
     verify)
         verify_import
+        exit 0
         ;;
-
     build)
-        if [[ ! -d "${TORCHAO_DIR}" ]]; then
-            echo "ERROR: torchao checkout not found at ${TORCHAO_DIR}" >&2
-            echo "" >&2
-            echo "Expected: a symlink or clone at coderef/ao -> your local torchao." >&2
-            echo "  ln -s /path/to/your/ao ${TORCHAO_DIR}" >&2
-            exit 1
-        fi
-
-        # sm89-only arch list. setup.py gates _C_cutlass_90a on compute_90a
-        # and _C_mxfp8 on compute_100, so restricting to 8.9 skips both
-        # automatically. Cuts build to ~5 min on an 8-core box.
-        export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9}"
-        export MAX_JOBS="${MAX_JOBS:-8}"
-
-        echo "Building torchao..."
-        echo "  source:               ${TORCHAO_DIR}"
-        echo "  venv:                 ${VIRTUAL_ENV}"
-        echo "  TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}"
-        echo "  MAX_JOBS:             ${MAX_JOBS}"
-        echo ""
-
-        # --no-build-isolation: use the venv's torch (the build needs it),
-        # rather than re-resolving a build-env torch that may not match.
-        (cd "${TORCHAO_DIR}" && "${UV}" pip install -e . --no-build-isolation)
-
-        echo ""
-        echo "Build done. Verifying..."
-        verify_import
         ;;
-
     *)
+        echo "ERROR: unknown subcommand '${ACTION}'" >&2
         echo "Usage: $0 [build|clean|verify]" >&2
         exit 1
         ;;
 esac
+
+# --- Build flow (reached for `build` or post-`clean`) ---
+
+if [[ ! -d "${TORCHAO_DIR}" ]]; then
+    echo "ERROR: torchao checkout not found at ${TORCHAO_DIR}" >&2
+    echo "" >&2
+    echo "Expected: a symlink or clone at coderef/ao -> your local torchao." >&2
+    echo "  ln -s /path/to/your/ao ${TORCHAO_DIR}" >&2
+    exit 1
+fi
+
+# sm89-only arch list. setup.py gates _C_cutlass_90a on compute_90a
+# and _C_mxfp8 on compute_100, so restricting to 8.9 skips both
+# automatically. Cuts build to ~5 min on an 8-core box.
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9}"
+export MAX_JOBS="${MAX_JOBS:-8}"
+
+echo "==> Building torchao"
+echo "  source:               ${TORCHAO_DIR}"
+echo "  venv:                 ${VIRTUAL_ENV}"
+echo "  TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}"
+echo "  MAX_JOBS:             ${MAX_JOBS}"
+echo ""
+
+# --no-build-isolation: use the venv's torch (the build needs it),
+# rather than re-resolving a build-env torch that may not match.
+(cd "${TORCHAO_DIR}" && "${UV}" pip install -e . --no-build-isolation)
+
+echo ""
+echo "==> Verifying"
+verify_import
