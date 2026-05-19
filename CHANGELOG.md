@@ -632,11 +632,32 @@ Implications worth keeping:
   length increase (T=7560 vs T=7800) -- direct evidence of autotune
   flipping under interleaved dispatch. Captured in the Cell C
   decision log entry.
+- **Validation surface for persistent-CTA (Tier 1.3) and §6.1
+  concurrent-dispatch** (added 2026-05-19, per audio-loop-side
+  memo). The same trace also exposes:
+  - dual HEAD-DIM specialization co-firing (~80/20 split HEAD-128 /
+    HEAD-64) in a single render -- two sage template instantiations
+    competing for autotune cache slots.
+  - cross-modal attentions (`audio_to_video_attn`,
+    `video_to_audio_attn`) contributing ~36% of wall (~22s of 61s
+    in the failed render that produced the trace) -- non-trivial
+    share.
+  - the T=7560 vs T=7800 anomaly noted above.
+
+  If persistent-CTA work lands tile-config-cache-sticky behavior
+  (the v0.6 Backlog framing of CTAs holding M-tile state in
+  registers/L2 across the pipeline), OR if §6.1 concurrent-dispatch
+  ships and launches attn + ffn on different streams, **the dual-
+  HEAD-DIM mix in this workload class is exactly where the tile-
+  config thrashing or cross-stream coupling would surface**. Worth a
+  check against this trace once either kernel-side wedge is ready.
 
 **Trigger to act:** a second cross-workload observation of HEAD-64
 sage dispatches surfaces (suggests two-pass workloads are recurrent
 rather than one-off), OR autotune-pre-bake (Backlog item) ships and
-needs to decide which head dims to cover.
+needs to decide which head dims to cover, OR persistent-CTA / §6.1
+lands a candidate and needs a multi-template-instantiation workload
+to validate against.
 
 ## Recurring process items
 

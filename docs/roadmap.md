@@ -54,44 +54,44 @@ The reference workload: LTX 2.3 video gen + Gemma3 12B text encoder
 + VAE encode/decode, on RTX 4090 / sm89 / 24 GB VRAM. Sub-module
 shares per `docs/ltx_workload_profile.md`.
 
-### 1.1 Workflow profiler tool
+### 1.1 Workflow profiler tool -- RETIRED (consume the consumer-side `inspect_run.py` instead)
 
-**What:** a Python utility that ingests a ComfyUI chrome trace
-(plus `record_function` annotations) and emits:
+**Status (2026-05-19): retired from active build queue.** The
+consumer-side audio-loop claude is already building the equivalent
+tool as `scripts/inspect_run.py` on their side. Their phase plan:
 
-- Per-sub-module kernel-time breakdown (matmul / norm / activation /
-  attention / FFN / VAE / etc.)
-- Kernel-name presence audit (which Triton / CUDA kernels actually
-  fired -- the rung-1 evidence from the evidence ladder)
-- Dispatch ladder readout (which sage kernel was chosen per call,
-  via correlation with `get_last_dispatched_kernel()`)
-- cpu_op.dur vs kernel-time aggregation cross-check (catches the
-  47%-offload-trap class of misinterpretation)
-- Two-arm comparison helper (BASELINE + TREATMENT side-by-side,
-  kernel-name diff, sub-module delta, attribution coverage delta)
+- **Phase 1** (concrete specs landed): console-log error scan, sage
+  routing health, per-iteration consistency, workflow-vs-execution
+  mismatch, tracer manifest reconciliation.
+- **Phase 2** (deferred, requires chrome-trace parsing): per-stage
+  kernel-time breakdown (the methodology used to land the Cell C
+  verdict), initial-render-vs-loop-body symmetry, attention shape
+  outliers.
+- **Phase 3** (deferred, A/B mode): treatment-vs-baseline kernel-
+  time diff that auto-generates the per-stage decomposition table
+  the Cell C audit required as a 50-line one-off script.
 
-**Why it's load-bearing:** every kernel decision on this fork
-benefits from sub-module attribution. Downstream consumer side has
-been hand-rolling this; this side has been hand-rolling it in
-`tests/bench/`. A unified tool means we both stop reinventing AND
-the methodology in `perf_research_framework.md` gets a concrete data
-layer that any new consumer can adopt.
+**Why we retire rather than parallel-build:** they have the data
+context (consumer-side runtime, workload exposure across the audio-
+loop + two-pass + IC-LoRA classes), and building a parallel
+sage-side workflow profiler would duplicate effort against the same
+methodology. Better disposition: **consume their tool's output for
+our bench-side decisions** and pair on Phase 2 / Phase 3 if useful.
 
-**Technical shape:** standalone Python package, likely shipped as a
-sibling repo `sage-bench-tools/` (or similar) to keep sage-fork
-primitive. Reads chrome JSON; uses `pandas` + `orjson` for
-aggregation; emits markdown tables + optional plots. Interface
-roughly `bench-tools profile <trace.json> [--baseline <trace>]
-[--treatment <trace>] [--out report.md]`.
+**Implication for downstream items:** Tier 1.2 (VAE decoder fp8
+fusion experiments) gating on "workflow profiler data shows VAE is
+non-trivial share" now waits on Phase 2 of their tool, not on us
+building a tool. Same for Tier 2.4 (cross-modal attention coverage)
+which gates on profiler data showing cross-modal attn is non-
+trivial share. We are consumers of their output, not blocked on our
+own build.
 
-**Effort:** ~1 week for v0.1 covering the five bullet points above.
-Ongoing refinement as we use it.
-
-**Trigger to act:** downstream-consumer authorization to adopt v0.1
-spec + workload-profiler agreement on interface from cross-clone
-discussion. Most relevant prerequisite: their requirements on what
-data layer matters most to them, since they're the heaviest
-consumer.
+**Trigger to revive (rebuild on our side):** if their tool stalls
+indefinitely AND a kernel-side decision blocks on data we can't get
+from manual chrome-trace inspection, we'd build a sage-side version
+focused on kernel-isolation methodology (Phase 2 check 7 in their
+phase plan -- the part that intersects our sm89 optimization work).
+Until then, retired.
 
 ### 1.2 VAE decoder fp8 fusion experiments
 
@@ -300,7 +300,7 @@ committed.
 Companion autotune-pre-bake scope expansion is captured in 2.2's
 note above.
 
-**Trigger to act:** workflow profiler (1.1) data lands showing
+**Trigger to act:** consumer-side `inspect_run.py` Phase 2 data lands showing
 cross-modal attention is non-trivial (>3% of e2e wall) on a real
 consumer workload, OR a second cross-workload observation of HEAD-64
 dispatches surfaces (turning the "Workload intel" entry from
@@ -449,7 +449,7 @@ torchao (0.18+ at time of writing) relevant surfaces:
   inform a future sage_ffn variant where per-tensor scaling hits an
   rtol ceiling.
 
-**Trigger to act:** workflow profiler (Tier 1.1) data lands AND the
+**Trigger to act:** consumer-side `inspect_run.py` Phase 2 data lands AND the
 comparand-identity hypothesis (Cell C hypothesis 1) needs
 resolution, OR ComfyUI surfaces a torchao storage convention in
 production. Either fires the read on torchao primitives.
@@ -581,9 +581,11 @@ Three plausible structures for new kernel work beyond sage attention
    grows significantly.
 
 **Current prior:** adjacent repos for new kernel projects (#1).
-Sage-fork stays primitive per VISION. The workflow profiler is the
-first candidate to live in a sibling repo. Open to downstream-
-consumer input on ergonomics.
+Sage-fork stays primitive per VISION. With Tier 1.1 retired in
+favor of consuming the consumer-side `inspect_run.py`, the
+first-candidate-for-sibling-repo slot is open; the next concrete
+candidate is whatever Tier 2.5 (ComfyUI quant compat shim) becomes
+if it splits into its own package.
 
 ## What we might be wrong about
 
