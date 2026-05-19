@@ -5,32 +5,65 @@ L1 routing index. Detailed material lives in `docs/` (committed) and
 
 ## TLDR
 
-Local fork of `woct0rdho/SageAttention` (itself a fork of
-`thu-ml/SageAttention`). Two purposes:
+**Mission:** sm89 kernel optimization for ComfyUI consumer workloads.
+The repo name is "sage-fork" for historical reasons (started as a
+local fork of `woct0rdho/SageAttention`, itself a fork of
+`thu-ml/SageAttention`); the substantive scope is broader. See
+`VISION.md` for the full framing.
 
-1. **Editable install** for any PyTorch project that wants sage on
-   sm89 / RTX 40xx / Ada. ComfyUI is one common consumer, but the
-   fork is consumer-agnostic: anything that imports `sageattention`
-   or replaces `torch.nn.functional.scaled_dot_product_attention`
-   picks it up. The packaging-regression fix in setup.py is the
-   load-bearing reason this fork exists at all.
-2. **Experimentation and measurement surface** for sm89 attention
-   kernel decisions. The LTX-shape bench harness
-   (`tests/test_sageattn_ltx_shapes.py`) and torch.compile spike
-   live here so kernel-side decisions can be made with numbers.
-   Consumers handle their own routing policy; the fork stays
-   primitive (kernels + bench).
+We optimize the kernels that run when ComfyUI consumers fire their
+workflows on sm89 / RTX 4090. Anchored in DiT-class diffusion (LTX
+2.3 video, Flux / Z-Image image gen) and expanding to multi-modal
+pipelines (audio-conditioned video, cross-modal attention, two-pass
+tensor-loop samplers) as those become consumer workload classes worth
+attacking. We don't have a kernel-class non-goal -- attention, FFN,
+VAE, cross-modal, anything else that shows up in a render hot loop
+is fair game on sm89. The DiT and LLM worlds are converging; shared
+surfaces (attention, FFN, normalization) are in scope as multi-modal
+pipelines emerge.
 
-We care about exactly one GPU: **sm89 / RTX 40xx / Ada**. Other archs
-compile and run via the dispatcher's sm100/sm120/sm121 fallback to
-the sm89 kernel, but we don't test or debug them. We do not carry
+Three load-bearing surfaces:
+
+1. **Kernels.** sage attention (the historical core: INT8 Q/K + FP8
+   PV) + `sage_ffn` (v0.6 fp8 MLP) + `fused_rope_split`. Forward:
+   VAE fp8 fusion, cross-modal attention coverage, GeGLU sage_ffn
+   extension, persistent-CTA rewrites. All sm89-bounded; CUDA +
+   Triton; `mma.sync` + `cp.async` primitives (no TMA / WGMMA /
+   TMEM since those are sm90+).
+2. **Bench + methodology.**
+   `tests/test_sageattn_ltx_shapes.py` is the load-bearing
+   attention measurement; `tests/bench_sage_ffn_shapes.py` is the
+   sage_ffn measurement; new primitives add their own surfaces.
+   `docs/perf_research_framework.md` codifies how we read the
+   numbers: load-bearing metric, synthetic-vs-in-pipeline 2x2 matrix
+   (Cell A/B/C/D), evidence ladder, 5-pattern silent-fallback
+   enumeration, disprove-test discipline.
+3. **ComfyUI integration patterns.**
+   `sageattention.extract_fp8_weight_and_scale` (v0.6.4) shims the
+   four known fp8 storage conventions; the cross-clone memo protocol
+   coordinates with the audio-loop consumer-side claude; the
+   wrapper-discipline rules codify what every kernel-replacement
+   consumer node needs to handle.
+
+**Hard constraint: sm89 / Ada / 4090 only.** Other archs compile and
+run via the dispatcher's sm100/sm120/sm121 fallback to the sm89
+kernel, but we don't test or debug them. We do not carry
 Hopper/Blackwell-specific kernels (all removed in v0.5.0). Windows
-install paths are also gone; build is Linux+source only.
+install paths are gone; build is Linux+source only.
+
+**Editable install** is what ships kernel changes to consumers. The
+packaging-regression fix in setup.py is the load-bearing reason this
+fork exists at all -- without it, downstream ComfyUI consumers
+couldn't compile sage from source on Ada. Everything else is built
+on top.
 
 ## Architecture
 
-CUDA extension + Triton + Python wrapper for int8/fp8 quantized
-attention. Relevant pieces:
+CUDA extension + Triton + Python wrapper covering attention, fused
+MLP, and ComfyUI integration shims. Relevant pieces, organized by
+work surface:
+
+**Attention kernels:**
 
 - `sageattention/core.py` -- `sageattn()` top-level dispatch. On
   sm89 + CUDA >= 12.8, picks `sageattn_qk_int8_pv_fp8_cuda` with
@@ -41,15 +74,39 @@ attention. Relevant pieces:
   kernel set (INT8 QK + FP8 PV, multiple accum variants).
 - `sageattention/triton/` -- JIT Triton kernels. Mask-correct on
   all archs (the only mask-correct path before v0.5.5; still gates
-  archs that haven't gained native CUDA mask support). Also home
-  of v0.6 `fused_mlp_fp8.py` -- the `sage_ffn` two-kernel fp8 MLP
-  primitive (FFN-side, not attention).
+  archs that haven't gained native CUDA mask support).
+
+**Non-attention kernels (v0.6+):**
+
+- `sageattention/triton/fused_mlp_fp8.py` -- `sage_ffn`, the
+  two-kernel fp8 MLP primitive for DiT FFN blocks. Ships as
+  completeness primitive (Cell C verdict per CHANGELOG); forward
+  work includes persistent-CTA hybrid + GeGLU extension.
+- `sageattention/triton/fused_rope.py` -- `fused_rope_split`, a
+  LTX-shape split-rotary-embed helper.
+- Future: VAE fp8 fusion, cross-modal attention coverage, additional
+  fp8 primitives as the load-bearing measurement justifies them.
+
+**ComfyUI integration patterns:**
+
+- `sageattention/comfyui_compat.py` -- `extract_fp8_weight_and_scale`
+  (v0.6.4), centralizes the four known ComfyUI fp8 storage
+  conventions so future consumers don't re-derive the probe.
+  Generalization candidate (Tier 2.5) as new quant conventions
+  surface.
+- Cross-clone memo protocol in `internal/`'s memo files coordinates
+  with the audio-loop consumer-side claude. Discipline rules in
+  `docs/perf_research_framework.md`.
+
+**Build + install:**
+
 - `setup.py` -- builds `_qattn_sm80`, `_qattn_sm89`, `_fused`. Our
   patch at line 152 adds sm89 to the SM80 build gate.
 - `build.sh` -- editable-install wrapper. Enforces `VIRTUAL_ENV`,
   `--python` pin, MAX_JOBS cap.
 
 Full upstream-vs-ours inventory in `docs/whats_ours_vs_upstream.md`.
+Mission and forward directions in `VISION.md` + `docs/roadmap.md`.
 
 ## Install / build
 

@@ -127,7 +127,81 @@ bench shows a clean speedup, the speedup gets promoted into a
 delivered claim, the in-pipeline A/B reveals the speedup doesn't
 transfer because production conditions (cache contention, dispatch
 overhead, allocator state, neighboring-module behavior) break an
-assumption the synthetic bench held warm. Two precedents in this fork:
+assumption the synthetic bench held warm.
+
+### The synthetic × in-pipeline 2x2 matrix (Cell A/B/C/D vocabulary)
+
+Every kernel-replacement decision lives in one of four cells of this
+matrix. The rows are "what the in-pipeline A/B shows on the actual
+production workload"; the columns are "what the synthetic isolation
+bench projects vs the production stock comparand":
+
+| | synthetic FASTER | synthetic SLOWER |
+|---|---|---|
+| in-pipeline FASTER | **Cell A** | **Cell B** |
+| in-pipeline SLOWER | **Cell C** | **Cell D** |
+
+**Cell A: win across the board.** Synthetic AND in-pipeline both
+show the new kernel beating the comparand. Ship default-on; the
+kernel is a real win. Disposition: promote to recommended path,
+update consumer-facing defaults, retire the comparand path as the
+recommended option.
+
+**Cell B: synthetic slower, production faster.** Implausible at face
+value. Usually means one of: (1) the synthetic comparand isn't
+representative of what production actually runs; (2) the new kernel
+benefits from a production-side side-effect the synthetic bench
+doesn't reproduce (cache warmth from a neighboring module, dispatch
+overhead avoidance, allocator state coupling). Disposition: do not
+ship on the in-pipeline number alone; the synthetic bench is
+broken-or-irrelevant and needs to be fixed before any claim. Often
+exposes a comparand-identity bug (see "stock comparand identity"
+discussion below).
+
+**Cell C: synthetic faster, production slower (or wash).** The
+canonical synthetic-vs-production gap. Synthetic isolation projected
+a win that didn't transfer. Root causes typically fall in one of
+four buckets: (1) L2 cache contention with neighboring modules that
+the synthetic bench held warm; (2) cumulative kernel-launch overhead
+at production call counts the synthetic bench didn't reproduce; (3)
+autotune state under interleaved dispatch differing from the warm
+autotune state synthetic isolation converged on; (4) stock comparand
+identity -- synthetic compared against an isolated reference (e.g.
+`torch._scaled_mm`), production compared against a different stock
+path (e.g. `comfy.ops.fp8_linear` + ChunkFFN wrapper). Disposition:
+either close the gap via a structural fix (persistent-CTA, autotune
+pre-bake, switching the bench comparand to match production), or
+ship as completeness primitive at best. v0.6 sage_ffn landed here.
+
+**Cell D: synthetic slower, production slower.** Kernel is
+structurally worse than the comparand. Don't ship except as a
+forward-compat primitive for a future workload where the trade-off
+flips. v0.6 sage_ffn was NOT here: synthetic ceiling was 1.39-1.60x
+FASTER than `torch._scaled_mm` at production shapes (CHANGELOG
+v0.6.5 bench rows). The production loss was Cell C, not Cell D.
+
+**Cell-to-evidence mapping.** Resolving "which cell are we in"
+requires distinct evidence at each stage. For the in-pipeline row:
+rung-1 evidence (chrome trace shows the new kernel's symbol in
+`cat=kernel` rows) confirms the patch is firing -- without this,
+"slower in production" might mean "the new kernel never ran." For
+the synthetic column: the bench must compare against the actual
+production stock comparand, not just an isolated reference. The
+Cell C verdict on v0.6 sage_ffn was reached only after both
+conditions held (audio-loop consumer-side `818453e` + sage v0.6.5
+in place; rung-1 evidence present in every TREATMENT chrome trace).
+
+**Open hypothesis discipline.** A Cell C verdict opens (typically)
+2-4 hypotheses for the inversion (e.g. comparand identity, autotune
+flips, L2 contention, allocator state). Each hypothesis needs:
+(a) a measurement that would advance it from "plausible" to
+"confirmed"; (b) a documented reopen-trigger if not pursued today;
+(c) a CHANGELOG Decision log entry capturing both. The hypotheses
+gate forward roadmap items: persistent-CTA targets hypothesis 1/2/3
+symmetrically; a comparand-direct re-bench targets hypothesis 4.
+
+Two concrete precedents in this fork (both retired into Decision
+log entries):
 
 - **v0.5.1 -> 2026-05-07 retirement**: the v0.5.1 release attributed
   +17pp of an audio_loop_latent e2e ratio to "FFN-adjacent reach

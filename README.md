@@ -1,29 +1,41 @@
-last updated: 2026-05-15
+last updated: 2026-05-19
 
-# SageAttention-ada
+# sage-fork
+
+*sm89 kernel optimization for ComfyUI consumer workloads.*
 
 *Based on [SageAttention](https://github.com/thu-ml/SageAttention) by thu-ml,
 via [woct0rdho's fork](https://github.com/woct0rdho/SageAttention). This
 project has diverged substantially since and is no longer a thin patch
 on either; treat it as its own thing.*
 
-An attention-kernel library for **DiT-class local generation on sm89 /
-RTX 40xx / Ada** -- LTX 2.3 video, Flux-class image, Z-Image-Turbo, and
-similar models that run on a single 4090.
+A sm89 / RTX 4090 kernel optimization and measurement surface for
+ComfyUI consumer workloads. The mission is to make the workflows we
+actually run faster, more memory-efficient, and more measurable --
+anchored in DiT-class diffusion (LTX 2.3 video, Flux / Z-Image image
+gen) and expanding to multi-modal pipelines (audio-conditioned video,
+cross-modal attention, two-pass tensor-loop samplers) as those become
+consumer workload classes worth attacking. DiT and LLM worlds are
+converging in practice; we expect new workload shapes over time and
+structure the work to absorb them.
 
-The core is INT8-quantized Q/K with FP8 PV accumulation, running
-through a runtime-dispatched kernel selector that picks the right
-variant for the GPU + CUDA combination it finds. There are also
-Triton fallbacks for archs without the native kernels and a couple of
-extra primitives (a fused split-RoPE, a multi-Q-slice attention entry)
-that downstream consumers occasionally find useful.
+Sage attention is the historical foundation and remains a primary
+deliverable: INT8-quantized Q/K with FP8 PV accumulation, runtime-
+dispatched kernel selector that picks the right variant for the GPU
++ CUDA combination it finds, Triton fallbacks for paths the native
+kernels don't cover. v0.6 added `sage_ffn` (fp8-native fused MLP for
+DiT FFN blocks). Forward directions span attention, FFN, VAE,
+ComfyUI integration shims, workflow profiling, persistent-CTA
+rewrites, and whatever the load-bearing measurement says next. The
+repo name is "sage-fork" for historical reasons; the substantive
+scope is broader. See `VISION.md` for the full mission framing.
 
-We care about **one GPU**: sm89 / Ada / 4090. The kernels compile and
-run on other archs via dispatcher fallbacks (sm80 forward-compat, sm100
-/ sm120 / sm121 through the sm89 path), but the bench baselines, the
-rtol expectations, and the perf-decision criteria are all calibrated
-for sm89. Treat results elsewhere as "should work" rather than
-"validated."
+**The hard constraint: sm89 / Ada / 4090 only.** Kernels compile and
+run on other archs via dispatcher fallbacks (sm80 forward-compat,
+sm100 / sm120 / sm121 through the sm89 path), but the bench
+baselines, the rtol expectations, and the perf-decision criteria are
+all calibrated for sm89. Treat results elsewhere as "should work"
+rather than "validated."
 
 ---
 

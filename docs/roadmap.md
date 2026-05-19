@@ -1,6 +1,6 @@
 # Roadmap
 
-Last updated: 2026-05-19 (Cell C verdict folded into Tier 1.3 trigger; cross-modal + quant-compat added as Tier 2.4 and 2.5)
+Last updated: 2026-05-19 (Cell C verdict folded into Tier 1.3 trigger; cross-modal + quant-compat added as Tier 2.4 and 2.5; Stack leverage + External design references sections added; aligned with VISION.md mission reframe)
 
 Forward-looking record of directions worth pursuing on this fork --
 ranked by relevance to the current workload, technically scoped, and
@@ -141,9 +141,26 @@ SMEM budget on sm89 (164 KB per SM) constrains tile size. Likely
 correctness on rtol vs the existing 2-kernel reference at each
 shape in the LTX FFN coverage.
 
-**Effort:** 2-3 weeks per CHANGELOG estimate. Higher confidence on
-FFN first (concrete e2e regression data); attention follows if the
-pattern holds.
+**Sub-pattern shape (per the "External design references" section
+below):** the cleanest articulation is producer/consumer warp split
+with explicit roles -- loader warps doing `cp.async` for x_chunk +
+w_chunk; launcher/controller logic managing the per-stage semaphore
+state; consumer warps doing `tl.dot` + scale + GELU. Next-tile-id
+sourced from `atomicAdd` on a global counter (sm89-equivalent of
+cluster launch control). Pipeline depth (4-deep load + 8-deep
+epilogue from the Megakernels reference) retuned for sm89's 164KB
+SMEM. Compile-time `static_assert`-equivalent shmem budget check at
+autotune-config-generation time so budget violations surface at
+compile rather than runtime.
+
+**Effort:** 2-3 weeks per CHANGELOG estimate, Triton-shaped. Could
+drop to 1-2 weeks if Triton 3.7's persistent-kernel primitives land
+cleanly on sm89 -- worth a ~half-day spike against
+`tl.dot_scaled` + improved `tl.program_id` patterns before
+committing. Higher confidence on FFN first (concrete e2e regression
+data); attention follows if the pattern holds. A faithful `.cu`-side
+persistent-CTA modeled on Megakernels' shape would be 4-8 weeks and
+isn't worth the additional cost over the Triton-shaped version.
 
 **Trigger refined 2026-05-19 (Cell C verdict confirmed):** the
 v0.6 e2e gap is NOT closable via consumer-side `prior_forward`
@@ -373,13 +390,166 @@ at test time but not in production logs.
 Cheap enough that "wait for trigger" was the wrong call originally;
 will ship next session it gets touched.
 
+## Stack leverage opportunities
+
+The modern stack (Triton 3.7, torchao, PyTorch 2.12) has primitives
+we're underutilizing. Each entry: what it offers, which open problem
+it intersects, effort.
+
+### Triton 3.7 features
+
+- **`tl.dot_scaled`** -- fp8 matmul with scale tensors as direct
+  kernel args. If sm89-supported and stable, *kills the v0.6.5
+  `w*_scale` must-be-Python-scalar foot-gun at the kernel level*
+  rather than at the assert boundary. Our wrapper assert becomes
+  defense-in-depth, not load-bearing. Worth a spike before any
+  persistent-CTA rewrite to decide whether the new ABI is in the
+  scope of the rewrite.
+- **Improved persistent-kernel primitives** -- better `tl.program_id`
+  patterns for persistent grids + cleaner async-copy primitives.
+  Could *cut Tier 1.3 (persistent-CTA `sage_ffn`) effort estimate
+  from 2-3 weeks to 1-2 weeks* if the primitives land cleanly on
+  sm89.
+- **Autotune cache control APIs** -- improved `kernel.cache`
+  introspection + load/save. Intersects Cell C hypothesis 2
+  (autotune flips between contexts) and Tier 2.2 (autotune pre-
+  bake). May simplify pre-bake by eliminating the per-(torch,
+  triton, CUDA) version-split logic.
+
+**Trigger to act:** before any persistent-CTA rewrite (Tier 1.3) --
+worth ~half a day spike confirming which primitives are sm89-stable
+in Triton 3.7. If `tl.dot_scaled` works, the v0.6.1+ kernel ABI
+could ship with native tensor-scale support and we walk back the
+v0.6.5 wrapper assert to defense-in-depth.
+
+### torchao primitives
+
+A local torchao checkout is available; we can build from source.
+torchao 0.18+ relevant surfaces:
+
+- **`Float8Linear` with per-tensor + per-row scaling** -- production-
+  quality fp8 Linear. Plausibly *what ComfyUI moves to* if/when they
+  upgrade their fp8 stack. Our `extract_fp8_weight_and_scale` v0.6.4
+  shim doesn't currently probe for a torchao storage convention; if
+  it lands in ComfyUI, that's a 5th storage convention to handle.
+- **`Float8RowwiseScaledTensor` / `Float8TensorWise`** -- proper
+  tensor subclasses for fp8 with scales. Could be *the right
+  comparand for our synthetic bench* (Cell C hypothesis 1: "stock
+  comparand identity"). Benching sage_ffn vs
+  `torchao.float8.Float8Linear` might give a more honest "is
+  sage_ffn faster than the modern production-ready alternative"
+  answer than benching vs raw `torch._scaled_mm`.
+- **`torchao.prototype` kernels** -- research code including fused
+  fp8 MLP variants. Possible direct prior art for sage_ffn that
+  re-shapes the persistent-CTA effort or surfaces tile-config
+  patterns we haven't tried.
+- **MX scaling formats (mxfp8, mxfp4)** -- sm100+ only for the
+  hardware path, but the software per-block scaling pattern could
+  inform a future sage_ffn variant where per-tensor scaling hits an
+  rtol ceiling.
+
+**Trigger to act:** workflow profiler (Tier 1.1) data lands AND the
+comparand-identity hypothesis (Cell C hypothesis 1) needs
+resolution, OR ComfyUI surfaces a torchao storage convention in
+production. Either fires the read on torchao primitives.
+
+### PyTorch 2.12 features
+
+- **`torch._scaled_mm_v2`** -- newer than `_scaled_mm`. Different
+  tile selection. Our synthetic bench uses `_scaled_mm`; switching
+  to `_scaled_mm_v2` could shift the synthetic-bench comparand and
+  possibly the Cell C verdict at the bench layer.
+- **`torch.cuda.tunable`** -- PyTorch's auto-tuning API for
+  cuBLAS/cuBLASLt. Cross-session caching. May help with the
+  autotune-state-under-interleaving problem (Cell C hypothesis 2)
+  from a different angle than Triton's own autotune cache.
+- **`torch.compile` improvements** -- `docs/torch_compile_spike.md`
+  documented our skip at torch 2.11. If 2.12 changes the Dynamo
+  graph-break rules at our pybind sites, the spike is worth re-
+  running. CHANGELOG Backlog item 3.3.
+
+**Trigger to act:** independently of any of the above firing.
+`_scaled_mm_v2` swap in the bench is a ~30-min experiment that
+could be done opportunistically; `torch.compile` revisit is conditional
+on a spike at the new torch version.
+
+## External design references
+
+Cross-arch projects whose code we do NOT port (sm90+ only) but whose
+patterns are worth internalizing before persistent-CTA work. Both
+were audit-read 2026-05-19 via subagent investigation; full notes in
+`internal/design/persistent_cta_sage_ffn_scoping.md` (gitignored)
+when that scoping doc activates.
+
+### Megakernels (local checkout; sm100/sm103 only)
+
+Specific patterns transferable to sm89 by re-implementing against
+`cp.async` + `mma.sync` instead of TMA/WGMMA/cluster-launch:
+
+- **Warp-role decomposition** (`csrc/megakittens.cuh`,
+  `csrc/controller.cuh`, `csrc/itypes/gemm.cuh` in the Megakernels
+  repo) -- explicit roles: controller / loader / launcher / consumer
+  / storer warps. Software pattern, sm70+. On sm89: loader warps use
+  `cp.async`; the next-tile-id source is `atomicAdd` instead of
+  cluster launch control.
+- **Page-release ordering** (`csrc/itypes/gemm.cuh` lines 39-46) --
+  semaphore-driven SMEM page reuse. Portable as-is.
+- **Pipeline depth tuning** (`LOAD_PIPE_DEPTH=4, EPI_PIPE_DEPTH=8`)
+  -- discipline transfers; specific numbers retune for sm89's 164KB
+  SMEM budget.
+- **Fused two-Linear-around-activation pattern**
+  (`csrc/itypes/llama1b/upgate.cuh`) -- decode-shaped (M=1) so not a
+  code port, but validates the abstraction shape sage_ffn is moving
+  toward.
+
+### ThunderKittens (local checkout; sm90+ only)
+
+Specific patterns transferable to sm89:
+
+- **Producer/consumer warp split with per-stage semaphores**
+  (`prototype/interpreter/interpreter.cuh:355`,
+  `templates.cuh:9`) -- 4 producer warps doing async loads, 8
+  consumer warps doing MMA + math. Software pattern. On sm89: same
+  structure, `cp.async` instead of `tma::load_async`, sync `mma.sync`
+  instead of WGMMA.
+- **`task_iter`-driven dispatch** -- persistent kernel loops on a
+  task index pulled from a global queue. On sm89: same structure,
+  `atomicAdd` on a global counter instead of cluster launch control.
+- **Compile-time tile shape `static_assert` shmem budget check**
+  (`interpreter.cuh:50-56`) -- Triton-portable. Verify
+  `BLOCK_M*BLOCK_K + BLOCK_K*BLOCK_N` fits SMEM at autotune-config-
+  generation time, catching budget violations before runtime.
+- **Bias-init lane-shuffle pattern** (`kernels/flux/flux_gelu.cu`
+  `init_bias` at lines 26-41) -- portable; corroborates the bias
+  handling sage_ffn already does.
+- **fp8 per-tensor scale layout**
+  (`kernels/gemm/fp8_h100_scaled/fp8_h100_gemm_scaled.cu` lines 116-119)
+  -- "accumulate fp32, scale at end, dequant to bf16" matches
+  sage_ffn's numerics ordering. Cross-check, no port.
+
+**What's NOT transferable from either project:** TMA, WGMMA,
+`setmaxnreg`, `tcgen05`, MXFP8/NVFP4 hardware paths, 2-CTA clusters.
+sm90+ features that don't exist on sm89. Megakernels' DAG-fusion
+`torch.compile` backend is also out of scope (wrong abstraction
+level for a kernel library).
+
+**Adoption cost:** read ~5 hours before any persistent-CTA work to
+internalize patterns. No code adoption. Effort estimate for the
+Tier 1.3 rewrite (2-3 weeks Triton-shaped) is unchanged by reading;
+a faithful `.cu`-side persistent-CTA modeled directly on
+Megakernels' shape would be 4-8 weeks and not worth it.
+
 ## Tier 4: Explicit non-goals
 
 - **Hopper / Blackwell support.** Out of scope per VISION.md.
   Reopen only if audience shifts.
 - **Generic / cross-arch kernel rewrites.** Fights the scope.
 - **Becoming an LLM-inference engine.** vLLM / SGLang / others own
-  that space. We stay diffusion-focused.
+  that space. We stay diffusion-and-multi-modal-diffusion focused.
+  As DiT and LLM worlds converge (audio-conditioned models, text-
+  conditioned video, multi-modal pipelines), shared kernel surfaces
+  (attention, FFN, normalization) are in scope on sm89; we just
+  don't ship an autoregressive serving stack.
 - **Polished public release infrastructure** (CI builds for
   multiple Python / CUDA / torch versions, polished docs site,
   user-onboarding flows). Solo-hobbyist scope; the README +
