@@ -1,6 +1,6 @@
 # Roadmap
 
-Last updated: 2026-05-19 (Cell C verdict folded into Tier 1.3 trigger)
+Last updated: 2026-05-19 (Cell C verdict folded into Tier 1.3 trigger; cross-modal + quant-compat added as Tier 2.4 and 2.5)
 
 Forward-looking record of directions worth pursuing on this fork --
 ranked by relevance to the current workload, technically scoped, and
@@ -227,6 +227,12 @@ triton version, CUDA version) split since autotune output can vary.
 OR demonstrated benefit from a one-off pre-bake on the canonical
 workload. Cheap enough that "wait for trigger" is conservative.
 
+If 2.4 (cross-modal attention coverage) activates first, the
+pre-bake scope must cover both HEAD-DIM 128 AND HEAD-DIM 64
+template instantiations -- otherwise pre-bake benefits only the
+main self-attention path while cross-modal attns still pay the
+cold-render autotune cost.
+
 ### 2.3 fp8/int8 research for video diffusion specifically
 
 **What:** methodology + measurement work documenting how fp8/int8
@@ -245,6 +251,88 @@ if the user wants public-facing output.
 **Trigger to act:** user-driven (not data-driven). If findings
 worth sharing surface organically, share them; otherwise this stays
 "keep the option open" and structures no work.
+
+### 2.4 Cross-modal attention bench coverage + HEAD-DIM 64 autotune
+
+**What:** extend `tests/test_sageattn_ltx_shapes.py` to cover
+HEAD-DIM 64 attention shapes in addition to today's HEAD-DIM 128
+coverage. Multi-modal workflows (audio-conditioned video, cross-
+attention pipelines) dispatch the HEAD-64 sage template alongside
+the HEAD-128 template in the same render -- different sub-modules,
+different tile-config space. Today's bench measures only one of
+the two template instantiations.
+
+**Why:** two specific data points motivate this. (a) A cross-clone
+trace observation (CHANGELOG "Workload intel") of a two-pass tensor-
+loop workflow shows 1536 HEAD-128 + 384 HEAD-64 dispatches per
+render. (b) An attention-kernel slowdown of 2.14x at a 3% seq-length
+increase in the same trace surfaced direct evidence of autotune
+flipping under interleaved dispatch (Cell C hypothesis 2,
+corroborated). Without HEAD-64 bench rows we cannot pre-bake the
+right autotune configs and we cannot measure the cross-modal-attn
+share of e2e wall time.
+
+**Technical shape:** add shape entries to the LTX shape table for
+HEAD-64 cross-attention call sites (audio cross-attns, upsampler
+stages, or whatever the consumer workflow surfaces). Reuse the
+existing `accuracy_metrics` + median-timing harness. Companion
+update to `tests/regression_baselines.json` once shapes are
+committed.
+
+**Effort:** ~1-2 days for bench rows + baseline calibration.
+Companion autotune-pre-bake scope expansion is captured in 2.2's
+note above.
+
+**Trigger to act:** workflow profiler (1.1) data lands showing
+cross-modal attention is non-trivial (>3% of e2e wall) on a real
+consumer workload, OR a second cross-workload observation of HEAD-64
+dispatches surfaces (turning the "Workload intel" entry from
+one-off to recurrent). Until either fires, the existing HEAD-128
+coverage is sufficient.
+
+### 2.5 ComfyUI quant compatibility shim package
+
+**What:** generalize `sageattention.extract_fp8_weight_and_scale`
+(v0.6.4, currently a single utility in `sageattention/comfyui_compat.py`)
+into a small standalone package or subpackage covering the broader
+"resolve quantized parameters across ComfyUI versions" surface.
+Candidates: fp8 weights + scales (today), fp8 biases (if a future
+convention surfaces), int8 weights + scales (if int8 quant lands in
+ComfyUI), Linear-vs-Conv2d quant convention variance.
+
+**Why:** the v0.6.4 utility was driven by one specific consumer-
+side bug (QuantizedTensor wrapper unwrap). ComfyUI's fp8 storage
+convention has shifted at least three times (legacy `scale_weight`
+attr → older `weight_scale` attr → modern `QuantizedTensor._params`
+/ `layout_params`). Every future consumer who wants to extract
+quantized parameters re-derives the same probe. Centralizing the
+probe protects every consumer from re-deriving the conventions and
+getting bitten by the same trap. Tier 2 rather than Tier 1 because
+the v0.6.4 single-utility version covers the immediate case; this
+is "round out the shim into a more general surface as new
+conventions surface."
+
+**Technical shape:** either (a) keep as a subpackage of
+`sageattention` and add new probe functions (`extract_int8_weight_and_scale`,
+`extract_quantized_bias`, etc.) as ComfyUI conventions surface, OR
+(b) split into a sibling repo (`comfyui-quant-compat` or similar)
+that has no sage dependency and can be vendored by consumers that
+don't want a sage import. Repo-structure question is open per the
+existing "Repo structure" section below; current prior is
+subpackage-of-sageattention.
+
+**Effort:** ~3 hours per added probe function (matching the v0.6.4
+estimate). Test coverage via mock-objects pattern established in
+`tests/test_comfyui_compat.py`.
+
+**Trigger to act:** a third (post-v0.6.4) ComfyUI fp8 storage
+convention surfaces (would extend the existing probe), OR an int8
+or other quantization scheme lands in ComfyUI that a downstream
+consumer hits, OR a second consumer wrapper hits the missing-unwrap
+trap on a different attribute (e.g. bias storage convention).
+Three-incident threshold rather than two because the methodology
+fold from v0.6.4 + the framework rung 2 expansion together cover
+the single-utility case adequately.
 
 ## Tier 3: Lower-relevance, real but conditional
 
