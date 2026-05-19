@@ -1,6 +1,6 @@
 # Roadmap
 
-Last updated: 2026-05-19 (Cell C verdict folded into Tier 1.3 trigger; cross-modal + quant-compat added as Tier 2.4 and 2.5; Stack leverage + External design references sections added; aligned with VISION.md mission reframe)
+Last updated: 2026-05-19
 
 Forward-looking record of directions worth pursuing on this fork --
 ranked by relevance to the current workload, technically scoped, and
@@ -392,11 +392,12 @@ will ship next session it gets touched.
 
 ## Stack leverage opportunities
 
-The modern stack (Triton 3.7, torchao, PyTorch 2.12) has primitives
-we're underutilizing. Each entry: what it offers, which open problem
-it intersects, effort.
+The modern stack has primitives we're underutilizing. Each entry:
+what it offers, which open problem it intersects, effort. Version
+anchors are inline where a feature is new-in-that-version; section
+headers stay version-neutral so this section ages with the stack.
 
-### Triton 3.7 features
+### Triton features
 
 - **`tl.dot_scaled`** -- fp8 matmul with scale tensors as direct
   kernel args. If sm89-supported and stable, *kills the v0.6.5
@@ -418,14 +419,14 @@ it intersects, effort.
 
 **Trigger to act:** before any persistent-CTA rewrite (Tier 1.3) --
 worth ~half a day spike confirming which primitives are sm89-stable
-in Triton 3.7. If `tl.dot_scaled` works, the v0.6.1+ kernel ABI
-could ship with native tensor-scale support and we walk back the
-v0.6.5 wrapper assert to defense-in-depth.
+at the current Triton (3.7 at time of writing). If `tl.dot_scaled`
+works, the v0.6.1+ kernel ABI could ship with native tensor-scale
+support and we walk back the v0.6.5 wrapper assert to defense-in-depth.
 
 ### torchao primitives
 
 A local torchao checkout is available; we can build from source.
-torchao 0.18+ relevant surfaces:
+torchao (0.18+ at time of writing) relevant surfaces:
 
 - **`Float8Linear` with per-tensor + per-row scaling** -- production-
   quality fp8 Linear. Plausibly *what ComfyUI moves to* if/when they
@@ -453,33 +454,42 @@ comparand-identity hypothesis (Cell C hypothesis 1) needs
 resolution, OR ComfyUI surfaces a torchao storage convention in
 production. Either fires the read on torchao primitives.
 
-### PyTorch 2.12 features
+### PyTorch features
 
-- **`torch._scaled_mm_v2`** -- newer than `_scaled_mm`. Different
-  tile selection. Our synthetic bench uses `_scaled_mm`; switching
-  to `_scaled_mm_v2` could shift the synthetic-bench comparand and
-  possibly the Cell C verdict at the bench layer.
+- **`torch._scaled_mm_v2`** (PyTorch 2.12+) -- newer than
+  `_scaled_mm`. Different tile selection. Our synthetic bench uses
+  `_scaled_mm`; switching to `_scaled_mm_v2` could shift the
+  synthetic-bench comparand and possibly the Cell C verdict at the
+  bench layer.
 - **`torch.cuda.tunable`** -- PyTorch's auto-tuning API for
   cuBLAS/cuBLASLt. Cross-session caching. May help with the
   autotune-state-under-interleaving problem (Cell C hypothesis 2)
   from a different angle than Triton's own autotune cache.
 - **`torch.compile` improvements** -- `docs/torch_compile_spike.md`
-  documented our skip at torch 2.11. If 2.12 changes the Dynamo
-  graph-break rules at our pybind sites, the spike is worth re-
-  running. CHANGELOG Backlog item 3.3.
+  documented our skip at torch 2.11. If a later torch release
+  changes the Dynamo graph-break rules at our pybind sites, the
+  spike is worth re-running. CHANGELOG Backlog item 3.3.
 
 **Trigger to act:** independently of any of the above firing.
 `_scaled_mm_v2` swap in the bench is a ~30-min experiment that
-could be done opportunistically; `torch.compile` revisit is conditional
-on a spike at the new torch version.
+could be done opportunistically; `torch.compile` revisit is
+conditional on a spike at a torch version newer than 2.11.
 
 ## External design references
 
 Cross-arch projects whose code we do NOT port (sm90+ only) but whose
 patterns are worth internalizing before persistent-CTA work. Both
-were audit-read 2026-05-19 via subagent investigation; full notes in
-`internal/design/persistent_cta_sage_ffn_scoping.md` (gitignored)
-when that scoping doc activates.
+were audit-read 2026-05-19 via subagent investigation. Full notes
+will land in `internal/design/persistent_cta_sage_ffn_scoping.md`
+(gitignored; not yet authored, created when Tier 1.3 work
+activates). Line numbers below are as of the 2026-05-19 audit-read;
+refresh on re-read since upstream projects may renumber.
+
+**Trigger to act:** before Tier 1.3 (persistent-CTA hybrid for
+sage_ffn) work begins. ~5 hours of read time to internalize
+patterns; no code port. The patterns transfer to sm89 by re-
+implementing against `cp.async` + `mma.sync` instead of the sm90+
+TMA/WGMMA primitives the upstream code uses.
 
 ### Megakernels (local checkout; sm100/sm103 only)
 
@@ -544,12 +554,10 @@ Megakernels' shape would be 4-8 weeks and not worth it.
 - **Hopper / Blackwell support.** Out of scope per VISION.md.
   Reopen only if audience shifts.
 - **Generic / cross-arch kernel rewrites.** Fights the scope.
-- **Becoming an LLM-inference engine.** vLLM / SGLang / others own
-  that space. We stay diffusion-and-multi-modal-diffusion focused.
-  As DiT and LLM worlds converge (audio-conditioned models, text-
-  conditioned video, multi-modal pipelines), shared kernel surfaces
-  (attention, FFN, normalization) are in scope on sm89; we just
-  don't ship an autoregressive serving stack.
+- **Becoming an LLM-inference engine.** See VISION.md "What we are
+  NOT" for the framing. Short form: shared kernel surfaces in scope
+  on sm89 as DiT and LLM converge; autoregressive serving stack is
+  not.
 - **Polished public release infrastructure** (CI builds for
   multiple Python / CUDA / torch versions, polished docs site,
   user-onboarding flows). Solo-hobbyist scope; the README +

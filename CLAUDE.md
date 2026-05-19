@@ -14,13 +14,10 @@ local fork of `woct0rdho/SageAttention`, itself a fork of
 We optimize the kernels that run when ComfyUI consumers fire their
 workflows on sm89 / RTX 4090. Anchored in DiT-class diffusion (LTX
 2.3 video, Flux / Z-Image image gen) and expanding to multi-modal
-pipelines (audio-conditioned video, cross-modal attention, two-pass
-tensor-loop samplers) as those become consumer workload classes worth
-attacking. We don't have a kernel-class non-goal -- attention, FFN,
-VAE, cross-modal, anything else that shows up in a render hot loop
-is fair game on sm89. The DiT and LLM worlds are converging; shared
-surfaces (attention, FFN, normalization) are in scope as multi-modal
-pipelines emerge.
+pipelines as those become consumer workload classes worth attacking
+(see `VISION.md` for the full scope framing). No kernel-class
+non-goal -- attention, FFN, VAE, cross-modal, anything else that
+shows up in a render hot loop is fair game on sm89.
 
 Three load-bearing surfaces:
 
@@ -36,7 +33,7 @@ Three load-bearing surfaces:
    sage_ffn measurement; new primitives add their own surfaces.
    `docs/perf_research_framework.md` codifies how we read the
    numbers: load-bearing metric, synthetic-vs-in-pipeline 2x2 matrix
-   (Cell A/B/C/D), evidence ladder, 5-pattern silent-fallback
+   (Cell A/B/C/D), evidence ladder, rung-2 silent-fallback-pattern
    enumeration, disprove-test discipline.
 3. **ComfyUI integration patterns.**
    `sageattention.extract_fp8_weight_and_scale` (v0.6.4) shims the

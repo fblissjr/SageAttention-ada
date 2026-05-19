@@ -378,8 +378,9 @@ chain fully closed, sage_ffn dispatches end-to-end -- rung-1 evidence
 (`_fp8_matmul_gelu_kernel` + `_fp8_matmul_kernel` rows in `cat=kernel`
 of every TREATMENT chrome trace) confirms.
 
-The verdict is **Cell C** of the synthetic-vs-production 2x2 matrix
-at *both* wall-time and per-stage-kernel-time levels:
+The verdict is **Cell C** of the synthetic-vs-in-pipeline 2x2 matrix
+(defined in `docs/perf_research_framework.md`) at *both* wall-time
+and per-stage-kernel-time levels:
 
 | measurement | sage_ffn | stock (prod) | ratio |
 |---|---:|---:|---:|

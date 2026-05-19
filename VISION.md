@@ -47,12 +47,12 @@ The work surface, by layer:
   `sageattention/comfyui_compat.py` (fp8 storage probe across known
   conventions), the cross-clone memo protocol with the audio-loop
   consumer-side claude, the wrapper-discipline rules in the
-  perf-research framework (5-pattern silent-fallback enumeration).
+  perf-research framework (rung-2 silent-fallback-pattern enumeration).
 - **Methodology + decision discipline** --
   `docs/perf_research_framework.md` codifies the rules every kernel-
   day decision is graded against: load-bearing metric, synthetic-vs-
   in-pipeline 2x2 matrix (Cell A/B/C/D vocabulary), evidence ladder
-  for kernel-replacement audits, 5-pattern silent-fallback
+  for kernel-replacement audits, rung-2 silent-fallback-pattern
   enumeration, disprove-test discipline.
 - **Forward record** -- `docs/roadmap.md` (tiered directions, trigger-
   conditional, including stack-leverage opportunities and external
@@ -187,7 +187,7 @@ and we add a perceptual layer.
   (`docs/perf_research_framework.md`) that codifies the rules every
   kernel-day decision is graded against: load-bearing metric, the
   synthetic-vs-in-pipeline 2x2 matrix (Cell A/B/C/D), evidence
-  ladder for kernel-replacement audits, 5-pattern silent-fallback
+  ladder for kernel-replacement audits, rung-2 silent-fallback-pattern
   enumeration, disprove-test discipline. Reusable across any future
   kernel work on this fork or its consumers.
 - **A decision log + tiered roadmap** that grades every change
@@ -265,7 +265,7 @@ and we add a perceptual layer.
 - [`docs/perf_research_framework.md`](./docs/perf_research_framework.md)
   — the methodology framework in full: synthetic-vs-in-pipeline 2x2
   matrix (Cell A/B/C/D), evidence ladder for kernel-replacement
-  audits, 5-pattern silent-fallback enumeration.
+  audits, rung-2 silent-fallback-pattern enumeration.
 - [`docs/roadmap.md`](./docs/roadmap.md) — forward-looking record
   of directions worth pursuing, tiered by relevance and trigger-
   conditional. Includes Stack leverage opportunities (torchao,

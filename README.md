@@ -13,11 +13,9 @@ A sm89 / RTX 4090 kernel optimization and measurement surface for
 ComfyUI consumer workloads. The mission is to make the workflows we
 actually run faster, more memory-efficient, and more measurable --
 anchored in DiT-class diffusion (LTX 2.3 video, Flux / Z-Image image
-gen) and expanding to multi-modal pipelines (audio-conditioned video,
-cross-modal attention, two-pass tensor-loop samplers) as those become
-consumer workload classes worth attacking. DiT and LLM worlds are
-converging in practice; we expect new workload shapes over time and
-structure the work to absorb them.
+gen) and expanding to multi-modal pipelines as those become consumer
+workload classes worth attacking. See `VISION.md` for the full
+scope framing.
 
 Sage attention is the historical foundation and remains a primary
 deliverable: INT8-quantized Q/K with FP8 PV accumulation, runtime-
@@ -64,9 +62,12 @@ rather than "validated."
   completeness primitive, not a perf win**: synthetic-bench shows
   1.26-1.36x vs torch's fp8-dequant path, but a two-sampler LTX
   production A/B came back +1.79% e2e slower (+20% at stage-2
-  per-call). Available for users who specifically need fp8-native
-  fused MLP on sm89; no other library provides this combination.
-  See "What we've measured" for the production breakdown.
+  per-call) -- the synthetic-vs-in-pipeline gap the perf-research
+  framework calls Cell C (defined in
+  `docs/perf_research_framework.md`). Available for users who
+  specifically need fp8-native fused MLP on sm89; no other library
+  provides this combination. See "What we've measured" for the
+  production breakdown.
 - **A bench harness** -- `tests/test_sageattn_ltx_shapes.py` measures
   every sage kernel + torch SDPA backend (FLASH / EFFICIENT / CUDNN)
   at the LTX-class shapes our models actually hit, reporting both

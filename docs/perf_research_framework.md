@@ -129,7 +129,7 @@ transfer because production conditions (cache contention, dispatch
 overhead, allocator state, neighboring-module behavior) break an
 assumption the synthetic bench held warm.
 
-### The synthetic × in-pipeline 2x2 matrix (Cell A/B/C/D vocabulary)
+### The synthetic-vs-in-pipeline 2x2 matrix (Cell A/B/C/D vocabulary)
 
 Every kernel-replacement decision lives in one of four cells of this
 matrix. The rows are "what the in-pipeline A/B shows on the actual
