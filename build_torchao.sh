@@ -122,6 +122,26 @@ fi
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9}"
 export MAX_JOBS="${MAX_JOBS:-8}"
 
+# Pre-build: capture pre-state. uv pip install -e . with a stale `.so`
+# on disk will see the file and skip the CUDA compile step (it thinks
+# the package is built). To force a real rebuild against the current
+# torch ABI, wipe the base extension first. We leave _C_cutlass_90a
+# and _C_mxfp8 alone -- those are sm90+/sm100+ artifacts from earlier
+# builds and not in scope for our sm89-only path.
+PRE_BUILD_TS=$(date +%s)
+echo "==> Forcing fresh _C.abi3.so rebuild"
+if [[ -f "${TORCHAO_DIR}/torchao/_C.abi3.so" ]]; then
+    pre_mtime=$(stat -c %Y "${TORCHAO_DIR}/torchao/_C.abi3.so")
+    echo "  removing stale ${TORCHAO_DIR}/torchao/_C.abi3.so (mtime=$(date -d @${pre_mtime} +%Y-%m-%d))"
+    rm -f "${TORCHAO_DIR}/torchao/_C.abi3.so"
+else
+    echo "  no existing _C.abi3.so to remove"
+fi
+# Also wipe the build cache dir -- uv/setuptools can resurrect stale
+# artifacts from there even when source .so is gone.
+rm -rf "${TORCHAO_DIR}/build"
+
+echo ""
 echo "==> Building torchao"
 echo "  source:               ${TORCHAO_DIR}"
 echo "  venv:                 ${VIRTUAL_ENV}"
@@ -131,8 +151,32 @@ echo ""
 
 # --no-build-isolation: use the venv's torch (the build needs it),
 # rather than re-resolving a build-env torch that may not match.
-(cd "${TORCHAO_DIR}" && "${UV}" pip install -e . --no-build-isolation)
+# --force-reinstall: bypass uv's "already installed" short-circuit.
+# --no-deps: don't re-resolve transitive dependencies (we're only
+# rebuilding torchao itself).
+(cd "${TORCHAO_DIR}" && "${UV}" pip install -e . \
+    --no-build-isolation --force-reinstall --no-deps)
 
 echo ""
 echo "==> Verifying"
+
+# Confirm a fresh _C.abi3.so actually exists post-build. If the build
+# silently skipped the CUDA compile (uv install can still succeed with
+# only metadata), the import would still fall back to pure-Python paths
+# but the C extension wouldn't be available for any compiled-kernel
+# work. Surface this loudly here.
+if [[ -f "${TORCHAO_DIR}/torchao/_C.abi3.so" ]]; then
+    post_mtime=$(stat -c %Y "${TORCHAO_DIR}/torchao/_C.abi3.so")
+    if (( post_mtime > PRE_BUILD_TS )); then
+        echo "  _C.abi3.so rebuilt (mtime=$(date -d @${post_mtime} +%Y-%m-%d\ %H:%M:%S))"
+    else
+        echo "  WARNING: _C.abi3.so exists but mtime ($(date -d @${post_mtime} +%Y-%m-%d)) is older than this build session" >&2
+        echo "           the build may have used a cached binary. Try ./build_torchao.sh clean to wipe deeper artifacts." >&2
+    fi
+else
+    echo "  WARNING: _C.abi3.so was not produced by the build" >&2
+    echo "           setup.py likely skipped the CUDA compile step. Investigate setup.py output above." >&2
+fi
+echo ""
+
 verify_import
