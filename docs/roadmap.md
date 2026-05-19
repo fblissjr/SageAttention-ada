@@ -425,12 +425,21 @@ support and we walk back the v0.6.5 wrapper assert to defense-in-depth.
 
 ### torchao primitives
 
-A local torchao checkout is available; we can build from source via
-`./build_torchao.sh` (mirrors `build.sh` discipline: active-venv
-enforcement, sm89-only arch list to skip sm90+/sm100+ kernels we
-don't use, editable install). Today the bench arm uses pure-Python
-`addmm_float8_unwrapped_inference`; future compiled-kernel work
-needs the C extension rebuilt against the current torch version.
+A local torchao checkout is available; `./build_torchao.sh` does
+editable install + diagnostic verify (active-venv enforcement,
+force-reinstall to defeat uv's "already installed" short-circuit
+after a torchao git pull).
+
+**Honest about what torchao 0.18 ships on sm89:** the pure-Python
+`addmm_float8_unwrapped_inference` (a thin wrapper around
+`torch._scaled_mm`) is the only surface usable on sm89. torchao's
+compiled extensions `_C_cutlass_90a` (sm90a) and `_C_mxfp8` (sm100)
+are Hopper/Blackwell-only; the base `_C` extension is empty on
+0.18 because all its candidate sources got refactored into the
+sm90a/sm100 sub-extensions. So building torchao's C extensions
+buys us nothing on sm89; the editable install is purely about
+keeping the Python-side entry points current.
+
 torchao (0.18+ at time of writing) relevant surfaces:
 
 - **`Float8Linear` with per-tensor + per-row scaling** -- production-
