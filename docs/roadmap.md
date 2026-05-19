@@ -425,7 +425,12 @@ support and we walk back the v0.6.5 wrapper assert to defense-in-depth.
 
 ### torchao primitives
 
-A local torchao checkout is available; we can build from source.
+A local torchao checkout is available; we can build from source via
+`./build_torchao.sh` (mirrors `build.sh` discipline: active-venv
+enforcement, sm89-only arch list to skip sm90+/sm100+ kernels we
+don't use, editable install). Today the bench arm uses pure-Python
+`addmm_float8_unwrapped_inference`; future compiled-kernel work
+needs the C extension rebuilt against the current torch version.
 torchao (0.18+ at time of writing) relevant surfaces:
 
 - **`Float8Linear` with per-tensor + per-row scaling** -- production-

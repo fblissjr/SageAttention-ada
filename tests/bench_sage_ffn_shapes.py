@@ -20,13 +20,25 @@ the kernel an FFN consumer would see if sage_ffn falls back to
 stock.
 
 A third comparand (torchao `addmm_float8_unwrapped_inference`) is
-included automatically if `torchao` is importable. Motivation:
-CHANGELOG Decision log "v0.6 sage_ffn Cell C verdict" open
-hypothesis 1 ("stock comparand identity") -- if ComfyUI migrates to
-torchao primitives in production, the correct synthetic comparand
-is torchao instead of `torch._scaled_mm`. Bench arm is opt-in via
-torchao availability; skipped silently when torchao isn't
-installed.
+included automatically if `torchao` is importable. NOTE: this
+function is currently a thin Python wrapper around
+`torch._scaled_mm` -- same underlying cuBLAS kernel as the
+existing `_scaled_mm` arm, so it does NOT directly test Cell C
+hypothesis 1 (stock comparand identity). The actual hypothesis-1
+test would be `torchao.float8.Float8Linear` with per-row scaling.
+
+What this arm DOES give us, even with identical kernel dispatch:
+(a) regression detection if torchao ever diverges from
+`_scaled_mm` (e.g. fast-accum default flip, preprocessing
+addition), (b) ABI stability across torch version bumps
+(torchao tends to abstract `_scaled_mm` ABI changes), (c)
+future-proofing for the eventual ComfyUI migration to torchao
+primitives (the scaffold is in place; we don't scramble), (d)
+ecosystem documentation. Bench arm is opt-in via torchao
+availability; skipped silently when torchao isn't installed.
+
+See `build_torchao.sh` for building torchao from a local
+checkout against the active venv.
 
 Output is markdown tables suitable for direct paste into a memo.
 
