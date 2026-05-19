@@ -404,6 +404,25 @@ Two open hypotheses for the inversion (neither preferred yet):
 
 Either explains the gap; neither is a sage correctness bug.
 
+**Cross-workload corroboration of hypothesis (2) (added 2026-05-19
+post-verdict):** A separate consumer-side workflow (two-pass tensor-
+loop sampler, NOT the FML2V workload that produced the original
+verdict) surfaced direct evidence of autotune flipping between
+contexts. The smoking gun: attention kernel time per call at two
+nearly-identical sequence lengths, same workflow, same render:
+T=7560 (n=1896 calls) measures 15.7 ms median; T=7800 (n=711 calls)
+measures 33.6 ms median. 3% sequence-length increase, 2.14x kernel
+slowdown -- not shape-linear. Candidate explanations (different
+batch dim, different head dim under interleaving, L2 contention with
+larger working set) all reduce to "the kernel got a different tile
+config for two structurally similar calls because something in the
+(B, H, T, D, neighbor-state) tuple shifted." That is hypothesis (2)
+firing visibly. Strengthens it from "plausible explanation for one
+observed gap" to "documented failure mode across multiple workloads."
+Roadmap Tier 2.2 (autotune pre-bake) gains a concrete justification
+beyond UX (cold-render lag) -- pre-bake addresses production-perf
+variance, not just first-render-per-shape lag.
+
 **Disposition:** v0.6 sage_ffn "ships as completeness primitive, not
 perf win" framing reaffirmed. Diagnostic instrumentation work paid
 off -- the chain that closed the verdict spanned v0.6.2 (informative
@@ -578,6 +597,45 @@ improvement on Q (for a skewed model) yields ~8-10% end-to-end.
 - A future workload with shorter-bit Q quantization (fp4 or below)
   where per-block mean becomes a first-order win rather than a
   third-order refinement.
+
+## Workload intel
+
+Cross-workload observations worth keeping for future bench-coverage,
+autotune, and roadmap decisions. Not actionable today; filed so
+they're discoverable when a decision in that space surfaces. Pair
+with `docs/ltx_workload_profile.md` (canonical FML2V breakdown).
+
+### Two-pass tensor-loop workflow: mixed head dims (HEAD-128 + HEAD-64)
+
+Observed 2026-05-19 via cross-clone trace analysis on a consumer-side
+two-pass sampler workflow (distinct from the FML2V workload the
+load-bearing metric is anchored to). 1920 total sage attention calls
+per trace: **1536 at HEAD-DIM 128, 384 at HEAD-DIM 64**. The HEAD-64
+specialization corresponds to a smaller-dim pass (audio cross-attns
+or upsampler stage). Two sage template instantiations co-fire in the
+same render.
+
+Implications worth keeping:
+
+- **Bench coverage gap.** `tests/test_sageattn_ltx_shapes.py` covers
+  HEAD-DIM 128 LTX shapes; HEAD-DIM 64 isn't currently in the sweep.
+  Cold-render UX on two-pass workloads pays a HEAD-64 autotune sweep
+  on the first render per shape. If two-pass workloads become
+  recurrent, add HEAD-64 rows to the bench.
+- **Autotune pre-bake (Backlog item) scope.** If pre-bake ships, the
+  cached configs should cover both head dims; otherwise the pre-bake
+  benefits only one of the two template instantiations active in this
+  workload.
+- **Cell C hypothesis (2) corroborating evidence.** Same trace
+  exhibited a 2.14x attention-kernel slowdown for a 3% sequence-
+  length increase (T=7560 vs T=7800) -- direct evidence of autotune
+  flipping under interleaved dispatch. Captured in the Cell C
+  decision log entry.
+
+**Trigger to act:** a second cross-workload observation of HEAD-64
+sage dispatches surfaces (suggests two-pass workloads are recurrent
+rather than one-off), OR autotune-pre-bake (Backlog item) ships and
+needs to decide which head dims to cover.
 
 ## Recurring process items
 
