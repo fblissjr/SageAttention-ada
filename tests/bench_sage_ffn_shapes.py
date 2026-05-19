@@ -71,9 +71,7 @@ def quantize_activation_per_tensor_fp8(x: torch.Tensor) -> tuple[torch.Tensor, t
 
 
 def _torchao_inference_matmul_available() -> bool:
-    """torchao's inference fp8 matmul is the candidate-stock-comparand
-    flagged in roadmap Stack-leverage. Lazy import so the bench runs
-    without torchao installed."""
+    """Lazy availability check for torchao's inference fp8 matmul."""
     try:
         from torchao.float8.inference import addmm_float8_unwrapped_inference  # noqa: F401
         return True
@@ -81,37 +79,23 @@ def _torchao_inference_matmul_available() -> bool:
         return False
 
 
-def torchao_inference_fp8_mlp(
+def _scale_to_0d_tensor(scale: float, device: torch.device) -> torch.Tensor:
+    return torch.tensor(scale, dtype=torch.float32, device=device).view(())
+
+
+def _fp8_mlp_with(
+    matmul_fn,
     x_bf16: torch.Tensor,
     w1_fp8: torch.Tensor, s1: float,
     w2_fp8: torch.Tensor, s2: float,
     b1: torch.Tensor | None,
     b2: torch.Tensor | None,
 ) -> torch.Tensor:
-    """torchao inference-fp8 path comparand. Same two-Linear-around-
-    GELU shape as `torch_stock_fp8_mlp`, but routed through
-    `torchao.float8.inference.addmm_float8_unwrapped_inference`.
-
-    Motivation (CHANGELOG Decision log "v0.6 sage_ffn Cell C verdict"
-    open hypothesis 1 -- "stock comparand identity"): our synthetic
-    bench's existing comparand is `torch._scaled_mm`. Production
-    stock at the time of the v0.6 audit was ComfyUI's
-    `MixedPrecisionOps` + `QuantizedTensor` path, which dispatches
-    cuBLAS XMMA kernels broadly equivalent to `_scaled_mm`. If
-    ComfyUI migrates to torchao primitives in production, the
-    correct synthetic comparand is `torchao` instead. Even before
-    that migration, benching against torchao gives a "modern
-    production-ready fp8 Linear" comparand independent of the legacy
-    ComfyUI stack.
-
-    Per-tensor scaling. Scales passed as 0-d tensors (torchao's ABI,
-    distinct from sage_ffn's Python-float ABI). Per-stage dynamic
-    activation quant matches `torch_stock_fp8_mlp`.
-
-    Skipped automatically if torchao isn't importable.
-    """
-    from torchao.float8.inference import addmm_float8_unwrapped_inference
-
+    """Shared two-Linear-around-GELU(tanh) implementation parameterized on
+    the matmul primitive. Used by both `torch_stock_fp8_mlp` and
+    `torchao_inference_fp8_mlp`; the only difference between the two arms
+    is which fp8 matmul kernel runs. `matmul_fn(a_fp8, b_fp8_t, a_scale,
+    b_scale)` returns a bf16 tensor."""
     *batch_dims, hidden = x_bf16.shape
     M = 1
     for d in batch_dims:
@@ -120,32 +104,33 @@ def torchao_inference_fp8_mlp(
 
     # Stage 1
     x_fp8, x_scale = quantize_activation_per_tensor_fp8(x_flat)
-    s1_tensor = torch.tensor(s1, dtype=torch.float32, device=x_bf16.device).view(())
-    intermediate = addmm_float8_unwrapped_inference(
-        a_data=x_fp8,
-        a_scale=x_scale,
-        b_data=w1_fp8.t(),
-        b_scale=s1_tensor,
-        output_dtype=torch.bfloat16,
-    )
+    s1_tensor = _scale_to_0d_tensor(s1, x_bf16.device)
+    intermediate = matmul_fn(x_fp8, w1_fp8.t(), x_scale, s1_tensor)
     if b1 is not None:
         intermediate = intermediate + b1
     intermediate = F.gelu(intermediate, approximate="tanh")
 
     # Stage 2
     interm_fp8, interm_scale = quantize_activation_per_tensor_fp8(intermediate)
-    s2_tensor = torch.tensor(s2, dtype=torch.float32, device=x_bf16.device).view(())
-    out_flat = addmm_float8_unwrapped_inference(
-        a_data=interm_fp8,
-        a_scale=interm_scale,
-        b_data=w2_fp8.t(),
-        b_scale=s2_tensor,
-        output_dtype=torch.bfloat16,
-    )
+    s2_tensor = _scale_to_0d_tensor(s2, x_bf16.device)
+    out_flat = matmul_fn(interm_fp8, w2_fp8.t(), interm_scale, s2_tensor)
     if b2 is not None:
         out_flat = out_flat + b2
 
     return out_flat.reshape(*batch_dims, hidden)
+
+
+def _scaled_mm_adapter(a_fp8, b_fp8_t, a_scale, b_scale):
+    return torch._scaled_mm(a_fp8, b_fp8_t, scale_a=a_scale, scale_b=b_scale, out_dtype=torch.bfloat16)
+
+
+def _torchao_addmm_adapter(a_fp8, b_fp8_t, a_scale, b_scale):
+    from torchao.float8.inference import addmm_float8_unwrapped_inference
+    return addmm_float8_unwrapped_inference(
+        a_data=a_fp8, a_scale=a_scale,
+        b_data=b_fp8_t, b_scale=b_scale,
+        output_dtype=torch.bfloat16,
+    )
 
 
 def torch_stock_fp8_mlp(
@@ -155,40 +140,25 @@ def torch_stock_fp8_mlp(
     b1: torch.Tensor | None,
     b2: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Reference implementation: torch's stock cuBLAS fp8 matmul path.
-    Two `torch._scaled_mm` calls bracketing a GELU(tanh), with a
-    re-quantization of the intermediate (the cost the consumer-side
-    `quantize_fp8_tensor_kernel` represents in production traces)."""
-    *batch_dims, hidden = x_bf16.shape
-    M = 1
-    for d in batch_dims:
-        M *= d
-    x_flat = x_bf16.reshape(M, hidden)
+    """`torch._scaled_mm` comparand. cuBLAS XMMA fp8 matmul path --
+    matches what a ComfyUI fp8 Linear dispatches to in production
+    (the `sm89_xmma_gemm_e4m3bf16_e4m3f32_*` kernels)."""
+    return _fp8_mlp_with(_scaled_mm_adapter, x_bf16, w1_fp8, s1, w2_fp8, s2, b1, b2)
 
-    # Stage 1
-    x_fp8, x_scale = quantize_activation_per_tensor_fp8(x_flat)
-    s1_tensor = torch.tensor(s1, dtype=torch.float32, device=x_bf16.device).view(())
-    intermediate = torch._scaled_mm(
-        x_fp8, w1_fp8.t(),
-        scale_a=x_scale, scale_b=s1_tensor,
-        out_dtype=torch.bfloat16,
-    )
-    if b1 is not None:
-        intermediate = intermediate + b1
-    intermediate = F.gelu(intermediate, approximate="tanh")
 
-    # Stage 2
-    interm_fp8, interm_scale = quantize_activation_per_tensor_fp8(intermediate)
-    s2_tensor = torch.tensor(s2, dtype=torch.float32, device=x_bf16.device).view(())
-    out_flat = torch._scaled_mm(
-        interm_fp8, w2_fp8.t(),
-        scale_a=interm_scale, scale_b=s2_tensor,
-        out_dtype=torch.bfloat16,
-    )
-    if b2 is not None:
-        out_flat = out_flat + b2
-
-    return out_flat.reshape(*batch_dims, hidden)
+def torchao_inference_fp8_mlp(
+    x_bf16: torch.Tensor,
+    w1_fp8: torch.Tensor, s1: float,
+    w2_fp8: torch.Tensor, s2: float,
+    b1: torch.Tensor | None,
+    b2: torch.Tensor | None,
+) -> torch.Tensor:
+    """torchao inference-fp8 path comparand via
+    `addmm_float8_unwrapped_inference`. Addresses Cell C hypothesis 1
+    (stock comparand identity); see module docstring + CHANGELOG
+    Decision log for motivation. Skipped automatically by callers
+    when `_torchao_inference_matmul_available()` returns False."""
+    return _fp8_mlp_with(_torchao_addmm_adapter, x_bf16, w1_fp8, s1, w2_fp8, s2, b1, b2)
 
 
 def _build_block(T: int, hidden: int, inner: int, with_bias: bool, seed: int = 0):
@@ -241,6 +211,10 @@ def bench_one_shape(T: int, hidden: int, inner: int, with_bias: bool = True) -> 
     out_sage = call_sage()
     out_stock = call_stock()
     mean_rtol, _max_rtol, _mean_atol, _max_atol = accuracy_metrics(out_sage, out_stock)
+    # Drop the stock output before timing; the timing loop will reallocate
+    # its own intermediates and we only need out_sage live for the torchao
+    # rtol comparison below. ~1.4 GiB at T=42240.
+    del out_stock
 
     sage_ms = _time_call(call_sage)
     stock_ms = _time_call(call_stock)
@@ -250,14 +224,15 @@ def bench_one_shape(T: int, hidden: int, inner: int, with_bias: bool = True) -> 
     if torchao_available:
         out_torchao = call_torchao()
         torchao_vs_sage_rtol, _, _, _ = accuracy_metrics(out_sage, out_torchao)
-        torchao_ms = _time_call(call_torchao)
+        # Release immediately after the rtol calc; the timing loop will
+        # reallocate. Avoids stacking three ~1.4 GiB intermediates at T=42240.
         del out_torchao
+        torchao_ms = _time_call(call_torchao)
 
-    # T=42240 holds ~1.4 GiB bf16 intermediate per FFN call; the allocator's
-    # high-water mark across the warmup + sample loop can stack multiple
-    # intermediates if Triton autotune is compiling configs concurrently.
-    # Explicit reclaim between shapes keeps the bench safe on a 24 GiB card.
-    del x, w1, w2, b1, b2, out_sage, out_stock
+    # Final cleanup between shapes. Triton autotune can hold multiple
+    # config-compile-time intermediates concurrently; explicit reclaim
+    # keeps the bench safe on a 24 GiB card.
+    del x, w1, w2, b1, b2, out_sage
     torch.cuda.empty_cache()
 
     return {
@@ -273,32 +248,29 @@ def bench_one_shape(T: int, hidden: int, inner: int, with_bias: bool = True) -> 
 
 def _print_markdown_table(rows: list[dict], title: str) -> None:
     print(f"\n### {title}\n")
-    any_torchao = any(r.get("torchao_ms") is not None for r in rows)
-    if any_torchao:
-        print("| T (seq) | hidden | inner | sage_ffn ms | torch stock fp8 ms | torchao fp8 ms | stock/sage | torchao/sage | mean rtol (vs stock) | rtol (vs torchao) |")
-        print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-        for r in rows:
-            tms = r.get("torchao_ms")
-            tratio = r.get("torchao_ratio")
-            trtol = r.get("torchao_rtol")
-            tms_s = f"{tms:.3f}" if tms is not None else "n/a"
-            tratio_s = f"{tratio:.2f}x" if tratio is not None else "n/a"
-            trtol_s = f"{trtol:.4f}" if trtol is not None else "n/a"
-            print(
-                f"| {r['T']} | {r['hidden']} | {r['inner']} | "
-                f"{r['sage_ms']:.3f} | {r['stock_ms']:.3f} | {tms_s} | "
-                f"{r['ratio']:.2f}x | {tratio_s} | "
-                f"{r['mean_rtol']:.4f} | {trtol_s} |"
-            )
-    else:
-        print("| T (seq) | hidden | inner | sage_ffn ms | torch stock fp8 ms | stock/sage | mean rtol |")
-        print("|---:|---:|---:|---:|---:|---:|---:|")
-        for r in rows:
-            print(
-                f"| {r['T']} | {r['hidden']} | {r['inner']} | "
-                f"{r['sage_ms']:.3f} | {r['stock_ms']:.3f} | "
-                f"{r['ratio']:.2f}x | {r['mean_rtol']:.4f} |"
-            )
+    show_torchao = any(r.get("torchao_ms") is not None for r in rows)
+
+    base_headers = ["T (seq)", "hidden", "inner", "sage_ffn ms", "torch stock fp8 ms", "stock/sage", "mean rtol (vs stock)"]
+    torchao_headers = ["torchao fp8 ms", "torchao/sage", "rtol (vs torchao)"]
+    headers = base_headers + torchao_headers if show_torchao else base_headers
+
+    print("| " + " | ".join(headers) + " |")
+    print("|" + "|".join(["---:"] * len(headers)) + "|")
+
+    for r in rows:
+        cells = [
+            str(r["T"]), str(r["hidden"]), str(r["inner"]),
+            f"{r['sage_ms']:.3f}", f"{r['stock_ms']:.3f}",
+            f"{r['ratio']:.2f}x", f"{r['mean_rtol']:.4f}",
+        ]
+        if show_torchao:
+            tms, tratio, trtol = r.get("torchao_ms"), r.get("torchao_ratio"), r.get("torchao_rtol")
+            cells += [
+                f"{tms:.3f}" if tms is not None else "n/a",
+                f"{tratio:.2f}x" if tratio is not None else "n/a",
+                f"{trtol:.4f}" if trtol is not None else "n/a",
+            ]
+        print("| " + " | ".join(cells) + " |")
 
 
 def part_a_production_shapes() -> list[dict]:
