@@ -182,7 +182,12 @@ characterizes accuracy AND speed per (shape, mode) using
 `SDPBackend.EFFICIENT_ATTENTION` as the reference (MATH backend
 OOMs at LTX self-attn scale). Soft-warns when mean_rtol > 0.10.
 Measures five sage kernels and three torch SDPA backends in one run,
-plus an `fp8++vs.triton` cross-kernel rtol row.
+plus an `fp8++vs.triton` cross-kernel rtol row. The bench's `fp8_cuda`
+mode is `pv_accum_dtype="fp32+fp32"` (inst-buffer), NOT pure `fp32` --
+the pure-FP32 PV-accum config (SageAttention 2 / external-port
+comparand) is `pv_accum_dtype="fp32"` ->
+`qk_int8_sv_f8_accum_f32_fuse_v_scale_attn`; our default `fp8_cuda++`
+is `fp32+fp16`.
 
 Reuse `accuracy_metrics` from `tests/test_sageattn_ltx_shapes.py:160`
 for rtol/atol comparisons (symmetric denominator; matches every
@@ -233,7 +238,10 @@ identical at a shape where they shouldn't.
 - **No emojis** in any file or output.
 - Comments: only non-obvious WHY.
 - **Never push without being asked.** Origin is the maintainer's
-  personal fork.
+  personal fork -- a GitHub fork of `thu-ml/SageAttention`.
+  `gh pr create` defaults `--base` to the **upstream parent**, so a
+  within-fork PR must pin `--repo <origin>` (and `--base`/`--head`)
+  or it opens a public PR against thu-ml.
 - **Retract wrong-framing in committed docs via `git revert`, not
   in-place edit.** The revert preserves the wrong commit + its
   message in `git log` and supersedes it with a revert commit on
