@@ -73,6 +73,145 @@ on sm89 fp8++: 2026-05-13 (v0.5.5).
 Real open TODOs. Each has an explicit trigger-to-act; we don't do these
 speculatively.
 
+### Persistent-CTA hybrid for stage-2 attention (highest e2e leverage; v0.7 candidate)
+
+After v0.6.0's production A/B, a downstream consumer characterized
+the wall-time breakdown of the FML2V multi-guide render. **Stage-2
+attn1 (video self-attention at T=42240) is the single heaviest
+sub-module across the whole render** -- materially larger than the
+FFN share that v0.6 targeted. The optimization-leverage calculus
+shifts: attention is the bigger lever. See
+`docs/ltx_workload_profile.md` for the canonical breakdown with
+per-sub-module percentages + the FFN-share triplet.
+
+A persistent-CTA hybrid (CTAs hold M-tile state in registers/L2 across
+kernel calls, attacking the L2-contention root cause) applied to stage-2
+attn1 has an estimated ceiling of ~15% e2e wall-time reduction --
+the largest single perf lever in the LTX 2.3 production stack.
+
+Difficulty: high (persistent-CTA Triton is non-trivial). 2-3 weeks of
+kernel-engineering work.
+
+**Trigger to act:** persistent-CTA pattern is validated on FFN first
+(see the FFN entry below), AND user demand for a real attention-side
+e2e win on LTX-class workloads. Sequencing matters: prove the pattern
+on the smaller / lower-risk surface first, then port to the larger /
+higher-payoff surface.
+
+### Persistent-CTA hybrid for sage_ffn (validates the pattern; v0.6.1 candidate)
+
+v0.6.0's sage_ffn is +1.79% e2e slower than the chunking-only baseline
+on a two-sampler FML2V workflow (+20% per-call at stage-2, +3% at
+stage-1). Root cause is L2 contention with neighboring attention
+modules + cumulative kernel-launch overhead at LTX's
+~1000-FFN-calls/render count.
+
+The persistent-CTA hybrid (option b' from the scoping doc) attacks
+the L2-contention root cause directly: persistent CTAs hold M-tile
+state in registers/L2 across the two matmul kernels, so the
+intermediate doesn't have to re-fetch when neighboring attention
+modules thrash L2. Estimated 1-2 weeks of work. Expected delivered:
+~10-20% FFN speedup over current sage_ffn, putting it at parity-or-
+better vs torch reference, plus the memory-side win at stage-2 if
+the intermediate stays in L2.
+
+Smaller e2e gain than the attention port above (~3-5% wall-time vs
+~15%), but builds directly on v0.6 work and validates whether the
+hybrid pattern is viable before committing to the attention port.
+
+**v0.6.5 Cell C confirmation refines this item's framing.** With the
+6-bug consumer integration chain fully closed and sage_ffn dispatching
+end-to-end, per-stage FFN kernel time measures sage 22% slower at
+stage-1 (T=10780) and 5% slower at stage-2 (T=42240) vs production
+stock fp8 path -- despite synthetic isolation showing 1.39x / 1.60x
+sage advantage at the same shapes. The inverted sign means the
+synthetic-vs-production gap concentrates at the kernel boundary itself,
+not framework overhead. Two open hypotheses (not blocking, neither yet
+preferred):
+
+  (1) Stock comparand identity -- synthetic compares vs
+      `torch._scaled_mm`; production stock is `comfy.ops.fp8_linear`
+      wrapped in KJNodes' `LTXVChunkFeedForward` (chunked at 4096
+      with cached compilation state). Different baseline.
+  (2) Sage autotune state under interleaving -- production has sage
+      attention + sage_ffn dispatches interleaved at varying shapes.
+      Autotune may pick a different tile config than synthetic
+      isolation converges on.
+
+Either explains the gap; neither is a sage correctness bug.
+Persistent-CTA targets (1)/(2) symmetrically by removing the L2-thrash
+pathway between matmuls, so the item stays load-bearing for closing
+the v0.6 e2e gap. The "**ships as completeness primitive, not perf
+win**" docstring framing remains correct for v0.6 specifically.
+
+**Trigger to act:** user demand for "actually faster than torch
+reference on a real workload" surfaces, OR a different production
+workload class (single-pass / non-multi-guide) lands net-positive
+under sage_ffn and the priority becomes generalizing that, OR
+concurrent-dispatch consumer wrapper (consumer-side §6.1 candidate)
+ships ahead of this and closes the e2e gap by a different path.
+
+Recommended sequence: FFN persistent-CTA first (lower risk, faster
+to ship, validates the technique), attention persistent-CTA second
+(higher payoff once the pattern is proven on the smaller surface).
+
+### CUTLASS-based fp8 matmul backend (skip per workload-profile analysis)
+
+Was queued as an option for closing the v0.6.0 production gap; audio-
+loop's workload-profile data + the L2-contention root cause analysis
+showed this is the wrong root-cause attack. CUTLASS addresses matmul
+codegen quality (Triton-vs-cuBLASLt gap, bounded at ~1.27-1.36x in
+isolation); the production gap is L2 contention + dispatch overhead,
+not matmul throughput. cuBLASLt-level codegen on a kernel that still
+thrashes L2 doesn't move the needle.
+
+A more detailed analysis of why fp16-accum + CUTLASS-class matmul
+doesn't help here is in `docs/fp16_accum_fp8_matmul.md`.
+
+**Trigger to revisit:** persistent-CTA hybrid lands and the L2-thrash
+hypothesis is validated, AND a workload class surfaces where matmul
+throughput IS the bottleneck (not the current case).
+
+### Mask-aware autotune key (measurement hygiene; cheap)
+
+Triton's autotune key on the sm89 mask-correct path doesn't
+discriminate by mask kind. Warm-cache config inherited across mask
+shapes (causal, general, none) pollutes future perf measurements --
+a config tuned for one mask kind gets reused on another. The fix:
+add a mask-kind discriminator to the autotune key.
+
+Variance-class fix, not a perf bet. Disproportionate value because:
+
+- Removes the "warm-cache config inherited across mask kinds" issue
+  that polluted prior measurements
+- Foundational for any future kernel measurement work (persistent-CTA
+  spike measurements would benefit)
+- Catches the synthetic-vs-production trap class earlier next time
+
+Estimated 1-2 hours implementation.
+
+**Trigger to act:** land regardless of whether the larger persistent-
+CTA work happens. Measurement infrastructure compounds; do it before
+the next perf experiment fires.
+
+### sage_ffn autotune key: coarsen to power-of-2 buckets on M
+
+Current cache key is `["M", "N", "K"]`. Every new M re-autotunes
+(~10-15s per kernel). LTX 2.3 uses two stable M values, but other
+modes (chunked FFN, different resolution / frame count) mint
+others. One-line change: `key=[lambda M: triton.next_power_of_2(M),
+"N", "K"]` -- T=10780 and T=11000 share a cache entry.
+
+Risk is bounded: the curated 8-config sweep means bucket-winner
+variance is small. But the two LTX shapes have different winners
+(stage-1: num_warps=4 num_stages=2; stage-2: num_warps=8
+num_stages=4), so bucketing could land a sub-optimal config on a
+neighbor M.
+
+**Trigger to act:** user feedback that first-render-per-shape
+autotune-cost is painful across workflow variations, OR a downstream
+consumer reports cycling through M values frequently in production.
+
 ### Extract `tests/_helpers.py` for shared `make_qkv` + `require_cuda`
 
 Four standalone test files now duplicate near-identical scaffolding:
@@ -227,6 +366,136 @@ spend on a "kernel-side gap" finding.
 
 Investigations that closed without action. Recorded so we don't
 re-derive them. Each entry has an explicit reopen-trigger.
+
+### comfy-kitchen SageAttention port evaluated: stay, adopt one technique (binding boundary)
+
+**Closed 2026-05-23.** An external SageAttention port landed in
+Comfy-Org's `comfy-kitchen` kernel library (NVIDIA-authored). It
+vendors the same upstream thu-ml sm89 kernel we fork, so the question
+was whether its approach obsoletes any of our core components.
+
+Verdict: **stay on every user-facing component; adopt exactly one
+technique.** Reasoning, grounded in measurement and the consumer
+contract:
+
+- **Kernel config.** The port ships pure-FP32 PV accumulation
+  (SageAttention 2; kernel template `use_pv_fp16_accu=false`). Our
+  sm89 default is `pv_accum_dtype="fp32+fp16"` (2++). Measured on a
+  4090 at the load-bearing LTX shape (`tests/spikes/spike_accum_config_ab.py`,
+  commit `5a9c3f4`): **2++ is 1.20x faster (+16.6% wall) at
+  indistinguishable mean_rtol** (0.0980 vs 0.0979). Backing away from
+  our config would be a measured regression.
+- **Masking.** The port is causal/none-only; our v0.5.5 fp8++ kernel
+  has the general additive-mask path. A static diff of the vendored
+  `.cuh` confirms theirs is upstream-verbatim-minus-torch with no mask
+  params; ours carries `DTypeMask` + `mask_ptr`. The downstream
+  consumer node's headline feature is masked LTX cross-attn on the
+  CUDA kernel -- the port cannot run it.
+- **API surface.** The consumer depends on our Python surface
+  (`sageattn()`, the named kernel exports, `pv_accum_dtype`,
+  `attn_mask`, `get_last_dispatched_kernel()`,
+  `core.get_cuda_arch_versions()`, `KNOWN_KERNEL_NAMES`). The port
+  exposes one `sage_sdpa(q,k,v,is_causal,smooth_k)` with none of these.
+  Convergence is a non-starter; the port can't execute the workload.
+- **The one adoptable technique:** its torch-free nanobind/DLPack
+  binding boundary (no libtorch ABI coupling, stable-ABI wheels,
+  cleaner `torch.compile` story). Captured as roadmap Tier 2.6. The
+  consumer-API surface above is the spike's acceptance criterion --
+  the swap is invisible iff that surface survives bit-identical.
+
+Also considered and **not adopted**: the port's fused CUDA K-mean
+reduction (it fuses `k.mean()` into CUDA; we do it as a torch op then
+fuse only the subtraction). Leverage estimate: the K-mean is a
+memory-bound reduction of the K tensor (~188 MiB at the load-bearing
+shape) -- sub-0.1 ms against a ~20 ms attention kernel, i.e. <1%.
+Below the kernel-day threshold; not worth the CUDA surface.
+
+Full comparison + the measured A/B + the verified header diff:
+`internal/comfy_kitchen_pr42_comparison.md` (gitignored).
+
+**Reopen-trigger:** the binding-boundary spike (Tier 2.6) fires on its
+own triggers (a `torch.compile` consumer ask, an editable-install
+breakage on a torch/CUDA bump, or an interop decision). The
+stay-on-config verdict reopens only if a future port closes the 1.20x
+gap (e.g. ships a 2++-equivalent accum) AND gains a mask path -- at
+which point the comparison is re-run.
+
+### v0.6 sage_ffn Cell C verdict (synthetic-vs-production gap concentrates at the kernel boundary)
+
+**Closed 2026-05-19** after a multi-cycle cross-clone diagnostic
+session that bottomed out the consumer-side integration chain (six
+distinct bugs surfaced and fixed: scale-lookup probe, QuantizedTensor
+unwrap, `prior_forward` chaining, `str(exc)` logger, call-time weight
+resolve + device guard, `.item()` hoist for scalar ABI). With the
+chain fully closed, sage_ffn dispatches end-to-end -- rung-1 evidence
+(`_fp8_matmul_gelu_kernel` + `_fp8_matmul_kernel` rows in `cat=kernel`
+of every TREATMENT chrome trace) confirms.
+
+The verdict is **Cell C** of the synthetic-vs-in-pipeline 2x2 matrix
+(defined in `docs/perf_research_framework.md`) at *both* wall-time
+and per-stage-kernel-time levels:
+
+| measurement | sage_ffn | stock (prod) | ratio |
+|---|---:|---:|---:|
+| wall time, mean of 3 runs each | 188.3s | 185.7s | +1.4s (+0.75%) |
+| stage-1 (T=10780) FFN kernel | 8930 ms | ~7290 ms | sage 22% SLOWER |
+| stage-2 (T=42240) FFN kernel | 12920 ms | ~12300 ms | sage 5% SLOWER |
+
+Synthetic isolation at the same shapes (v0.6.5 `tests/bench_sage_ffn_shapes.py`):
+sage_ffn 1.39x faster at T=10780, 1.60x at T=42240. **Production has
+the sign flipped** -- largest synthetic gain is the smallest production
+gap; smallest synthetic gain is the largest production loss. Inverted
+relationship.
+
+Two open hypotheses for the inversion (neither preferred yet):
+
+  (1) Stock comparand identity -- synthetic compares vs
+      `torch._scaled_mm`; production stock is `comfy.ops.fp8_linear`
+      wrapped in KJNodes' `LTXVChunkFeedForward`. Different baseline.
+  (2) Sage autotune state under interleaving -- production interleaves
+      sage attention + sage_ffn at varying shapes; autotune may pick
+      a different tile config than synthetic isolation.
+
+Either explains the gap; neither is a sage correctness bug.
+
+**Cross-workload corroboration of hypothesis (2) (added 2026-05-19
+post-verdict):** A separate consumer-side workflow (two-pass tensor-
+loop sampler, NOT the FML2V workload that produced the original
+verdict) surfaced direct evidence of autotune flipping between
+contexts. The smoking gun: attention kernel time per call at two
+nearly-identical sequence lengths, same workflow, same render:
+T=7560 (n=1896 calls) measures 15.7 ms median; T=7800 (n=711 calls)
+measures 33.6 ms median. 3% sequence-length increase, 2.14x kernel
+slowdown -- not shape-linear. Candidate explanations (different
+batch dim, different head dim under interleaving, L2 contention with
+larger working set) all reduce to "the kernel got a different tile
+config for two structurally similar calls because something in the
+(B, H, T, D, neighbor-state) tuple shifted." That is hypothesis (2)
+firing visibly. Strengthens it from "plausible explanation for one
+observed gap" to "documented failure mode across multiple workloads."
+Roadmap Tier 2.2 (autotune pre-bake) gains a concrete justification
+beyond UX (cold-render lag) -- pre-bake addresses production-perf
+variance, not just first-render-per-shape lag.
+
+**Disposition:** v0.6 sage_ffn "ships as completeness primitive, not
+perf win" framing reaffirmed. Diagnostic instrumentation work paid
+off -- the chain that closed the verdict spanned v0.6.2 (informative
+asserts), v0.6.3 (dispatch log), v0.6.4 (`extract_fp8_weight_and_scale`
++ framework rung 2 with pattern (d)), v0.6.5 (`w*_scale` precondition
+assert + stage-1/stage-2 bench rows), and `70d1984` (framework rung 2
+pattern (e) fold). Each new failure mode after v0.6.2 was diagnosed
+in 1 render rather than the multi-cycle loop earlier.
+
+**Reopen-trigger:** persistent-CTA hybrid lands (Backlog item) AND
+re-render shows wall-time improvement OR per-stage parity-or-better
+vs production stock. At that point Cell C would close to Cell A and
+v0.6 docstring framing flips. Alternative reopen: a `comfy.ops.fp8_linear`-
+direct bench (hypothesis 1) lands data showing sage_ffn beats the
+production comparand -- routes investigation to autotune-state
+(hypothesis 2) and may not need persistent-CTA at all.
+
+Memo trail: `coderef/ComfyUI-AudioLoopHelper/internal/AUDIO_LOOP_CLAUDE_TO_SAGE_CLAUDE_MEMO.md`
+(2026-05-19T08:00Z verdict memo, audio-loop-side outbox-mirror).
 
 ### "FFN-adjacent reach" / launch-overhead / cache-footprint hypotheses on iclora: all three falsified
 
@@ -383,6 +652,66 @@ improvement on Q (for a skewed model) yields ~8-10% end-to-end.
   where per-block mean becomes a first-order win rather than a
   third-order refinement.
 
+## Workload intel
+
+Cross-workload observations worth keeping for future bench-coverage,
+autotune, and roadmap decisions. Not actionable today; filed so
+they're discoverable when a decision in that space surfaces. Pair
+with `docs/ltx_workload_profile.md` (canonical FML2V breakdown).
+
+### Two-pass tensor-loop workflow: mixed head dims (HEAD-128 + HEAD-64)
+
+Observed 2026-05-19 via cross-clone trace analysis on a consumer-side
+two-pass sampler workflow (distinct from the FML2V workload the
+load-bearing metric is anchored to). 1920 total sage attention calls
+per trace: **1536 at HEAD-DIM 128, 384 at HEAD-DIM 64**. The HEAD-64
+specialization corresponds to a smaller-dim pass (audio cross-attns
+or upsampler stage). Two sage template instantiations co-fire in the
+same render.
+
+Implications worth keeping:
+
+- **Bench coverage gap.** `tests/test_sageattn_ltx_shapes.py` covers
+  HEAD-DIM 128 LTX shapes; HEAD-DIM 64 isn't currently in the sweep.
+  Cold-render UX on two-pass workloads pays a HEAD-64 autotune sweep
+  on the first render per shape. If two-pass workloads become
+  recurrent, add HEAD-64 rows to the bench.
+- **Autotune pre-bake (Backlog item) scope.** If pre-bake ships, the
+  cached configs should cover both head dims; otherwise the pre-bake
+  benefits only one of the two template instantiations active in this
+  workload.
+- **Cell C hypothesis (2) corroborating evidence.** Same trace
+  exhibited a 2.14x attention-kernel slowdown for a 3% sequence-
+  length increase (T=7560 vs T=7800) -- direct evidence of autotune
+  flipping under interleaved dispatch. Captured in the Cell C
+  decision log entry.
+- **Validation surface for persistent-CTA (Tier 1.3) and §6.1
+  concurrent-dispatch** (added 2026-05-19, per audio-loop-side
+  memo). The same trace also exposes:
+  - dual HEAD-DIM specialization co-firing (~80/20 split HEAD-128 /
+    HEAD-64) in a single render -- two sage template instantiations
+    competing for autotune cache slots.
+  - cross-modal attentions (`audio_to_video_attn`,
+    `video_to_audio_attn`) contributing ~36% of wall (~22s of 61s
+    in the failed render that produced the trace) -- non-trivial
+    share.
+  - the T=7560 vs T=7800 anomaly noted above.
+
+  If persistent-CTA work lands tile-config-cache-sticky behavior
+  (the v0.6 Backlog framing of CTAs holding M-tile state in
+  registers/L2 across the pipeline), OR if §6.1 concurrent-dispatch
+  ships and launches attn + ffn on different streams, **the dual-
+  HEAD-DIM mix in this workload class is exactly where the tile-
+  config thrashing or cross-stream coupling would surface**. Worth a
+  check against this trace once either kernel-side wedge is ready.
+
+**Trigger to act:** a second cross-workload observation of HEAD-64
+sage dispatches surfaces (suggests two-pass workloads are recurrent
+rather than one-off), OR autotune-pre-bake (Backlog item) ships and
+needs to decide which head dims to cover, OR persistent-CTA / §6.1
+lands a candidate and needs a multi-template-instantiation workload
+to validate against.
+
 ## Recurring process items
 
 Cron-like checks; not engineering work. Each one has a frequency or
@@ -454,6 +783,459 @@ sufficient.
 
 ## Versions
 
+### v0.6.5 -- 2026-05-19  (informative precondition assert on `w*_scale` type + stage-1/stage-2 bench rows)
+
+Two coordinated additions surfacing the contract violation that hides
+behind a Triton kernel-compile error.
+
+**Precondition assert: `w*_scale` must be Python scalar.**
+
+`sage_ffn(...)` documents `w1_scale: float, w2_scale: float`. When a
+consumer passes a 0-d `torch.Tensor` instead (the natural shape from
+extracting `weight._params.scale` on a ComfyUI `QuantizedTensor`),
+the underlying Triton kernel sees the unannotated `W_scale` argument
+as a `pointer<fp32>` and the `acc = acc * W_scale` multiply fails
+compilation with `IncompatibleTypeErrorImpl('invalid operands of
+type pointer<fp32> and triton.language.float32')`. The error surfaces
+inside Triton's autotune machinery, not at the sage_ffn boundary,
+making the actual contract violation hard to diagnose.
+
+`sage_ffn` now asserts at the boundary:
+
+```
+sage_ffn: w1_scale must be a Python scalar (call .item() on the 0-d
+Tensor if extracting from a quantized weight), got Tensor
+```
+
+Same pattern as v0.6.2's dtype/shape asserts. The remedy (`.item()`)
+is named in the message. The `extract_fp8_weight_and_scale` utility
+from v0.6.4 still returns a Tensor (forward-compatible with per-
+channel scales); consumers extracting per-tensor scales for sage_ffn
+specifically call `.item()` to get a Python float.
+
+Edit at `sageattention/triton/fused_mlp_fp8.py:265-275`. Test
+coverage adds 2 cases to `tests/test_sage_ffn_precondition_messages.py`
+(now 9 total).
+
+**Bench: stage-1 + stage-2 synthetic rows at production unchunked shapes.**
+
+`tests/bench_sage_ffn_shapes.py` now bench's `T=10780` (stage-1) and
+`T=42240` (stage-2) alongside the chunked-call-site shapes already
+present (T=4096 + T=1808). Useful for direct synthetic-vs-in-pipeline
+comparison; eliminates "the chunk-sweep interpolation was off" as a
+noise source in Cell A vs Cell C diagnosis.
+
+Sample run on RTX 4090 / sm89 / torch 2.11+cu130:
+
+| T (seq) | sage_ffn ms | torch stock fp8 ms | stock/sage |
+|---:|---:|---:|---:|
+| 4096 (full chunk) | 4.68 | 7.00 | 1.50x |
+| 1808 (residual chunk) | 2.32 | 3.02 | 1.30x |
+| 10780 (stage-1 unchunked) | 13.34 | 18.55 | **1.39x** |
+| 42240 (stage-2 unchunked) | 56.41 | 90.52 | **1.60x** |
+
+T=42240 holds ~1.4 GiB bf16 intermediate per FFN call; the bench
+now explicitly reclaims tensor refs + calls `empty_cache()` between
+shapes so the allocator high-water mark during Triton autotune
+doesn't OOM on a 24 GiB card.
+
+### v0.6.4 -- 2026-05-19  (`extract_fp8_weight_and_scale` + framework: 4th silent-fallback rung)
+
+Two coordinated additions surfacing what a cross-clone diagnostic
+session learned about silent-fallback patterns in kernel-replacement
+wrappers.
+
+**New public utility: `sageattention.extract_fp8_weight_and_scale(linear)`**
+
+Probes a ComfyUI `Linear`-like for fp8 weight + scale across the
+four known storage conventions:
+
+1. Modern `QuantizedTensor` with `weight.layout_params.scale` (public
+   alias; preferred surface, comfy_kitchen v0.2.8+).
+2. Modern `QuantizedTensor` with `weight._params.scale` (raw alias;
+   fallback when public alias is absent).
+3. Legacy `Linear.scale_weight` attribute (older `fp8_ops` convention).
+4. Older `Linear.weight_scale` attribute (some custom-node patches).
+
+Returns `(raw_weight_fp8_tensor, scale_tensor, path_label)` on hit,
+`None` on miss. Modern path returns the unwrapped `weight._qdata`,
+not the `QuantizedTensor` wrapper -- sage kernels assert
+`dtype == float8_e4m3fn` and the wrapper itself doesn't satisfy that.
+
+Source: `sageattention/comfyui_compat.py`. Test coverage:
+`tests/test_comfyui_compat.py` (10 standalone cases covering each
+probe path, priority order, and miss conditions; mock objects, no
+ComfyUI runtime dependency).
+
+Trigger to add this utility: a consumer-side wrapper hit the missing-
+unwrap silently for two A/B cycles (passed `weight` rather than
+`weight._qdata` to `sage_ffn`; the resulting AssertionError was
+swallowed by a logger that stripped `str(exc)`). Centralizing the
+probe protects every future consumer from re-deriving the four
+storage conventions and getting bitten by the same trap. Reference
+intel: `internal/design/comfyui_fp8_storage_conventions.md`.
+
+**Framework: 4th silent-fallback rung in `docs/perf_research_framework.md`**
+
+Rung 2 of the evidence ladder for kernel-replacement audits is
+expanded from "every fallback path needs a log line" to "...and the
+log line must carry the underlying error's message, not just its
+class name." Four distinct failure modes enumerated:
+
+  (a) Explicit `except` without logging.
+  (b) Early-return guard before the protected call.
+  (c) Implicit dispatch to a pre-patch forward on miss.
+  (d) Log fires but strips the error's message (informative-log-but-
+      strips-message).
+
+(d) is the trap (a)-(c) graduate to once obvious silent layers are
+fixed: surface looks like (a) but is functionally equivalent to (a)
+for debugging. The 2026-05-18 cross-clone session that surfaced this
+ran for two A/B cycles before the logger was unstripped AND the
+underlying QuantizedTensor unwrap surfaced. Worked example captured
+in the framework without naming the specific wrapper (consumer-
+agnostic framing).
+
+### v0.6.3 -- 2026-05-19  (session-start dispatch log in `sageattn()`)
+
+`sageattn()` now emits one `[INFO] sage routing: arch=... cuda=...
+mask=... pv_accum=... -> <kernel>` line to stderr per unique
+`(arch, cuda_version, mask_present, pv_accum_dtype, kernel_name)`
+tuple observed in the current process. Subsequent calls with the
+same tuple are silent.
+
+Sample output (sm89 + CUDA >= 12.8, unmasked):
+
+```
+[INFO] sage routing: arch=sm89 cuda=13.0 mask=False pv_accum=fp32+fp16 -> fp8_cuda++
+```
+
+This gives consumers a grep-able ground-truth record of which kernel
+the dispatcher actually chose for their `(arch, cuda_version, mask
+presence, pv_accum_dtype)` config, without forcing a programmatic
+call to `get_last_dispatched_kernel()`. The dispatcher audit on
+2026-05-18 identified this as the "observability of happy path" gap
+between our exhaustive-with-explicit-raise dispatch and the lesson
+that "every dispatch leaf should surface its choice once per session"
+from a cross-clone wrapper postmortem.
+
+Helpers added to `sageattention.core`:
+
+- `_log_routing_choice_once(arch, mask_present, pv_accum_dtype, kernel_name)`
+  -- called from each branch of `sageattn()`. Module-level dedup set;
+  thread-safe enough for the one-write-per-tuple semantics.
+- `_reset_routing_log_for_test()` -- test-only state reset.
+
+Test coverage at `tests/test_dispatcher_routing_log.py` (5 standalone
+cases: first-call emits, second-call deduped, different routing
+tuple emits separately, reset helper clears state, kernel name in
+log matches `get_last_dispatched_kernel()`).
+
+The existing telemetry test (`tests/test_dispatched_kernel_telemetry.py`)
+still passes -- the routing log is additive and orthogonal to the
+`_record_dispatch` / `get_last_dispatched_kernel` telemetry API.
+
+### v0.6.2 -- 2026-05-18  (informative `sage_ffn` precondition asserts)
+
+Every `assert` inside `sage_ffn(...)` now carries a message naming
+the precondition and the actual offending value. Previously the
+asserts had no message, so a downstream wrapper catching
+`AssertionError` and logging `str(exc)` received an empty string --
+un-actionable for diagnosing dtype/shape mismatches.
+
+Sample messages now surfaced:
+
+```
+sage_ffn: x.dtype must be bfloat16, got torch.float16
+sage_ffn: w1.dtype must be float8_e4m3fn, got torch.bfloat16
+sage_ffn: w1.shape must be (inner=256, hidden=64), got (256, 65)
+sage_ffn: b1 must be CUDA bfloat16 with shape (inner=256,), got device=cuda:0 dtype=torch.bfloat16 shape=(257,)
+```
+
+Zero runtime cost on the happy path -- Python only formats assert
+messages on failure. Edit at
+`sageattention/triton/fused_mlp_fp8.py:259-285`.
+
+Test coverage at `tests/test_sage_ffn_precondition_messages.py` (7
+standalone cases, one per assert: x.dtype, w1.dtype, w2.dtype,
+w1.shape, w2.shape, b1.shape, device).
+
+### v0.6.1 -- 2026-05-17  (stream-safety fix: kernel launches now honor the current CUDA stream)
+
+Every CUDA kernel launch in `csrc/qattn/sm89_*.cu`,
+`csrc/qattn/qk_int_sv_f16_cuda_sm80.cu`, and `csrc/fused/fused.cu`
+used the 3-argument launch configuration `<<<grid, block, smem>>>`,
+which omits the stream argument and defaults to the legacy default
+stream (stream 0). Triton kernels (used both directly via the
+`*_triton` paths and as the QK quant pre-step for `fp8_cuda` paths)
+correctly respect `at::cuda::getCurrentCUDAStream()`, but sage's
+own CUDA launches silently ignored the caller's stream context.
+
+For default-stream callers this is a no-op: `getCurrentCUDAStream()`
+returns the default stream, so the launch lands on the same stream
+it always did. For callers that wrap sage in `with
+torch.cuda.stream(s_other):`, the launch was landing on the
+default stream while preceding kernels (`Linear` projections, etc.)
+were correctly enqueued on `s_other`. Without an explicit
+`cudaStreamWaitEvent`, the sage kernel saw whatever state the
+default stream happened to have, which is racy.
+
+**Fix.** Pass `at::cuda::getCurrentCUDAStream()` as the fourth
+launch argument on every kernel launch in the three files above
+(1 in each of 7 sm89 .cu files, 4 in the sm80 .cu, 8 in fused.cu).
+Add `#include <ATen/cuda/CUDAContext.h>` where it was missing
+(fused.cu already had it).
+
+**Verification.** `tests/spikes/spike_concurrent_dispatch_submodule.py`
+previously measured a stable ~0.02 mean_rtol drift between
+sequential dispatch and side-stream dispatch on the video
+self-attention path; post-fix the same spike measures
+`bits_equal=True, mean_rtol=0.000000` on both video (sage fp8++)
+and audio (FA via SDPA) arms. The same shape under un-patched
+quant pre-kernels (fused.cu) but patched attn kernel produced NaN
+in the side-stream output -- the quant kernel was racing with the
+preceding Linear on the side stream. With all launch sites patched
+both stages of the pipeline sequence correctly on the caller's
+stream.
+
+`tests/test_sageattn_ltx_shapes.py` shows no rtol or perf drift
+on the default-stream path; the two `--check-regression` flags
+fired are pre-existing stale baselines from v0.3.0 that predate
+the v0.5.5 dispatcher mask-routing change (the `auto` row at
+`ltx23_video_cross_text_kv226` now lands on `fp8_cuda++` rather
+than `fp16_triton`, which is the v0.5.5-shipped behavior).
+Separate from this fix.
+
+**Files touched.** 9 .cu files in csrc + 1 spike (added bit-equality
+diagnostic alongside the rtol report).
+
+**Why this surfaced now.** The concurrent-dispatch spikes under
+`tests/spikes/spike_concurrent_dispatch*.py` ran sage from inside
+a side-stream context for the first time; default-stream callers
+never exercise the failure mode (current stream == default stream
+makes the missing argument semantically equivalent to the
+fix). A cross-render fingerprint check on the production
+default-stream path was bit-deterministic at every sage call
+position, which scoped the drift to the side-stream path
+specifically and motivated the source read that found the
+3-argument launches.
+
+**Scope note.** This is a correctness fix, not a perf change. The
+default-stream hot path is bit-identical before/after. The fix
+unblocks correctness for any consumer that wants to dispatch sage
+on a side stream.
+
+### v0.6.0 -- 2026-05-15  (sage_ffn: fp8-native two-kernel fused MLP for LTX 2.3-class FFN blocks on sm89 -- ships as completeness primitive, not currently a perf win in production)
+
+Ships `sage_ffn(x, w1, s1, w2, s2)` -- a Triton two-kernel
+`Linear(fp8) -> GELU(tanh) -> Linear(fp8)` MLP path for DiT
+FFN blocks whose weights are stored as per-tensor fp8 (E4M3FN).
+The primary motivating workload is LTX 2.3 distilled, whose
+transformer blocks have hidden=4096, inner=16384 and 44 of 48
+blocks shipped as fp8 (bookend blocks `{0, 1, 46, 47}` stay
+bf16 per the distilled checkpoint's design).
+
+**The wedge is qualitative, not just quantitative.** No other
+library ships an fp8-native fused MLP for ComfyUI consumer-app
+shapes on sm89. FA's `fused_mlp_func` is bf16/fp16 only (cuBLASLt
+epilogue path); torch's `F.linear` against fp8 weights dequants
+to bf16 first, paying 2x the weight-bandwidth and using bf16
+tensor cores at ~330 TFLOPS instead of fp8 tensor cores at
+~660 TFLOPS. `sage_ffn` loads fp8 weights directly and computes
+in fp8.
+
+**Synthetic-bench numbers (RTX 4090, CUDA 13.0, torch 2.12.0+cu130,
+triton 3.7.0), bias-inclusive path (matches LTX 2.3 distilled
+checkpoint, which carries bf16 biases on both `ff.net.0.proj` and
+`ff.net.2`):**
+
+| shape | mean_rtol vs torch ref | sage_ffn | torch ref | speedup |
+|---|---|---|---|---|
+| stage-1 (T=10780, h=4096, inner=16384) | 0.0914 | 13.3 ms | 18.1 ms | **1.36x** |
+| stage-2 (T=44880, multi-guide expanded) | 0.0914 | 59.8 ms | 75.3 ms | **1.26x** |
+
+Bias-free path (sanity check that the `HAS_BIAS=False` constexpr
+branch is wired correctly) lands at 1.33x / 1.26x, mean_rtol 0.0915
+/ 0.0914 -- statistically identical to the bias-inclusive path
+(bias is an epilogue offset, not in the inner matmul loop).
+
+These are standalone matmul-GELU-matmul measurements against
+randomly-initialized weights, not end-to-end ComfyUI rendering.
+mean_rtol is well under the 0.10 budget that gates all sage
+kernels. The reference is `F.linear(F.gelu(F.linear(x, w1_bf16_ref),
+approximate="tanh"), w2_bf16_ref)` with weights dequantized once
+outside the timing loop -- i.e. torch's best-case fp8-weight path,
+not its naive one.
+
+Validated against the full 126-config sweep at the same env:
+hardcoded 8-config winners deliver 1.33-1.36x / 1.26-1.27x; full
+sweep delivers 1.33x / 1.27x. Bit-identical mean_rtol; hardcoded
+matches full-sweep perf within run-to-run noise.
+
+**Production result: sage_ffn is slower than torch in the tested
+workload. Ships as completeness primitive, not a perf win.**
+
+In-pipeline A/B on a two-sampler LTX 2.3 FML2V multi-guide
+workflow (768x512x97, 8-step stage-1 + 3-step stage-2 refine, on
+a 4090 under `nodynvram`, 4 renders interleaved
+treatment/baseline/treatment/baseline in the same ComfyUI
+session):
+
+| metric | baseline (chunking only) | treatment (sage_ffn + chunking) | delta |
+|---|---|---|---|
+| wall-time avg | 148.51s | 151.17s | **+1.79% slower** |
+| ff @ T=10780 med ms/call | 10.36 | 10.67 | +3.0% slower |
+| ff @ T=42240 med ms/call | 48.77 | 58.58 | **+20.1% slower** |
+| All non-FFN sub-modules | unchanged | unchanged | 1.00x (identity) |
+
+Per-call FFN times for the warm-autotune treatments (#2 and #4)
+matched the cold-autotune treatment (#1), so the regression is
+not autotune amortization. Patching surface is clean -- attention
+sub-modules at 1.00x ratio confirm the regression is FFN-specific.
+
+**Why the synthetic 1.27-1.36x didn't translate:**
+
+1. **L2 cache contention with neighboring sub-modules.** Synthetic
+   bench ran FFN alone with warm L2 holding its tensors.
+   Production runs `attn1` (~107 ms at T=42240, large working set)
+   immediately before `ff` at stage-2; the attention pass evicts
+   FFN's L2 residency. The X-tile-lives-in-L2 assumption from the
+   day-3 perf analysis breaks when L2 is hostile. Cold-L2 FFN is
+   bandwidth-bound, no fp8-vs-bf16 advantage realized. Worse at
+   stage-2 (4x the working set, more HBM round-trips) matches the
+   shape of the regression (+20% at T=42240 vs +3% at T=10780).
+2. **Cumulative kernel-launch overhead at LTX call count.** LTX
+   2.3 fires ~1056 ff calls per render across transformer blocks.
+   sage_ffn is two kernel launches per call (matmul+GELU, then
+   matmul). torch reference is one cuBLASLt call per matmul. The
+   per-call launch-overhead delta scales with that 1000+ count.
+
+This is the v0.5.5 precedent playing out a second time: synthetic
+kernel-bench numbers project a wedge, in-pipeline A/B reveals
+that production conditions (cache contention, dispatch overhead,
+neighboring-module behavior) change the picture. The synthetic
+numbers above are real measurements of the kernel in isolation
+and are not retracted -- they characterize what the kernel can
+do under ideal conditions, which is useful information for
+future kernel work. They are not the delivered consumer-app
+number.
+
+**What this means for users:**
+
+- Keep an FFN-chunking node (e.g. `LTXVChunkFeedForward` from
+  KJNodes) as the production default; don't replace it with a
+  consumer-side `sage_ffn` patch node expecting a speedup.
+- `sage_ffn` is available for users who specifically need an
+  fp8-native fused MLP for ComfyUI consumer-app on sm89 (no
+  other library provides this combination). The "uncontested
+  availability" wedge holds; the "delivered speedup" wedge does
+  not on the tested workload.
+- Different workload shapes may differ from this result -- the
+  L2-contention picture depends on what other modules are
+  active and what their working sets look like. Single-pass
+  (non-multi-guide) workloads in particular may behave
+  differently. In-pipeline measurement is the gate, not
+  synthetic bench.
+
+**Design: two-kernel split, not single-kernel fusion.** Kernel 1
+matmul + GELU(tanh) epilogue + write intermediate. Kernel 2
+matmul down-projection. Intermediate at LTX stage-2 multi-guide
+is ~1.47 GiB; users on 24 GiB cards should compose with an
+FFN-chunking node (e.g. `LTXVChunkFeedForward` from KJNodes).
+The single-kernel "intermediate never hits HBM" design was
+explored on day 1-2 and rejected at day 2's perf wall: the
+X_tile (1 MB at BLOCK_M=128, K=4096, bf16) won't fit in sm89's
+100 KB SMEM, and the nested-loop structure was forcing Triton
+into L2 evictions. FA's `fused_mlp_func` is also a two-kernel
+split for the same reason -- this design converges on the
+industry standard.
+
+**Per-block-K activation quantization.** Each (BLOCK_M, BLOCK_K)
+chunk of the bf16 activation gets its own f32 scale, computed
+inline during the K-reduction. This avoids a separate amax pass
+over the full K dimension; the slight coarsening (~0.005 rtol
+cost vs per-row) is well within the 0.10 budget.
+
+**Autotune.** Each kernel carries 8 hardcoded `@triton.autotune`
+configs -- the winners from a 126-config sweep against the two
+LTX FFN shapes, plus a few neighbors for shapes the winners may
+not cover. First call at a new shape pays ~10-15 seconds
+autotune-search per kernel (~30-60 sec total across the full
+sage_ffn at two new shapes); subsequent calls hit Triton's
+on-disk cache. The full 126-config sweep cost 7+ minutes
+first-render-per-shape on consumer hardware -- unshippable UX.
+The pruned 8-config set preserves the 1.27-1.33x delivered
+numbers at acceptable cold-start cost (validated against the
+full sweep at the same env). To re-derive winners for a new
+LTX-class shape: run the kernel against the shape, inspect
+`_fp8_matmul_gelu_kernel.cache` for the picked config.
+
+**Why the synthetic numbers stay in the docs.** The 1.27-1.36x
+synthetic-bench delta is a real, measurable property of the
+kernel running in isolation against `F.linear(F.gelu(F.linear(...
+)))` with bf16-dequant weights. Removing those numbers would
+hide useful information about the kernel's isolation behavior
+(relevant for future kernel-day work, e.g. evaluating whether a
+v0.6.1 redesign actually moves the isolation number). The
+discipline lesson is "don't *promote* the synthetic number as a
+delivered consumer-app speedup" -- not "don't measure synthetic
+performance."
+
+**Paths to close the production gap (v0.6.1 candidates, not
+v0.6.0 blockers):**
+
+1. **Persistent-CTA two-kernel hybrid** (the option (b') flagged
+   in the scoping doc). Persistent CTAs hold M-tile state in
+   registers / L2 across the two matmuls, addressing the
+   L2-contention root cause directly. Significantly more kernel
+   engineering than v0.6.0.
+2. **CUTLASS-based CUDA backend** for the fp8 matmul. Closes the
+   Triton-vs-cuBLASLt codegen gap that bounds the synthetic
+   ceiling at 1.27-1.36x; unclear whether it would also recover
+   the production loss. 2-3 weeks of work.
+
+Neither blocks v0.6.0 ship. See Backlog for triggers.
+
+**API.**
+
+`sage_ffn(x, w1, w1_scale, w2, w2_scale, b1=None, b2=None)`. The
+optional `b1` (inner,) and `b2` (hidden,) bf16 biases match the
+LTX 2.3 distilled checkpoint's FFN layout (`nn.Linear(...,
+bias=True)` defaults on both projections). When a bias is `None`,
+the kernel's `HAS_BIAS=False` constexpr branch compiles the load
+out -- no runtime cost on the bias-free path.
+
+**Limitations / scope.**
+
+- Plain GELU MLP only. No gated SwiGLU/GEGLU variant in v0.6;
+  the FFN structure has to be `Linear -> GELU(tanh) -> Linear`.
+- Bookend bf16 blocks must be handled by the caller. Consumer-side
+  dispatch typically inspects `block.ff.net[0].proj.weight.dtype`
+  and falls through to `F.linear` for bf16 blocks.
+- Per-tensor scalar weight scale only. Per-row / per-channel
+  weight scales are a v0.6.1 extension if a workload demands.
+- Bias must be bf16. Casting to bf16 at quantization time is
+  trivial; pre-quant bias scales are not supported (biases are
+  small, fp8 is overkill for them).
+- Not wired into `sageattn()` -- this is a separate FFN primitive,
+  not an attention kernel. Consumer imports `sage_ffn` directly.
+
+**Files added / changed:**
+
+- `sageattention/triton/fused_mlp_fp8.py` (new) -- the two-kernel
+  implementation + `sage_ffn` Python wrapper.
+- `sageattention/__init__.py` -- `sage_ffn` export.
+- `tests/spikes/spike_fp8_mma.py` (new) -- day-1 spike verifying
+  `tl.dot(fp8, fp8) -> f32` on sm89 at small + LTX stage-1
+  shapes.
+- `tests/spikes/test_fused_mlp_fp8_correctness.py` (new) --
+  correctness + perf gate at LTX FFN shapes, median-of-5 timing
+  after autotune-absorbing warmup.
+
+Design narrative (cross-claude memo trail, v0.6 scoping doc,
+day-by-day execution journal, decision-gate framework) lives in
+`internal/design/ffn_fusion_scoping.md` (gitignored).
+
 ### v0.5.5 -- 2026-05-13  (native general-mask support in the sm89 fp8++ CUDA kernel)
 
 First downstream-driven kernel-day work on the fork. Lands the
@@ -467,7 +1249,7 @@ Triggered by a high-leverage downstream consumer surface raising
 the structural-correctness concern (the "1 high-leverage surface"
 clause added in v0.5.4 backlog reformulation). Scoping note +
 implementation discipline in
-`internal/design/cuda_mask_kernel_scoping.md` (gitignored).
+`docs/cuda_mask_kernel_scoping.md`.
 
 #### Added
 

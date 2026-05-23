@@ -1,29 +1,42 @@
-last updated: 2026-05-14
+last updated: 2026-05-23
 
-# SageAttention-ada
+# sage-fork
+
+*sm89 kernel optimization for ComfyUI consumer workloads.*
 
 *Based on [SageAttention](https://github.com/thu-ml/SageAttention) by thu-ml,
-via [woct0rdho's fork](https://github.com/woct0rdho/SageAttention). This
-project has diverged substantially since and is no longer a thin patch
-on either; treat it as its own thing.*
+via [woct0rdho's fork](https://github.com/woct0rdho/SageAttention), with
+low-level CUDA primitives adapted from
+[FlashInfer](https://github.com/flashinfer-ai/flashinfer). This project has
+diverged substantially since and is no longer a thin patch on either; treat
+it as its own thing. Full attribution in [NOTICE](NOTICE); Apache-2.0 per the
+upstream lineage.*
 
-An attention-kernel library for **DiT-class local generation on sm89 /
-RTX 40xx / Ada** -- LTX 2.3 video, Flux-class image, Z-Image-Turbo, and
-similar models that run on a single 4090.
+A sm89 / RTX 4090 kernel optimization and measurement surface for
+ComfyUI consumer workloads. The mission is to make the workflows we
+actually run faster, more memory-efficient, and more measurable --
+anchored in DiT-class diffusion (LTX 2.3 video, Flux / Z-Image image
+gen) and expanding to multi-modal pipelines as those become consumer
+workload classes worth attacking. See `VISION.md` for the full
+scope framing.
 
-The core is INT8-quantized Q/K with FP8 PV accumulation, running
-through a runtime-dispatched kernel selector that picks the right
-variant for the GPU + CUDA combination it finds. There are also
-Triton fallbacks for archs without the native kernels and a couple of
-extra primitives (a fused split-RoPE, a multi-Q-slice attention entry)
-that downstream consumers occasionally find useful.
+Sage attention is the historical foundation and remains a primary
+deliverable: INT8-quantized Q/K with FP8 PV accumulation, runtime-
+dispatched kernel selector that picks the right variant for the GPU
++ CUDA combination it finds, Triton fallbacks for paths the native
+kernels don't cover. v0.6 added `sage_ffn` (fp8-native fused MLP for
+DiT FFN blocks). Forward directions span attention, FFN, VAE,
+ComfyUI integration shims, workflow profiling, persistent-CTA
+rewrites, and whatever the load-bearing measurement says next. The
+repo name is "sage-fork" for historical reasons; the substantive
+scope is broader. See `VISION.md` for the full mission framing.
 
-We care about **one GPU**: sm89 / Ada / 4090. The kernels compile and
-run on other archs via dispatcher fallbacks (sm80 forward-compat, sm100
-/ sm120 / sm121 through the sm89 path), but the bench baselines, the
-rtol expectations, and the perf-decision criteria are all calibrated
-for sm89. Treat results elsewhere as "should work" rather than
-"validated."
+**The hard constraint: sm89 / Ada / 4090 only.** Kernels compile and
+run on other archs via dispatcher fallbacks (sm80 forward-compat,
+sm100 / sm120 / sm121 through the sm89 path), but the bench
+baselines, the rtol expectations, and the perf-decision criteria are
+all calibrated for sm89. Treat results elsewhere as "should work"
+rather than "validated."
 
 ---
 
@@ -35,8 +48,9 @@ for sm89. Treat results elsewhere as "should work" rather than
 - **Specific kernel exports** -- `sageattn_qk_int8_pv_fp8_cuda`,
   `sageattn_qk_int8_pv_fp16_cuda`, `sageattn_qk_int8_pv_fp16_triton`.
   Bypass the dispatcher if you want to pick the kernel yourself.
-- **Native CUDA mask support on sm89 fp8++** (added v0.5.5; preliminary
-  -- see "What we've measured" below).
+- **Native CUDA mask support on sm89 fp8++** (v0.5.5). In-pipeline
+  observation under "What we've measured" is preliminary; the
+  kernel-correctness piece is not.
 - **`sageattn_partitioned(q, k, v, slices)`** -- amortizes K-quant +
   V-cast across multiple Q slices sharing the same K, V. Targets
   multi-slice partition patterns; correctness verified, peak HBM
@@ -45,6 +59,18 @@ for sm89. Treat results elsewhere as "should work" rather than
 - **`fused_rope_split(q, k, freqs_cis)`** -- clean-room Triton
   kernel matching the LTX split-rotary-embed convention; standalone
   helper, not bolted into `sageattn()`.
+- **`sage_ffn(x, w1, s1, w2, s2, b1=None, b2=None)`** (v0.6) -- a
+  two-kernel fp8-native fused MLP for DiT FFN blocks with per-tensor
+  fp8 (E4M3FN) weights. Targets LTX 2.3 distilled. **Ships as a
+  completeness primitive, not a perf win**: synthetic-bench shows
+  1.26-1.36x vs torch's fp8-dequant path, but a two-sampler LTX
+  production A/B came back +1.79% e2e slower (+20% at stage-2
+  per-call) -- the synthetic-vs-in-pipeline gap the perf-research
+  framework calls Cell C (defined in
+  `docs/perf_research_framework.md`). Available for users who
+  specifically need fp8-native fused MLP on sm89; no other library
+  provides this combination. See "What we've measured" for the
+  production breakdown.
 - **A bench harness** -- `tests/test_sageattn_ltx_shapes.py` measures
   every sage kernel + torch SDPA backend (FLASH / EFFICIENT / CUDNN)
   at the LTX-class shapes our models actually hit, reporting both
@@ -108,11 +134,16 @@ print(get_last_dispatched_kernel())  # 'fp8_cuda++', 'fp16_triton', etc.
 
 ## What we've measured
 
-Setup: RTX 4090, CUDA 13, torch 2.11, bf16 inputs. Speed = median ms
+Setup: RTX 4090, CUDA 13.0, torch 2.11, bf16 inputs. Speed = median ms
 over 3 timed runs after 1 warmup. `MATH` SDPA backend OOMs at LTX
 self-attn scale, so the accuracy reference is `SDPBackend.EFFICIENT_ATTENTION`.
 
 ### Unmasked self-attn
+
+Per-kernel speedup at synthetic LTX-class shapes (median over 3 timed
+runs). **These are isolation measurements, not e2e wall-time deltas
+on a render** -- the e2e contribution depends on the workload's
+attention share. Per-workload e2e numbers below.
 
 | shape                                    | sage fp8++ | torch_flash | speedup |
 |------------------------------------------|-----------:|------------:|--------:|
@@ -124,6 +155,15 @@ Quantization-induced rtol is ~0.097 on these shapes (well below the
 0.10 line we treat as the acceptable ceiling for DiT generation
 work). In practice this is below VAE noise on the image/video gen
 workloads we've tested; we haven't run task-level quality benchmarks.
+
+E2e ratio for the iclora workflow (downstream consumer A/B
+2026-05-07, attention share ~42% of CUDA kernel time): measured
+1.41x wall ratio, matches pure-Amdahl prediction within 1.4%. For
+the FML2V multi-guide workflow: stage-2 attn1 is the single
+heaviest sub-module and gives a materially larger e2e lever than
+the FFN-side primitive. The canonical breakdown + FFN-share triplet
+(three distinct readings depending on the question being asked) is
+in `docs/ltx_workload_profile.md`.
 
 ### Masked self-attn (post-v0.5.5)
 
@@ -178,6 +218,95 @@ routing flag + ComfyUI flags `--disable-dynamic-vram
 --disable-async-offload --reserve-vram 0 --cuda-malloc --cache-none`.
 Independent reproduction welcome.
 
+### sage_ffn (fp8-native fused MLP, v0.6)
+
+`sage_ffn` is a separate primitive from the attention kernels --
+two Triton kernels (`Linear -> GELU(tanh)` then `Linear`) computing
+in fp8 against per-tensor-fp8 weights. The wedge is qualitative:
+torch's `F.linear` against fp8 weights dequants to bf16 before the
+matmul (paying 2x weight bandwidth and using bf16 tensor cores at
+~330 TFLOPS); `sage_ffn` loads fp8 directly and uses sm89 fp8
+tensor cores at ~660 TFLOPS. No other library ships an fp8-native
+fused MLP for these consumer-app DiT shapes on sm89 (FA's
+`fused_mlp_func` is bf16/fp16 only).
+
+LTX 2.3 distilled FFN shapes (hidden=4096, inner=16384), bias-inclusive
+(matches the LTX 2.3 distilled checkpoint), measured on RTX 4090,
+CUDA 13.0, torch 2.12.0+cu130, triton 3.7.0 -- **synthetic standalone
+bench, not end-to-end ComfyUI rendering**:
+
+| shape | sage_ffn | torch ref (fp8-dequant) | speedup | mean_rtol |
+|---|---:|---:|---:|---:|
+| stage-1 (T=10780) | 13.3 ms | 18.1 ms | **1.36x** | 0.091 |
+| stage-2 (T=44880 multi-guide) | 59.8 ms | 75.3 ms | **1.26x** | 0.091 |
+
+mean_rtol is well under the 0.10 budget. The reference is
+`F.linear(F.gelu(F.linear(x, w1_bf16), approximate="tanh"), w2_bf16)`
+with weights dequantized once outside the timing loop, so this is
+torch's *best-case* fp8-weight path, not its naive one.
+
+**Production result on a two-sampler LTX workflow: sage_ffn is
+slower than the chunking-only baseline. Ships as completeness
+primitive, not a perf win.**
+
+In-pipeline A/B on a two-sampler FML2V multi-guide workflow
+(768x512x97, 8-step stage-1 + 3-step stage-2, 4 renders
+interleaved baseline/treatment/baseline/treatment on a 4090 under
+`nodynvram`):
+
+| metric | baseline | with sage_ffn | delta |
+|---|---|---|---|
+| wall-time avg | 148.51s | 151.17s | **+1.79% slower** |
+| ff @ T=10780 med ms/call | 10.36 | 10.67 | +3.0% slower |
+| ff @ T=42240 med ms/call | 48.77 | 58.58 | **+20.1% slower** |
+
+Same workflow / prompt / seed across both sides; interleaving
+controls for time-varying noise; non-FFN sub-modules at 1.00x
+ratio confirm the patching surface is clean. Per-call FFN times
+match between cold-autotune and warm-autotune treatments, so
+autotune amortization is not the explanation.
+
+Why the synthetic 1.26-1.36x didn't translate:
+
+1. **L2 cache contention with neighboring sub-modules.** Synthetic
+   bench ran FFN alone with warm L2. Production runs `attn1` (~107
+   ms at T=42240) immediately before `ff` at stage-2; the attention
+   pass evicts FFN's L2 residency. The X-tile-lives-in-L2
+   assumption breaks when L2 is hostile; cold-L2 FFN is
+   bandwidth-bound and loses the fp8-vs-bf16 advantage. Worse at
+   stage-2 (4x working set) matches the regression shape.
+2. **Cumulative kernel-launch overhead at LTX call count.** LTX
+   2.3 fires ~1056 ff calls per render across transformer blocks.
+   sage_ffn is two kernel launches per call; torch reference is
+   one cuBLASLt call per matmul.
+
+The v0.5.5 precedent played out a second time -- synthetic kernel-
+bench projects a wedge, in-pipeline A/B reveals production
+conditions change the picture. Different workload shapes (e.g.
+single-pass, non-multi-guide) may behave differently; in-pipeline
+measurement is the gate.
+
+Design notes:
+
+- Two-kernel split, intermediate hits HBM between them. This is
+  the same design FA's `fused_mlp_func` uses on bf16/fp16 -- the
+  single-kernel "intermediate never hits HBM" design hits an
+  sm89 SMEM wall at LTX-class K dims.
+- Plain GELU MLP only in v0.6. No gated SwiGLU/GEGLU variant.
+- Bookend bf16 blocks (LTX 2.3 keeps blocks `{0, 1, 46, 47}` as
+  bf16) need consumer-side dispatch -- `sage_ffn` only handles
+  fp8-weight blocks; the bf16 bookend blocks fall through to
+  `F.linear` in the caller.
+- First call at a new shape pays ~10-15s Triton autotune-search per
+  kernel (~30s total across both kernels at the two LTX shapes);
+  subsequent calls hit the on-disk cache. Configs are hardcoded
+  winners from a broader sweep so that first-render cost stays
+  bounded.
+- v0.6.1 candidates for closing the production gap: persistent-CTA
+  hybrid (addresses L2 contention directly) and a CUTLASS-based
+  CUDA backend (closes the Triton-vs-cuBLASLt codegen gap). See
+  CHANGELOG Backlog.
+
 ### Things we have NOT measured
 
 - Task-level quality (FVD / FID / preference) on any of the
@@ -208,9 +337,15 @@ Summary of the things worth knowing:
   (`tl.max(mask_block) == 0 -> skip`); the CUDA pipelined K-iteration
   loop makes the analog non-trivial. Currently relevant only for
   workloads we haven't measured.
-- **Other kernel optimizations under analysis** (mask-aware autotune
-  key, broadcast-mask specialization). See CHANGELOG / Backlog
-  for the actual list with triggers.
+- **Persistent-CTA hybrid for stage-2 attention** (highest e2e lever,
+  ~15% wall-time ceiling on LTX multi-guide workloads) and **for
+  sage_ffn** (validates the technique at lower risk). Both deferred;
+  see CHANGELOG Backlog for triggers. CUTLASS-based fp8 matmul backend
+  was queued and is now demoted to "skip per workload-profile analysis"
+  -- the v0.6 production gap was L2 contention + dispatch overhead,
+  not matmul codegen.
+- **Mask-aware autotune key** as measurement-hygiene infrastructure
+  (1-2 hour change, recommended regardless of larger work).
 
 ---
 
@@ -218,13 +353,23 @@ Summary of the things worth knowing:
 
 You get:
 
-- 2-2.7x speedup over torch's flash backend on sm89 self-attn at the
-  DiT-class shapes we validated (head_dim ∈ {64, 120, 128}).
+- 2-2.7x per-call speedup over torch's flash backend on sm89 self-attn
+  at the DiT-class shapes we validated (head_dim ∈ {64, 120, 128}).
+  Synthetic kernel-bench measurement; e2e wall-time wedge depends on
+  the workload's attention share. Measured: 1.41x e2e on the iclora
+  workflow at ~42% attention share, matches pure-Amdahl within 1.4%.
 - A faster cross-attn path via `sageattn_qk_int8_pv_fp16_triton`
-  (~2.8x over `torch_cudnn` at LTX cross-attn shapes).
+  (~2.8x over `torch_cudnn` at LTX cross-attn shapes). Same caveat:
+  per-call, not e2e.
 - Native mask support on the sm89 fp8++ CUDA path -- masked calls
   run at fp8++ speed instead of paying the Triton fallback
   overhead. (Other archs still use Triton.)
+- An fp8-native fused MLP primitive (`sage_ffn`, v0.6) for LTX
+  2.3-class FFN blocks. The only fp8-native fused MLP available
+  for these workloads on sm89. **Note**: synthetic-bench shows
+  1.26-1.36x but a two-sampler LTX production A/B came back
+  net slower; ships as a completeness primitive only. See
+  "What we've measured" for detail.
 
 You give up:
 
@@ -263,6 +408,8 @@ paths.
 sageattention/          # Python package
   core.py               # dispatcher + Python entry points
   triton/               # JIT Triton kernels
+    fused_mlp_fp8.py    # sage_ffn -- v0.6 two-kernel fp8 fused MLP
+    fused_rope.py       # fused_rope_split helper
   sm89_compile.py       # torch.library.custom_op schemas for sm89 kernels
   quant.py              # quantization helpers
 csrc/qattn/             # CUDA kernel sources (sm80 + sm89)

@@ -1,6 +1,6 @@
 # What's ours vs what's upstream
 
-Last updated: 2026-05-13
+Last updated: 2026-05-16
 
 L3 reference for CLAUDE.md. Load this when editing a file and you
 need to know whether the file is unmodified upstream code (lighter
@@ -13,7 +13,10 @@ additions (we own the contract).
   sm89_qk_int8_sv_f8_*.cu}`, `csrc/fused/`, `pyproject.toml`,
   `tests/test_sageattn.py`, `tests/test_flashattn{2,3}.py`.
 - `sageattention/` mostly unmodified except
-  `sageattention/triton/attn_qk_int8_per_block.py` (we added autotune).
+  `sageattention/triton/attn_qk_int8_per_block.py` (we added autotune),
+  `sageattention/triton/fused_rope.py` (v0.5.3, our addition), and
+  `sageattention/triton/fused_mlp_fp8.py` (v0.6.0, our addition --
+  the `sage_ffn` primitive).
 - `setup.py` mostly unmodified except line 152 (sm89 -> SM80 build gate)
   + v0.5.0 trims (Hopper SM90 block, CUDA-12.3-for-9.0 check, Windows
   MSVC compile flags).
@@ -98,6 +101,33 @@ additions (we own the contract).
   support, scoped to the load-bearing sm89 fp8++ kernel
   (`qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf`). Mechanism,
   measurement, and what's deferred: CHANGELOG v0.5.5.
+- **`sageattention.sage_ffn(x, w1, s1, w2, s2, b1=None, b2=None)
+  -> Tensor`** -- v0.6.0 fp8-native two-kernel fused MLP primitive
+  for DiT FFN blocks with per-tensor fp8 (E4M3FN) weights and
+  optional bf16 biases on both Linear layers. Targets LTX 2.3
+  distilled (hidden=4096, inner=16384). Two-kernel split design
+  (matmul+GELU(tanh) then matmul, intermediate hits HBM). Lives in
+  `sageattention/triton/fused_mlp_fp8.py`. Hardcoded 8-config
+  `@triton.autotune` per kernel (winners curated from a 126-config
+  full sweep). **Status: ships as a completeness primitive, not a
+  perf win.** Synthetic-bench shows 1.26-1.36x vs torch's
+  fp8-dequant reference; in-pipeline A/B on a two-sampler LTX
+  FML2V workflow came back +1.79% e2e slower (+20% per-call at
+  stage-2). Root cause is L2 contention with neighboring attention
+  modules + cumulative kernel-launch overhead at LTX's
+  ~1000-FFN-calls/render count. The qualitative wedge holds (no
+  other library ships fp8-native fused MLP for ComfyUI consumer-app
+  on sm89); the quantitative wedge does not on the tested workload.
+  Not wired into `sageattn()` -- consumer imports it directly. Test:
+  `tests/spikes/test_fused_mlp_fp8_correctness.py` (bias-inclusive
+  + bias-free, both LTX FFN shapes). See CHANGELOG v0.6.0 for the
+  full production-result table + v0.6.1 candidates (persistent-CTA
+  hybrid for FFN, persistent-CTA for stage-2 attention as the
+  highest-leverage follow-up).
+- `tests/spikes/spike_fp8_mma.py` -- v0.6 day-1 spike verifying
+  `tl.dot(fp8, fp8) -> f32` on sm89 at small + LTX stage-1 shapes.
+  Standalone scratch / debugging surface; not part of the main
+  bench loop.
 - `build.sh` -- editable-install wrapper with VIRTUAL_ENV check,
   `--python` pin, MAX_JOBS cap.
 - `tests/test_sageattn_ltx_shapes.py` -- LTX-parametrized accuracy +

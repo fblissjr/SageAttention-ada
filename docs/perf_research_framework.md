@@ -1,6 +1,6 @@
 # Performance research framework
 
-Last updated: 2026-05-13
+Last updated: 2026-05-19
 
 L3 reference for CLAUDE.md's "Performance research" pointer. Load this
 when you are about to make a kernel change, run a perf experiment, or
@@ -49,7 +49,17 @@ varies. Two measurements on file:
   delta is 0.82% of total launches -- ~0.4s, also negligible. The
   full saving comes from sage's faster attention kernel.
 
-Both numbers are real; they describe different workloads with
+- **LTX 2.3 FML2V multi-guide at production scale (in-pipeline A/B
+  2026-05-15 + tracer audit 2026-05-16)**: full wall-time breakdown
+  + per-sub-module shares + the FFN-share triplet are in the
+  canonical workload-profile doc `docs/ltx_workload_profile.md`.
+  Headline: stage-2 attn1 is the single heaviest sub-module;
+  sampler dominates at ~82% of render; total FFN is materially
+  smaller than the attention surface. Cite the workload-profile
+  doc rather than restating percentages locally; the next render-
+  data refresh updates one place.
+
+The three numbers are real; they describe different workloads with
 different attention shares. The framework: measure attention-share-
 of-CUDA-time on each workload of interest, apply Amdahl with the
 per-kernel ratio observed on that workload's actual call mix, and
@@ -59,11 +69,178 @@ ratio to another.
 
 Sourced from real consumer traces; see CHANGELOG v0.4.1 for the
 kernel-bench shape re-derivation, v0.5.1 for the audio_loop_latent
-e2e measurement, and the 2026-05-07 cross-claude memo trail
+e2e measurement, the 2026-05-07 cross-claude memo trail
 (`internal/AUDIO_LOOP_CLAUDE_TO_SAGE_CLAUDE_MEMO.md` +
 `internal/SAGE_CLAUDE_TO_AUDIO_LOOP_CLAUDE_MEMO.md`) for the iclora
 A/B decomposition that retired the launch-overhead, FFN-adjacent,
-and cache-footprint hypotheses on that workload.
+and cache-footprint hypotheses on that workload, and CHANGELOG v0.6.0
++ `docs/ltx_workload_profile.md` for the FML2V profile.
+
+## Profiler-aggregation gotcha: cpu_op `dur` is dispatch wall-clock, not serial wall-time
+
+Chrome trace events with `cat=cpu_op` have a `dur` field that captures the **CPU-side dispatch wall-clock** for that op -- the time the dispatcher spent issuing the op, not the GPU-side execution time. For async pytorch ops (`aten::copy_`, `aten::to`, most aten ops on CUDA tensors), the dispatcher fires, queues work onto the CUDA stream, returns; the `dur` measures only the dispatcher's CPU portion. The GPU then executes that work concurrently with subsequent CPU dispatch.
+
+Summing `cpu_op.dur` across many async ops on a compute-overlapping render gives an inflated CPU-side total that does NOT correspond to serial render wall-time. A `aten::copy_` total `dur` of 35 s across 40 k calls does not mean 35 s of the render was eaten by copies; most of that CPU dispatch overlapped with GPU compute.
+
+The right aggregation depends on the question:
+
+- **"What op did the dispatcher fire most often / what's the CPU-side dispatch profile?"** -> sum `cat=cpu_op` `dur`. Useful for finding dispatcher-bound bottlenecks or hot operator names.
+- **"What dominates sampler wall-time?"** -> sum `cat=kernel` `dur` (CUDA kernel wall-time) + explicit CPU work that blocks the dispatcher (sync points, `.item()` calls, host-to-device transfers that block). This is the right anchor for "X% of sampler" claims.
+
+Worked example (2026-05-16 retraction): a v3 audit doc claimed "comfy-aimdo offload = `aten::copy_ + aten::to` = 67 s = 47% of sampler" from cpu_op `dur` aggregation. A `nodynvram` A/B disproved the framing by showing that disabling dynamic VRAM made the render slower, not faster, and the `aten::copy_` + `aten::to` call counts went UP while their total `dur` stayed roughly the same. The 47% number was real CPU dispatch time but not serial wall-time; the framing propagated through three cross-clone memos before the A/B caught it -- almost shifted a 2-week infra commit on the misinterpreted aggregation.
+
+**Disprove-test discipline**: for any "X% of sampler is Y" claim that would shift a multi-day decision (infra commit, kernel-day work, ship/no-ship), identify the cheapest test that would falsify Y, and run it before the decision. Six minutes of GPU time on the right A/B can save weeks of work pointed at the wrong thing. Same shape as the synthetic-vs-in-pipeline rule below, but applied to interpretation, not measurement.
+
+## Evidence ladder for kernel-replacement audits: did the kernel actually fire?
+
+When a patch replaces a kernel (or wraps a forward, or monkey-patches a Linear), the first question a follow-up audit has to answer is **not** "is it faster?" but **"is the replacement actually firing in production?"** A patch that silently no-ops because of a missing-attribute early-return, a swallowed exception, or a dispatcher branch that fell through to the original code path will look indistinguishable from a working patch in coarse aggregations -- attribution coverage moves, sub-module time deltas move, kernel-count *totals* move -- while the actual replacement never executed once.
+
+The right evidence ladder, primary to weakest:
+
+1. **Kernel-name presence in the Chrome trace.** If your patch dispatches to a Triton kernel, the trace should contain `_your_kernel_name[autotuned_grid]` (or equivalent symbol) at least once in the relevant sub-module. If the trace is 100% cuBLAS XMMA / 100% the kernel set that was there before the patch, the patch is not firing -- regardless of what aggregation numbers say. This is the strongest signal because kernel names are a direct read from the GPU's actual execution, not an inference from CPU-side timing.
+
+   Sub-rule: **match against `cat=kernel` rows specifically, not dispatch annotations.** A Chrome trace contains kernel symbol names in two distinct row categories: the actual GPU launches at `cat=kernel`, and dispatch-side annotations (`cat=cpu_op` and similar) that reference the same name. A naive grep across the whole trace matches both layers and can look like rung-1 evidence when it's actually rung-3-shaped (dispatch attribution, not GPU execution). Always filter to `cat=kernel` before counting. Same trap shape as the `cpu_op.dur` aggregation gotcha at the top of this doc, but applied to "did the kernel fire at all" rather than "how long did it run."
+2. **Per-call instrumentation logs.** A one-shot log at install time (`[INFO] patched N blocks with kernel X`, `[WARN] could not extract required attribute on a patched block`) tells you the patch attempt happened and which fork it took. Per-call logging is finer-grained but noisier and only useful when you suspect a subset of calls is misbehaving. **Every fallback path needs a log line, and every fallback log line must carry the underlying error's message (not just its class name).** Five distinct ways this rule gets violated, all functionally equivalent for debugging utility:
+
+   (a) Explicit `except` clause **without** logging (the obvious one).
+   (b) Early-return guard **before** the protected call (silent because the protected call never happened, so even an `except` clause downstream of it never fires).
+   (c) Patch-installer never installs because an entry condition didn't match, so the unpatched forward fires by default with no log anywhere. (Distinct from "patched forward calls pre-patch on miss" -- that path typically emits a log; (c) is about the install path never taking, which means the wrapper's logger machinery never gets a chance to fire.)
+   (d) Log line that strips the underlying error's message -- e.g. `log.info(f"fallback: {type(exc).__name__}")` discards `str(exc)`. The log line exists but carries no diagnostic; surfaces "something failed" without "what" or "why."
+   (e) Patch installs cleanly and runs at call time, but the wrapper captured tensor references at install time -- before the framework's deferred operations (lazy device-cast, mmap-load, quantization-wrapper-swap, paged-cache allocation) completed. The patched forward passes stale references to the inner kernel, which rejects them. The wrapper's logic is correct; its captured state is frozen. Smoking-gun signal: framework "model loaded" / "weights cast" log appears AFTER the consumer's install log in console. Distinct from (b)/(c)/(d): patch DID install and DID call the kernel, but with pre-load state. Fix: resolve references at call time, not at install time; if install-time validation is needed, discard the captured tensors.
+
+   (d) is the trap (a)-(c) graduate to once the obvious silent layers are fixed: the observer thinks they've solved the logging problem because a line appears, but the line is dead weight. The shape recurred when `sage_ffn` (which has informative assert messages on every precondition) was wrapped by a downstream consumer whose fallback logger formatted only `type(exc).__name__`. The wrapper's logger DID fire on every AssertionError, but the diagnostic (e.g. "sage_ffn: w1.dtype must be float8_e4m3fn, got <QuantizedTensor wrapper>") never reached the operator. Multiple A/B cycles ran before the logger format was fixed AND the underlying cause (a missed QuantizedTensor unwrap on the input weight) surfaced in a single line of stderr.
+
+   (e) is structurally orthogonal -- the cause is upstream of forward. It composes: (e)+(a) is the maximum-stealth version (silent kernel rejection from frozen refs); (e)+(d) hides which property went stale (`cpu`-vs-`cuda`, etc.) by stripping the assert message. (e) is mutually exclusive with (c) (install ran, by definition).
+
+   Rule of thumb: when writing or reviewing a fallback `except` block, ask "what does an operator reading stderr know about WHY the fallback fired?" If the answer is "the class of the exception but not the message and not the input that triggered it," the log is at rung (d) and is a debugging dead end disguised as instrumentation.
+3. **Attribution coverage delta.** "Coverage went from 51% to 77% under TREATMENT" feels like a strong signal but it can move for reasons unrelated to whether the new kernel fired -- a composition fix that restored per-block `record_function` annotation will move it, even if the actual kernel replacement is no-op. Coverage delta is a useful corroboration that *something* changed about the patch surface; it is not evidence that the new kernel ran.
+4. **Sub-module time delta.** Weakest of the four. A "+12% on `ff` sub-module" looks like a sage_ffn-vs-stock measurement but can be entirely explained by chunk-policy changes, allocator state, autotune cache state, or anything else the patch perturbed besides the kernel itself. Cite this only after the kernel-name signal is established; never as standalone evidence.
+
+The asymmetry: kernel-name presence is cheap to check (one chrome trace, ctrl-F for the expected symbol). Attribution coverage and time deltas are what bench harnesses report by default and what one is tempted to read first. Read kernel-name presence first regardless of what the aggregations show.
+
+This rule generalizes the synthetic-vs-in-pipeline discipline below: a synthetic bench can confirm a kernel fires (because you wrote the bench to call it directly), but in-pipeline only proves dispatch worked if you verify kernel-name presence in the actual production trace. Don't assume "my patch overrides forward, therefore my kernel is firing"; verify.
+
+## When synthetic-bench projects, but production refuses to follow
+
+There is a recurring failure mode worth naming: a kernel-isolation
+bench shows a clean speedup, the speedup gets promoted into a
+delivered claim, the in-pipeline A/B reveals the speedup doesn't
+transfer because production conditions (cache contention, dispatch
+overhead, allocator state, neighboring-module behavior) break an
+assumption the synthetic bench held warm.
+
+### The synthetic-vs-in-pipeline 2x2 matrix (Cell A/B/C/D vocabulary)
+
+Every kernel-replacement decision lives in one of four cells of this
+matrix. The rows are "what the in-pipeline A/B shows on the actual
+production workload"; the columns are "what the synthetic isolation
+bench projects vs the production stock comparand":
+
+| | synthetic FASTER | synthetic SLOWER |
+|---|---|---|
+| in-pipeline FASTER | **Cell A** | **Cell B** |
+| in-pipeline SLOWER | **Cell C** | **Cell D** |
+
+**Cell A: win across the board.** Synthetic AND in-pipeline both
+show the new kernel beating the comparand. Ship default-on; the
+kernel is a real win. Disposition: promote to recommended path,
+update consumer-facing defaults, retire the comparand path as the
+recommended option.
+
+**Cell B: synthetic slower, production faster.** Implausible at face
+value. Usually means one of: (1) the synthetic comparand isn't
+representative of what production actually runs; (2) the new kernel
+benefits from a production-side side-effect the synthetic bench
+doesn't reproduce (cache warmth from a neighboring module, dispatch
+overhead avoidance, allocator state coupling). Disposition: do not
+ship on the in-pipeline number alone; the synthetic bench is
+broken-or-irrelevant and needs to be fixed before any claim. Often
+exposes a comparand-identity bug (see "stock comparand identity"
+discussion below).
+
+**Cell C: synthetic faster, production slower (or wash).** The
+canonical synthetic-vs-production gap. Synthetic isolation projected
+a win that didn't transfer. Root causes typically fall in one of
+four buckets: (1) L2 cache contention with neighboring modules that
+the synthetic bench held warm; (2) cumulative kernel-launch overhead
+at production call counts the synthetic bench didn't reproduce; (3)
+autotune state under interleaved dispatch differing from the warm
+autotune state synthetic isolation converged on; (4) stock comparand
+identity -- synthetic compared against an isolated reference (e.g.
+`torch._scaled_mm`), production compared against a different stock
+path (e.g. `comfy.ops.fp8_linear` + ChunkFFN wrapper). Disposition:
+either close the gap via a structural fix (persistent-CTA, autotune
+pre-bake, switching the bench comparand to match production), or
+ship as completeness primitive at best. v0.6 sage_ffn landed here.
+
+**Cell D: synthetic slower, production slower.** Kernel is
+structurally worse than the comparand. Don't ship except as a
+forward-compat primitive for a future workload where the trade-off
+flips. v0.6 sage_ffn was NOT here: synthetic ceiling was 1.39-1.60x
+FASTER than `torch._scaled_mm` at production shapes (CHANGELOG
+v0.6.5 bench rows). The production loss was Cell C, not Cell D.
+
+**Cell-to-evidence mapping.** Resolving "which cell are we in"
+requires distinct evidence at each stage. For the in-pipeline row:
+rung-1 evidence (chrome trace shows the new kernel's symbol in
+`cat=kernel` rows) confirms the patch is firing -- without this,
+"slower in production" might mean "the new kernel never ran." For
+the synthetic column: the bench must compare against the actual
+production stock comparand, not just an isolated reference. The
+Cell C verdict on v0.6 sage_ffn was reached only after both
+conditions held (audio-loop consumer-side `818453e` + sage v0.6.5
+in place; rung-1 evidence present in every TREATMENT chrome trace).
+
+**Open hypothesis discipline.** A Cell C verdict opens (typically)
+2-4 hypotheses for the inversion (e.g. comparand identity, autotune
+flips, L2 contention, allocator state). Each hypothesis needs:
+(a) a measurement that would advance it from "plausible" to
+"confirmed"; (b) a documented reopen-trigger if not pursued today;
+(c) a CHANGELOG Decision log entry capturing both. The hypotheses
+gate forward roadmap items: persistent-CTA targets hypothesis 1/2/3
+symmetrically; a comparand-direct re-bench targets hypothesis 4.
+
+Two concrete precedents in this fork (both retired into Decision
+log entries):
+
+- **v0.5.1 -> 2026-05-07 retirement**: the v0.5.1 release attributed
+  +17pp of an audio_loop_latent e2e ratio to "FFN-adjacent reach
+  within the sampler step" based on a single-data-point inference.
+  The 2026-05-07 iclora A/B directly traced attention time on the
+  actual workload, showed pure-Amdahl matched within 1.4%, and
+  retired the FFN-adjacent / cache-footprint / launch-overhead
+  reach hypotheses. Net: kernel ratio held, the mechanism story
+  didn't.
+- **v0.6.0 sage_ffn (2026-05-15)**: synthetic-bench showed 1.27-1.36x
+  vs torch's fp8-dequant reference at LTX FFN shapes. In-pipeline
+  A/B on a two-sampler FML2V workflow came back +1.79% e2e *slower*
+  (+20% per-call at stage-2). Root cause: L2 cache contention with
+  neighboring attention modules + cumulative kernel-launch overhead
+  at LTX's ~1000-FFN-calls/render count. The synthetic bench ran
+  FFN alone with warm L2; production ran it interleaved with
+  attention's much larger working set. Kernel walked back from
+  "delivered speedup" to "completeness primitive" in the same
+  session. See CHANGELOG v0.6.0 entry for the production-result
+  table.
+
+Discipline rule (codified in CLAUDE.md Conventions, "Gate ship-
+decisions on in-pipeline A/B when synthetic-bench can't measure
+the dominant cost"):
+
+1. Don't *claim* a delivered speedup from a synthetic number;
+   default framing is "synthetic-bench above, e2e pending in-pipeline
+   measurement" until a downstream A/B confirms transfer.
+2. For kernel-day work with structural risk that synthetic-bench
+   *specifically* can't measure -- L2 contention with neighboring
+   modules, cumulative dispatch overhead at high call counts,
+   memory-allocator behavior under fragmentation, thermal/clock
+   state during sustained renders -- gate the v0.X ship commit on
+   an in-pipeline measurement BEFORE the commit lands, not after.
+
+The v0.6 walk-back was the cost of running this rule
+ship-first-validate-later. For per-call-heavy primitives (FFN/MLP,
+RoPE, any kernel called 1000+ times per render), the structural-risk
+list above is the default expected behavior, not the exception.
 
 The earlier metric (`self_attn_large_704x704x497` at seq=31776, D=64)
 was a synthetic shape with the wrong head_dim -- LTX 2.3 video is

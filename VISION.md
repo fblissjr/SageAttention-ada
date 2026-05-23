@@ -1,32 +1,74 @@
-last updated: 2026-04-26
+last updated: 2026-05-19 (mission reframe: ComfyUI workload optimization on sm89; sage attention is one tool in the kit)
 
 # sage-fork
 
-A 4090 / Ada attention-kernel optimization repo for **DiT-class local
-generation**: LTX 2.3 video, Flux-class image (Flux 2 Klein and
-predecessors), Z-Image-Turbo S3-DiT, and other diffusion transformers
-we run locally. The kernel base is sage attention; the bench harness
-measures it alongside SpargeAttention, FlashInfer, and torch SDPA at
-the actual shapes our models run, on the actual GPU we have (RTX
-4090). One number drives every decision.
+*sm89 kernel optimization for ComfyUI consumer workloads.*
+
+A sm89 / RTX 4090 kernel optimization and measurement surface for
+**ComfyUI consumer workloads**. The mission is to make the workflows
+we actually run faster, more memory-efficient, and more measurable --
+anchored in DiT-class diffusion (LTX 2.3 video, Flux / Z-Image image
+gen) and expanding to multi-modal pipelines (audio-conditioned video,
+cross-modal attention, two-pass tensor-loop samplers) as those become
+consumer workload classes worth attacking. The DiT and LLM worlds are
+converging; we expect new workload shapes over time and structure the
+work to absorb them.
+
+Sage attention is the historical foundation and remains a primary
+deliverable. v0.6 added `sage_ffn` (fp8 MLP fusion). Forward directions
+span attention, FFN, VAE, ComfyUI integration shims, workflow profiling
+tools, persistent-CTA kernel rewrites, and whatever the load-bearing
+measurement says needs attacking next. We optimize where the wedge is,
+not where the repo name points.
+
+**The hard constraint: sm89 / RTX 4090 only.** Hopper / Blackwell /
+Ampere stay out of scope. Everything else -- kernel surface
+(attention, FFN, VAE, cross-modal, anything else that shows up in a
+ComfyUI render hot loop), abstraction layer (raw CUDA, Triton,
+CUTLASS-pattern, or modern Triton features), third-party leverage
+(torchao primitives, modern PyTorch fp8 APIs, sub-pattern references
+from Megakernels / ThunderKittens etc.) -- is on the table.
 
 ## How this works
 
-Three things matter:
+The work surface, by layer:
 
-- **`tests/test_sageattn_ltx_shapes.py`** — the bench harness. Every
-  kernel × every shape × (median_ms, mean_rtol). One run prints
-  everything side-by-side. ~30s on a warm cache.
-- **`sageattention/core.py`** — the dispatcher and per-kernel entry
-  points. Where most kernel-side changes land. The `csrc/qattn/*.cu`
-  files are the real kernel bodies; `core.py` orchestrates and
-  dispatches.
-- **`internal/PLAN.md`** — the live operational doc. Backlog,
-  experiment log (TSV-style), the research loop. Pairs with this
-  file the way [karpathy/autoresearch](https://github.com/karpathy/autoresearch)'s
-  `program.md` pairs with its README.
+- **Kernels** -- `sageattention/` (attention) + `sageattention/triton/`
+  (sage_ffn, fused_rope_split). New kernel work lands here on sm89-
+  bounded scope: CUDA + Triton, fp8 / int8 quantized where the
+  workload supports it, mature `mma.sync` + `cp.async` primitives
+  (no TMA / WGMMA / TMEM).
+- **Bench + measurement** -- `tests/test_sageattn_ltx_shapes.py`
+  (attention shapes), `tests/bench_sage_ffn_shapes.py` (fp8 MLP
+  shapes vs torch comparand), `tests/test_dispatcher_routing_log.py`
+  (routing observability). New primitives add their own measurement
+  surface; the methodology framework codifies how we trade across them.
+- **ComfyUI integration patterns** --
+  `sageattention/comfyui_compat.py` (fp8 storage probe across known
+  conventions), the cross-clone memo protocol with the audio-loop
+  consumer-side claude, the wrapper-discipline rules in the
+  perf-research framework (rung-2 silent-fallback-pattern enumeration).
+- **Methodology + decision discipline** --
+  `docs/perf_research_framework.md` codifies the rules every kernel-
+  day decision is graded against: load-bearing metric, synthetic-vs-
+  in-pipeline 2x2 matrix (Cell A/B/C/D vocabulary), evidence ladder
+  for kernel-replacement audits, rung-2 silent-fallback-pattern
+  enumeration, disprove-test discipline.
+- **Forward record** -- `docs/roadmap.md` (tiered directions, trigger-
+  conditional, including stack-leverage opportunities and external
+  design references), `CHANGELOG.md` (versioned divergence + Decision
+  log + Backlog + Workload intel), `internal/PLAN.md` (gitignored
+  live operational doc).
 
 ## The metric
+
+The load-bearing measurement for sage attention work is unchanged --
+attention dominates wall time on the canonical workload class
+(DiT-class video / image gen) and the kernel that ships is the one
+the dispatcher actually picks. New primitives (sage_ffn, future VAE
+fusion, future cross-modal attention coverage) each carry their own
+measurement surface; the methodology framework codifies how we trade
+across them and which decisions are gated on which evidence.
 
 ```
 tests/test_sageattn_ltx_shapes.py
@@ -120,33 +162,59 @@ and we add a perceptual layer.
 
 ## What we ARE
 
+- **A kernel set for ComfyUI sm89 workloads.** Attention (sage's
+  historical core) + `sage_ffn` (v0.6 fp8 MLP) + `fused_rope_split`.
+  Forward: VAE fp8 fusion, cross-modal attention coverage, GeGLU
+  sage_ffn extension, persistent-CTA rewrites, and whatever the
+  measurement says next. All sm89-bounded. The repo name is "sage-
+  fork" for historical reasons; the substantive scope is broader.
 - **A bench harness** that measures attention kernels at DiT shapes.
-  Sage variants (5 modes), SpargeAttention top-k = 0.5,
-  FlashInfer fp16 prefill, three torch SDPA backends — every row
-  prints every run. The bench output is a one-shot answer to "which
-  attention kernel for which shape on this GPU?", not a
-  sage-internal characterization.
-- **An editable install of sage** with the SM80 build gate widened
-  so it actually compiles from source on Ada (woct0rdho's `setup.py`
-  refactor accidentally dropped it). Load-bearing only because every
-  kernel-side change ships through the editable install.
-- **A decision log** that grades every kernel-side change against the
-  metric above. Deferrals carry concrete reopen-numbers, not vague
-  "trigger fires."
+  Sage variants (5 modes), SpargeAttention, FlashInfer, three torch
+  SDPA backends — every row prints every run. Expanding to new
+  workload classes (cross-modal, multi-modal pipelines) as those
+  become recurrent.
+- **An editable install** with the SM80 build gate widened to
+  compile from source on Ada. Load-bearing because every kernel-
+  side change ships through it.
+- **A ComfyUI integration surface.**
+  `sageattention.extract_fp8_weight_and_scale` (v0.6.4) shims the
+  four known fp8 storage conventions; the cross-clone memo protocol
+  coordinates with the audio-loop consumer-side claude; the
+  wrapper-discipline rules in the perf-research framework (5-pattern
+  silent-fallback enumeration) codify what every kernel-replacement
+  consumer node needs to handle.
+- **A perf-research methodology framework**
+  (`docs/perf_research_framework.md`) that codifies the rules every
+  kernel-day decision is graded against: load-bearing metric, the
+  synthetic-vs-in-pipeline 2x2 matrix (Cell A/B/C/D), evidence
+  ladder for kernel-replacement audits, rung-2 silent-fallback-pattern
+  enumeration, disprove-test discipline. Reusable across any future
+  kernel work on this fork or its consumers.
+- **A decision log + tiered roadmap** that grades every change
+  against the metric, with explicit triggers for promoting items
+  from "candidate" to "active backlog."
 
 ## What we are NOT
 
-- **A general sage replacement.** Hopper / Blackwell stays upstream.
+- **A general sage replacement.** Hopper / Blackwell stay upstream.
   We don't validate or optimize for non-Ada.
+- **An LLM-inference engine.** vLLM / SGLang / others own that
+  space. We stay diffusion-and-multi-modal-diffusion focused. As DiT
+  and LLM worlds converge in practice (audio-conditioned models,
+  text-conditioned video, multimodal pipelines), shared kernel
+  surfaces (attention, FFN, normalization) are in scope on sm89; we
+  just don't ship an autoregressive serving stack.
+- **A polished public release.** Solo-hobbyist scope. README +
+  CHANGELOG + roadmap + perf-research framework are sufficient.
+  Revisit only if audience shifts.
 - **A perf consultancy for individual workloads.** If a model class
   brings a head_dim or sequence pattern outside our coverage, the
-  fix is a new bench row, not a workload-specific kernel.
+  fix is a new bench row + a methodology cycle, not a workload-
+  specific kernel.
 - **A `torch.compile` target.** Verified 2026-04-25 on torch 2.11:
   compile-around-sage produces ~2.8 % rtol drift with no measurable
-  speedup. Consumers should keep `torch.compiler.disable()` around
-  sage calls. Revisit when a future torch release makes
-  [`tests/spike_torch_compile.py`](./tests/spike_torch_compile.py)
-  show bounded rtol AND measurable speedup.
+  speedup. Revisit when a future torch release makes the spike show
+  bounded rtol AND measurable speedup.
 
 ## Design choices
 
@@ -171,6 +239,18 @@ and we add a perceptual layer.
   `program.md`): all else being equal, simpler is better. A small
   median_ms gain that adds ugly complexity isn't worth it. Removing
   code and getting equal-or-better results is a great outcome.
+- **Stack leverage > reinvention.** Use modern torchao / Triton /
+  PyTorch features when they unlock something rather than rebuilding
+  from raw CUDA. Cross-arch design references (Megakernels'
+  persistent-CTA shape, ThunderKittens' producer/consumer split) are
+  read for sub-patterns; their code is not ported. See
+  `docs/roadmap.md` "Stack leverage opportunities" + "External
+  design references."
+- **Cross-clone coordination discipline.** Tight memo protocol with
+  the audio-loop consumer-side claude: durable-surface-first for
+  substantive numbers (commit to CHANGELOG / docs before the memo
+  references them), `supersedes: <timestamp>` prefix on retractions,
+  check the outbox-mirror directly when the inbox looks stale.
 - **Honest about what's V1.** See "What we might be wrong about."
 
 ## Where to go next
@@ -182,16 +262,26 @@ and we add a perceptual layer.
   metric" — the full perf-research framework: side-effect checks,
   next-experiment patterns, what we ignore and the trigger that
   would change that.
+- [`docs/perf_research_framework.md`](./docs/perf_research_framework.md)
+  — the methodology framework in full: synthetic-vs-in-pipeline 2x2
+  matrix (Cell A/B/C/D), evidence ladder for kernel-replacement
+  audits, rung-2 silent-fallback-pattern enumeration.
+- [`docs/roadmap.md`](./docs/roadmap.md) — forward-looking record
+  of directions worth pursuing, tiered by relevance and trigger-
+  conditional. Includes Stack leverage opportunities (torchao,
+  Triton 3.7, PyTorch 2.12) + External design references
+  (Megakernels, ThunderKittens) sections. Not a committed schedule;
+  the user remains the scheduler.
 - [`internal/PLAN.md`](./internal/) (gitignored) — live operational
   doc. Backlog with triggers, experiment log (TSV), the research
   loop. Edit every session.
 - [`CHANGELOG.md`](./CHANGELOG.md) — versioned divergence record,
-  Known kernel bugs, Decision log.
+  Known kernel bugs, Decision log, Workload intel.
 
 ## What we might be wrong about
 
 The metric and framework reflect the workload mix on this box as of
-2026-04-26. Four candid limitations:
+2026-05-19. Four candid limitations:
 
 1. **The "LTX self-attn dominates" assumption is workload-specific.**
    If a new model class with fundamentally different attention
@@ -209,19 +299,58 @@ The metric and framework reflect the workload mix on this box as of
    (PSNR / SSIM / LPIPS).
 3. **Kernel ms is not gen ms.** A 2× kernel speedup is invisible
    end-to-end if attention is already < 50 % of step time.
-   **Status: confirmed (with refinement) per v0.5.1.** First e2e
-   measurement on the canonical LTX 2.3 audio-loop workload
-   (832×480×497 / 25fps / 8-step distilled): sage's 2.66×
-   kernel-row speedup translates to **1.22× end-to-end**, with
-   attention at 8.2% of wall. Pure-attention Amdahl predicts
-   ~1.05×; observed 1.22× is +17 points higher because sage's
-   reach extends beyond the per-call attention rows into
-   FFN-adjacent amortization within the sampler step. Concrete
-   answer: kernel work IS justified; the simplification "kernel
-   ms = gen ms" isn't literally true; non-attention bottlenecks
-   (VAE decode, caching, scheduler overhead) are where the next
-   round of e2e wins routes. See CHANGELOG v0.5.1 for the
-   measurement detail.
+   **Status: confirmed (with two refinements).**
+
+   *v0.5.1 first e2e measurement* on the canonical LTX 2.3 audio-
+   loop workload (832×480×497 / 25fps / 8-step distilled): sage's
+   2.66× kernel-row speedup translates to **1.22× end-to-end**,
+   with attention at 8.2% of wall. Pure-attention Amdahl predicts
+   ~1.05×; observed 1.22× is +17 points higher because sage's reach
+   extends beyond the per-call attention rows into FFN-adjacent
+   amortization within the sampler step.
+
+   *v0.6 sage_ffn e2e walk-back* on a two-sampler LTX FML2V
+   workflow (CHANGELOG v0.6.0): synthetic kernel-bench projected
+   1.26-1.36× vs torch fp8-dequant reference, but the in-pipeline
+   A/B came back **+1.79% e2e SLOWER** (+20% per-call at stage-2).
+   Root cause was L2 cache contention with neighboring attention
+   modules + cumulative kernel-launch overhead at LTX's ~1000-FFN-
+   calls/render count. **This is the cost of running synthetic-
+   first / in-pipeline-validate-later** for kernel work with
+   structural risk that synthetic bench specifically can't measure
+   (L2 contention, dispatch overhead, fragmentation, sustained
+   thermal). Codified as the discipline rule in CLAUDE.md
+   "Gate ship-decisions on in-pipeline A/B when synthetic-bench
+   can't measure the dominant cost." Going forward, kernel-day
+   work with this risk shape gates the v0.X ship commit on in-
+   pipeline A/B BEFORE the commit lands, not after.
+
+   *v0.6 Cell C verdict at the per-kernel level (2026-05-19).* With
+   the consumer-side integration chain fully closed (six bugs across
+   two A/B cycles) and sage_ffn dispatching end-to-end, the v0.6
+   synthetic-vs-production gap was measured at the per-stage kernel
+   boundary: sage_ffn is 22% slower at stage-1 (T=10780) and 5%
+   slower at stage-2 (T=42240) vs production stock fp8, despite
+   synthetic isolation showing 1.39x / 1.60x sage advantage at the
+   same shapes. **Production has the sign flipped.** The gap is not
+   framework overhead -- it sits at the kernel boundary itself. Two
+   open hypotheses (CHANGELOG Decision log): stock comparand
+   identity (synthetic vs `torch._scaled_mm`, production vs
+   `comfy.ops.fp8_linear`), and sage autotune state under
+   interleaved dispatch. Neither is a sage correctness bug; the
+   kernel works as designed and the bench just isn't measuring the
+   production-relevant thing.
+
+   Concrete answer at the VISION level: kernel work IS justified
+   per v0.5.1; the simplification "kernel ms = gen ms" isn't
+   literally true; non-attention bottlenecks (VAE decode, caching,
+   scheduler overhead) are where the next round of e2e wins routes;
+   synthetic-bench projections need in-pipeline validation before
+   being claimed as e2e wins, especially for per-call-heavy
+   primitives; and the in-pipeline validation needs to verify the
+   *comparand* is what production actually runs, not just an
+   isolated reference. v0.6 Cell C exposed comparand-identity as
+   the hidden assumption synthetic bench glosses over.
 4. **The next-experiment framework is V1.** It codifies a strategy;
    the strategy hasn't been validated by running through it on a
    real perf change yet. The first time we use it to pick a
