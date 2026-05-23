@@ -1,18 +1,26 @@
-last updated: 2026-05-19 (mission reframe: ComfyUI workload optimization on sm89; sage attention is one tool in the kit)
+last updated: 2026-05-23 (library reframe: a sm89 kernel library for ComfyUI consumer workloads, consumed by a personal repo ecosystem; sage attention is one module in it)
 
 # sage-fork
 
-*sm89 kernel optimization for ComfyUI consumer workloads.*
+*A sm89 kernel library for ComfyUI consumer workloads.*
 
-A sm89 / RTX 4090 kernel optimization and measurement surface for
-**ComfyUI consumer workloads**. The mission is to make the workflows
-we actually run faster, more memory-efficient, and more measurable --
-anchored in DiT-class diffusion (LTX 2.3 video, Flux / Z-Image image
-gen) and expanding to multi-modal pipelines (audio-conditioned video,
-cross-modal attention, two-pass tensor-loop samplers) as those become
-consumer workload classes worth attacking. The DiT and LLM worlds are
-converging; we expect new workload shapes over time and structure the
-work to absorb them.
+A sm89 / RTX 4090 **kernel library** for **ComfyUI consumer workloads** --
+a coherent set of quantized kernels (attention, fp8 MLP, RoPE, and the
+fp8/int8 quant primitives underneath) consumed *as a library* by a
+personal repo ecosystem (today: the audio-loop consumer node; more
+over time). Structurally this is the shape comfy-kitchen takes -- one
+library, many primitives, a clean consumable boundary -- scoped to sm89.
+The name "sage-fork" is historical: sage attention is the founding
+module, not the whole library, and the `sageattention` import name is
+kept because the ecosystem pins it.
+
+The mission is to make the workflows we actually run faster, more
+memory-efficient, and more measurable -- anchored in DiT-class diffusion
+(LTX 2.3 video, Flux / Z-Image image gen) and expanding to multi-modal
+pipelines (audio-conditioned video, cross-modal attention, two-pass
+tensor-loop samplers) as those become consumer workload classes worth
+attacking. The DiT and LLM worlds are converging; we expect new workload
+shapes over time and structure the work to absorb them.
 
 Sage attention is the historical foundation and remains a primary
 deliverable. v0.6 added `sage_ffn` (fp8 MLP fusion). Forward directions
@@ -162,12 +170,16 @@ and we add a perceptual layer.
 
 ## What we ARE
 
-- **A kernel set for ComfyUI sm89 workloads.** Attention (sage's
-  historical core) + `sage_ffn` (v0.6 fp8 MLP) + `fused_rope_split`.
+- **A kernel library for ComfyUI sm89 workloads.** A coherent,
+  consumable set of primitives -- attention (sage's founding module)
+  + `sage_ffn` (v0.6 fp8 MLP) + `fused_rope_split` + the fp8/int8
+  quant primitives underneath -- with a versioned public API that
+  sibling repos depend on (today: the audio-loop consumer node).
   Forward: VAE fp8 fusion, cross-modal attention coverage, GeGLU
   sage_ffn extension, persistent-CTA rewrites, and whatever the
   measurement says next. All sm89-bounded. The repo name is "sage-
-  fork" for historical reasons; the substantive scope is broader.
+  fork" for historical reasons; sage attention is one module, not the
+  whole library.
 - **A bench harness** that measures attention kernels at DiT shapes.
   Sage variants (5 modes), SpargeAttention, FlashInfer, three torch
   SDPA backends — every row prints every run. Expanding to new
@@ -204,9 +216,13 @@ and we add a perceptual layer.
   text-conditioned video, multimodal pipelines), shared kernel
   surfaces (attention, FFN, normalization) are in scope on sm89; we
   just don't ship an autoregressive serving stack.
-- **A polished public release.** Solo-hobbyist scope. README +
-  CHANGELOG + roadmap + perf-research framework are sufficient.
-  Revisit only if audience shifts.
+- **A polished public release.** A library for a *personal* repo
+  ecosystem, not a published PyPI package. The "consumable boundary"
+  is for the maintainer's own sibling repos (the audio-loop consumer
+  node today),
+  not external users -- solo-hobbyist scope. README + CHANGELOG +
+  roadmap + perf-research framework are sufficient. Revisit only if
+  audience shifts.
 - **A perf consultancy for individual workloads.** If a model class
   brings a head_dim or sequence pattern outside our coverage, the
   fix is a new bench row + a methodology cycle, not a workload-

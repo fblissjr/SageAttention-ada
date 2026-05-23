@@ -656,7 +656,7 @@ Megakernels' shape would be 4-8 weeks and not worth it.
   CHANGELOG + this roadmap are sufficient. Revisit if scope shifts
   toward broader audience.
 
-## Repo structure (open question)
+## Repo structure (RESOLVED 2026-05-23: single library, keep the name)
 
 Three plausible structures for new kernel work beyond sage attention
 + sage_ffn:
@@ -672,12 +672,22 @@ Three plausible structures for new kernel work beyond sage attention
    the first member. Most polish work; cleanest long-term if scope
    grows significantly.
 
-**Current prior:** adjacent repos for new kernel projects (#1).
-Sage-fork stays primitive per VISION. With Tier 1.1 retired in
-favor of consuming the consumer-side `inspect_run.py`, the
-first-candidate-for-sibling-repo slot is open; the next concrete
-candidate is whatever Tier 2.5 (ComfyUI quant compat shim) becomes
-if it splits into its own package.
+**Resolved 2026-05-23 (user, library reframe):** option 2 (subpackages
+in one library). This repo IS the kernel library; new primitives land
+as modules within it (`sage_ffn`, `fused_rope`, future VAE / cross-modal,
+the fp8/int8 quant primitives), NOT as adjacent repos. The library is
+consumed by sibling consumer repos (the audio-loop consumer node
+today) via a
+versioned public API -- the surface enumerated in the consumer-API
+contract (`internal/comfy_kitchen_pr42_comparison.md`). The
+`sageattention` import name is kept (the ecosystem pins it); the library
+identity is a perspective + API-surface commitment, not a rename -- see
+VISION "What we ARE". This supersedes the prior "adjacent repos / stay
+primitive" lean. Option 3 (a renamed umbrella package with `sageattention`
+demoted to a submodule) stays available as a later step if the name
+mismatch becomes worth a migration; the binding-boundary spike (Tier 2.6)
+is the natural moment to revisit it, since it already touches the public
+surface.
 
 ## What we might be wrong about
 
