@@ -1,20 +1,26 @@
 """A/B: comfy-kitchen's fp32 PV-accum config vs our fp32+fp16 (2++) default.
 
-Substantiates the "2++ is the Ada speed win" claim from the comfy-kitchen
-PR #42 comparison (internal/comfy_kitchen_pr42_comparison.md) on the actual
-4090, isolating the single variable that differs: the PV accumulation config.
+Substantiates the "2++ is the Ada speed win" claim (recorded in the
+CHANGELOG Decision log) on the actual 4090: compares the two configs as
+they are actually instantiated in core.py.
 
 comfy-kitchen #42 instantiates qk_int_sv_f8_attn_kernel with
 DTypeSVAccum=float, use_inst_buffer=false, use_pv_fp16_accu=false,
-fuse_v_scale=true. That maps EXACTLY to our
+fuse_v_scale=true. That maps to our
 pv_accum_dtype="fp32" -> qk_int8_sv_f8_accum_f32_fuse_v_scale_attn.
 Our dispatcher default on sm89 is pv_accum_dtype="fp32+fp16" (2++).
 
-Same kernel template, same quant inputs, same shape -- only the accum
-config changes. So any speed/rtol delta here is attributable to the
-accum choice, not to binding/quant/packaging differences. This is a
-cleaner isolation than building comfy-kitchen (which would confound the
-accum delta with their different quant kernels + nanobind boundary).
+NOT a single-variable isolation: the 2++ config co-varies TWO things vs
+the fp32 config -- the PV accumulation dtype (fp16 vs fp32) AND the V
+quantization scale_max (core.py:1108-1110 uses 2.25 for fp32+fp16 vs
+448.0 otherwise, to keep the fp16 PV accumulator from overflowing). Both
+are bundled into what "2++" IS, so this measures the real
+comfy-kitchen-vs-ours comparand PAIR, not an isolated accum knob. The
+1.20x speed delta is a throughput effect of the accum dtype (scale_max
+doesn't change the kernel's MMA work); the rtol reflects the full config
+including the V-quant difference. Still a cleaner read than building
+comfy-kitchen (which would add their quant kernels + nanobind boundary
+on top).
 
 Reuses the load-bearing shape + accuracy_metrics + time_and_vram from
 tests/test_sageattn_ltx_shapes.py so the numbers are comparable to the
@@ -61,8 +67,8 @@ def main() -> None:
     shape = next(s for s in SHAPES if s.name == LOAD_BEARING)
     print(
         f"shape={shape.name}  B={shape.batch} H={shape.heads} "
-        f"N={shape.seq_q} D={shape.head_dim} causal={getattr(shape, 'is_causal', False)} "
-        f"dtype={DTYPE}\n"
+        f"N={shape.seq_q} D={shape.head_dim} has_mask={shape.has_mask} "
+        f"dtype={DTYPE} (run: is_causal=False, no mask)\n"
     )
 
     q, k, v = make_qkv(shape, DTYPE)

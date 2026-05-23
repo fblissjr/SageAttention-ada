@@ -170,16 +170,17 @@ and we add a perceptual layer.
 
 ## What we ARE
 
-- **A kernel library for ComfyUI sm89 workloads.** A coherent,
-  consumable set of primitives -- attention (sage's founding module)
-  + `sage_ffn` (v0.6 fp8 MLP) + `fused_rope_split` + the fp8/int8
-  quant primitives underneath -- with a versioned public API that
-  sibling repos depend on (today: the audio-loop consumer node).
-  Forward: VAE fp8 fusion, cross-modal attention coverage, GeGLU
-  sage_ffn extension, persistent-CTA rewrites, and whatever the
-  measurement says next. All sm89-bounded. The repo name is "sage-
-  fork" for historical reasons; sage attention is one module, not the
-  whole library.
+- **A kernel library for ComfyUI sm89 workloads.** A coherent set of
+  primitives -- attention (sage's founding module) + `sage_ffn` (v0.6
+  fp8 MLP) + `fused_rope_split` (the fp8/int8 quant lives inside these
+  kernels, not as separately-importable ops) -- with a documented
+  import surface (the de-facto public symbols in
+  `docs/downstream_symbols.md`) that its sibling consumer node pins
+  (today: the audio-loop node). Forward: VAE fp8 fusion, cross-modal
+  attention coverage, GeGLU sage_ffn extension, persistent-CTA
+  rewrites, and whatever the measurement says next. All sm89-bounded.
+  The repo name is "sage-fork" for historical reasons; sage attention
+  is one module, not the whole library.
 - **A bench harness** that measures attention kernels at DiT shapes.
   Sage variants (5 modes), SpargeAttention, FlashInfer, three torch
   SDPA backends — every row prints every run. Expanding to new
@@ -218,7 +219,7 @@ and we add a perceptual layer.
   just don't ship an autoregressive serving stack.
 - **A polished public release.** A library for a *personal* repo
   ecosystem, not a published PyPI package. The "consumable boundary"
-  is for the maintainer's own sibling repos (the audio-loop consumer
+  is for the maintainer's own sibling consumer node (the audio-loop
   node today),
   not external users -- solo-hobbyist scope. README + CHANGELOG +
   roadmap + perf-research framework are sufficient. Revisit only if

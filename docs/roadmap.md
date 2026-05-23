@@ -329,14 +329,13 @@ the v0.6.4 single-utility version covers the immediate case; this
 is "round out the shim into a more general surface as new
 conventions surface."
 
-**Technical shape:** either (a) keep as a subpackage of
-`sageattention` and add new probe functions (`extract_int8_weight_and_scale`,
-`extract_quantized_bias`, etc.) as ComfyUI conventions surface, OR
-(b) split into a sibling repo (`comfyui-quant-compat` or similar)
-that has no sage dependency and can be vendored by consumers that
-don't want a sage import. Repo-structure question is open per the
-existing "Repo structure" section below; current prior is
-subpackage-of-sageattention.
+**Technical shape:** keep as a subpackage of `sageattention` and add
+new probe functions (`extract_int8_weight_and_scale`,
+`extract_quantized_bias`, etc.) as ComfyUI conventions surface. Per the
+2026-05-23 "Repo structure" resolution (single library, subpackages,
+NOT adjacent repos), the once-considered "split into a standalone
+`comfyui-quant-compat` repo" option is off the table unless a consumer
+that wants the probe with *no* sage dependency actually surfaces.
 
 **Effort:** ~3 hours per added probe function (matching the v0.6.4
 estimate). Test coverage via mock-objects pattern established in
@@ -361,9 +360,9 @@ and a `stream_ptr`, tensors cross the boundary via DLPack capsules,
 and the compiled `_C` extension has no libtorch ABI dependency.
 
 **Why:** an external existence-proof landed (a SageAttention port
-using exactly this architecture -- see
-`internal/comfy_kitchen_pr42_comparison.md`). The boundary dissolves
-three of this fork's standing liabilities at once:
+using exactly this architecture -- see the comfy-kitchen PR evaluation
+in the CHANGELOG Decision log). The boundary dissolves three of this
+fork's standing liabilities at once:
 
   1. **Editable-install fragility.** The setup.py packaging-
      regression fix (the load-bearing reason the fork exists) is a
@@ -402,8 +401,8 @@ consumer node, 2026-05-23): `sageattn()`,
 `get_last_dispatched_kernel()`, `core.get_cuda_arch_versions()`,
 `KNOWN_KERNEL_NAMES`. Spike passes only if all of these import and
 behave identically post-swap, with the masked fp8++ path verified
-bit-identical (uint16-view equality per CLAUDE.md). Full contract table
-in `internal/comfy_kitchen_pr42_comparison.md`.
+bit-identical (uint16-view equality per CLAUDE.md). The canonical
+public-surface inventory is `docs/downstream_symbols.md`.
 
 **Effort:** ~1-day spike for the single-kernel proof. Full-surface
 port (7 sm89 variants + fused + the FFN/RoPE Triton entries, which
@@ -674,15 +673,14 @@ Three plausible structures for new kernel work beyond sage attention
 
 **Resolved 2026-05-23 (user, library reframe):** option 2 (subpackages
 in one library). This repo IS the kernel library; new primitives land
-as modules within it (`sage_ffn`, `fused_rope`, future VAE / cross-modal,
-the fp8/int8 quant primitives), NOT as adjacent repos. The library is
-consumed by sibling consumer repos (the audio-loop consumer node
-today) via a
-versioned public API -- the surface enumerated in the consumer-API
-contract (`internal/comfy_kitchen_pr42_comparison.md`). The
-`sageattention` import name is kept (the ecosystem pins it); the library
-identity is a perspective + API-surface commitment, not a rename -- see
-VISION "What we ARE". This supersedes the prior "adjacent repos / stay
+as modules within it (`sage_ffn`, `fused_rope`, future VAE / cross-modal;
+the fp8/int8 quant stays inside the kernels, not as separate ops), NOT as
+adjacent repos. The library is consumed by its sibling consumer node (the
+audio-loop node today; more if the ecosystem grows) via a documented
+import surface -- the de-facto public symbols in
+`docs/downstream_symbols.md`. The `sageattention` import name is kept
+(the consumer pins it); the library identity is a perspective +
+API-surface commitment, not a rename -- see VISION "What we ARE". This supersedes the prior "adjacent repos / stay
 primitive" lean. Option 3 (a renamed umbrella package with `sageattention`
 demoted to a submodule) stays available as a later step if the name
 mismatch becomes worth a migration; the binding-boundary spike (Tier 2.6)
