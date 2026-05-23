@@ -367,6 +367,59 @@ spend on a "kernel-side gap" finding.
 Investigations that closed without action. Recorded so we don't
 re-derive them. Each entry has an explicit reopen-trigger.
 
+### comfy-kitchen SageAttention port evaluated: stay, adopt one technique (binding boundary)
+
+**Closed 2026-05-23.** An external SageAttention port landed in
+Comfy-Org's `comfy-kitchen` kernel library (NVIDIA-authored). It
+vendors the same upstream thu-ml sm89 kernel we fork, so the question
+was whether its approach obsoletes any of our core components.
+
+Verdict: **stay on every user-facing component; adopt exactly one
+technique.** Reasoning, grounded in measurement and the consumer
+contract:
+
+- **Kernel config.** The port ships pure-FP32 PV accumulation
+  (SageAttention 2; kernel template `use_pv_fp16_accu=false`). Our
+  sm89 default is `pv_accum_dtype="fp32+fp16"` (2++). Measured on a
+  4090 at the load-bearing LTX shape (`tests/spikes/spike_accum_config_ab.py`,
+  commit `5a9c3f4`): **2++ is 1.20x faster (+16.6% wall) at
+  indistinguishable mean_rtol** (0.0980 vs 0.0979). Backing away from
+  our config would be a measured regression.
+- **Masking.** The port is causal/none-only; our v0.5.5 fp8++ kernel
+  has the general additive-mask path. A static diff of the vendored
+  `.cuh` confirms theirs is upstream-verbatim-minus-torch with no mask
+  params; ours carries `DTypeMask` + `mask_ptr`. The downstream
+  consumer node's headline feature is masked LTX cross-attn on the
+  CUDA kernel -- the port cannot run it.
+- **API surface.** The consumer depends on our Python surface
+  (`sageattn()`, the named kernel exports, `pv_accum_dtype`,
+  `attn_mask`, `get_last_dispatched_kernel()`,
+  `core.get_cuda_arch_versions()`, `KNOWN_KERNEL_NAMES`). The port
+  exposes one `sage_sdpa(q,k,v,is_causal,smooth_k)` with none of these.
+  Convergence is a non-starter; the port can't execute the workload.
+- **The one adoptable technique:** its torch-free nanobind/DLPack
+  binding boundary (no libtorch ABI coupling, stable-ABI wheels,
+  cleaner `torch.compile` story). Captured as roadmap Tier 2.6. The
+  consumer-API surface above is the spike's acceptance criterion --
+  the swap is invisible iff that surface survives bit-identical.
+
+Also considered and **not adopted**: the port's fused CUDA K-mean
+reduction (it fuses `k.mean()` into CUDA; we do it as a torch op then
+fuse only the subtraction). Leverage estimate: the K-mean is a
+memory-bound reduction of the K tensor (~188 MiB at the load-bearing
+shape) -- sub-0.1 ms against a ~20 ms attention kernel, i.e. <1%.
+Below the kernel-day threshold; not worth the CUDA surface.
+
+Full comparison + the measured A/B + the verified header diff:
+`internal/comfy_kitchen_pr42_comparison.md` (gitignored).
+
+**Reopen-trigger:** the binding-boundary spike (Tier 2.6) fires on its
+own triggers (a `torch.compile` consumer ask, an editable-install
+breakage on a torch/CUDA bump, or an interop decision). The
+stay-on-config verdict reopens only if a future port closes the 1.20x
+gap (e.g. ships a 2++-equivalent accum) AND gains a mask path -- at
+which point the comparison is re-run.
+
 ### v0.6 sage_ffn Cell C verdict (synthetic-vs-production gap concentrates at the kernel boundary)
 
 **Closed 2026-05-19** after a multi-cycle cross-clone diagnostic

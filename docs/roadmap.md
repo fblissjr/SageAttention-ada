@@ -391,6 +391,20 @@ full-surface port get scoped. The four-place-coupling discipline
 (CLAUDE.md) changes shape but does not disappear -- a DLPack signature
 is still a multi-site change.
 
+**Acceptance criterion (the real gate, not "does nanobind work"):**
+the downstream consumer node depends on the *Python API surface*, never
+on the compiled extension directly -- so the swap is invisible iff that
+surface survives bit-identical. The pinned surface (verified from the
+consumer node, 2026-05-23): `sageattn()`,
+`sageattn_qk_int8_pv_fp8_cuda(..., pv_accum_dtype=, attn_mask=)`,
+`sageattn_qk_int8_pv_fp16_cuda(..., pv_accum_dtype="fp32")`,
+`sageattn_qk_int8_pv_fp16_triton`, the masked fp8++ CUDA path (v0.5.5),
+`get_last_dispatched_kernel()`, `core.get_cuda_arch_versions()`,
+`KNOWN_KERNEL_NAMES`. Spike passes only if all of these import and
+behave identically post-swap, with the masked fp8++ path verified
+bit-identical (uint16-view equality per CLAUDE.md). Full contract table
+in `internal/comfy_kitchen_pr42_comparison.md`.
+
 **Effort:** ~1-day spike for the single-kernel proof. Full-surface
 port (7 sm89 variants + fused + the FFN/RoPE Triton entries, which
 are already torch-light) is multi-week and gated on the spike +
