@@ -1,6 +1,6 @@
 # Roadmap
 
-Last updated: 2026-05-19
+Last updated: 2026-05-23
 
 Forward-looking record of directions worth pursuing on this fork --
 ranked by relevance to the current workload, technically scoped, and
@@ -350,6 +350,70 @@ trap on a different attribute (e.g. bias storage convention).
 Three-incident threshold rather than two because the methodology
 fold from v0.6.4 + the framework rung 2 expansion together cover
 the single-utility case adequately.
+
+### 2.6 Torch-free binding boundary (nanobind + DLPack) evaluation
+
+**What:** evaluate replacing the PyTorch C++ extension binding
+layer (`csrc/qattn/pybind_sm89.cpp` + `sm89_compile.py`'s
+`@torch.library.custom_op` + pybind) with a torch-free
+**nanobind + DLPack** boundary -- kernels take raw device pointers
+and a `stream_ptr`, tensors cross the boundary via DLPack capsules,
+and the compiled `_C` extension has no libtorch ABI dependency.
+
+**Why:** an external existence-proof landed (a SageAttention port
+using exactly this architecture -- see
+`internal/comfy_kitchen_pr42_comparison.md`). The boundary dissolves
+three of this fork's standing liabilities at once:
+
+  1. **Editable-install fragility.** The setup.py packaging-
+     regression fix (the load-bearing reason the fork exists) is a
+     symptom of torch-extension build coupling. A torch-free
+     extension sidesteps the entire class -- stable ABI for py3.12+,
+     pure-python fallback wheel, no libtorch link.
+  2. **`torch.compile` graph-breaks.** `docs/torch_compile_spike.md`
+     documented Dynamo breaking at our pybind sites. A DLPack
+     boundary with a `torch.library` custom-op shim on top has a
+     cleaner story for staying in-graph (re-spike to confirm).
+  3. **Build/maintenance weight.** Decouples kernel compilation from
+     the installed torch version; reduces "rebuild on every torch
+     bump" churn.
+
+**Technical shape:** spike first on ONE kernel (the sm89 attention
+entry), do not port the whole surface up front. Confirm: (a) imports
+with no libtorch symbol, (b) dispatches on the caller's current
+stream (the `at::cuda::getCurrentCUDAStream()` discipline becomes a
+passed-in `stream_ptr` -- re-audit the v0.6.1 stream-safety fix
+under the new boundary), (c) rtol-matches the existing kernel on the
+load-bearing LTX shape, (d) the `@torch.library.custom_op` +
+`register_fake` shim still composes for consumers that wrap sage in
+`torch.compiler.disable()`. Only after the spike passes does the
+full-surface port get scoped. The four-place-coupling discipline
+(CLAUDE.md) changes shape but does not disappear -- a DLPack signature
+is still a multi-site change.
+
+**Effort:** ~1-day spike for the single-kernel proof. Full-surface
+port (7 sm89 variants + fused + the FFN/RoPE Triton entries, which
+are already torch-light) is multi-week and gated on the spike +
+trigger. Carries real risk: this rewrites the load-bearing binding
+layer, so the spike must prove the rtol + stream-safety + custom-op-
+shim story before any commitment.
+
+**Trigger to act (spike):** any one of -- (a) `torch.compile`
+compatibility becomes a concrete consumer ask (Tier 3.3 fires from
+the same trigger), (b) an editable-install / torch-bump breakage
+recurs on a CUDA or torch version bump, (c) a decision is needed on
+whether to converge with the official Comfy-Org kernel-library
+boundary for interop vs stay independent. The spike is cheap enough
+(~1 day) that any single trigger justifies it; the full port stays
+gated on the spike result.
+
+**Strategic note:** the existence-proof is NVIDIA contributing
+SageAttention into Comfy-Org's official kernel library. If that
+becomes the de-facto consumer path, the question shifts from "should
+we adopt this boundary" to "do we differentiate at the binding layer
+at all, or contribute the Ada-specific config (2++) + mask + FFN
+breadth upstream and converge." That is a VISION-level question, not
+just a roadmap item -- flagged here, decided there.
 
 ## Tier 3: Lower-relevance, real but conditional
 
