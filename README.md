@@ -1,13 +1,16 @@
-last updated: 2026-05-19
+last updated: 2026-05-23
 
 # sage-fork
 
 *sm89 kernel optimization for ComfyUI consumer workloads.*
 
 *Based on [SageAttention](https://github.com/thu-ml/SageAttention) by thu-ml,
-via [woct0rdho's fork](https://github.com/woct0rdho/SageAttention). This
-project has diverged substantially since and is no longer a thin patch
-on either; treat it as its own thing.*
+via [woct0rdho's fork](https://github.com/woct0rdho/SageAttention), with
+low-level CUDA primitives adapted from
+[FlashInfer](https://github.com/flashinfer-ai/flashinfer). This project has
+diverged substantially since and is no longer a thin patch on either; treat
+it as its own thing. Full attribution in [NOTICE](NOTICE); Apache-2.0 per the
+upstream lineage.*
 
 A sm89 / RTX 4090 kernel optimization and measurement surface for
 ComfyUI consumer workloads. The mission is to make the workflows we

@@ -1,0 +1,57 @@
+sage-fork
+
+This project is a fork of SageAttention, scoped to sm89 (Ada / RTX 4090)
+kernel optimization for ComfyUI consumer workloads. It is licensed under
+the Apache License, Version 2.0 (see LICENSE), consistent with the
+licensing of the upstream projects it derives from.
+
+================================================================================
+
+This software incorporates and derives from the following third-party
+projects. Their original copyright and Apache-2.0 license headers are
+preserved in the individual source files.
+
+--------------------------------------------------------------------------------
+SageAttention
+--------------------------------------------------------------------------------
+Copyright (c) 2024 by SageAttention team.
+License: Apache-2.0
+Website: https://github.com/thu-ml/SageAttention
+
+The attention CUDA kernels (csrc/qattn/), the fused quantization kernels
+(csrc/fused/), and the Triton quantization + attention kernels
+(sageattention/triton/) are derived from SageAttention. This fork reaches
+SageAttention by way of woct0rdho's fork
+(https://github.com/woct0rdho/SageAttention), which carried the source
+build / sm89 packaging work this fork builds on. The fork has diverged
+substantially since (general-mask CUDA path, fp8 fused MLP, fused RoPE,
+ComfyUI fp8 storage shims) and is no longer a thin patch on either parent.
+
+--------------------------------------------------------------------------------
+FlashInfer
+--------------------------------------------------------------------------------
+Copyright (c) 2023 by FlashInfer team.
+License: Apache-2.0
+Website: https://github.com/flashinfer-ai/flashinfer
+
+Several low-level CUDA primitives that SageAttention (and therefore this
+fork) builds on are adapted from FlashInfer v0.1.5 -- notably the MMA
+wrappers (csrc/mma.cuh), the cp.async helpers (csrc/cp_async.cuh), the
+permuted shared-memory layout (csrc/permuted_smem.cuh), and related
+utility headers. Each such file retains the FlashInfer copyright notice
+alongside the SageAttention modification notice.
+
+--------------------------------------------------------------------------------
+PyTorch
+--------------------------------------------------------------------------------
+Copyright (c) 2016-present, Meta Platforms, Inc. and PyTorch contributors
+License: BSD-3-Clause
+Website: https://pytorch.org/
+
+PyTorch is a runtime dependency. The CUDA extensions are currently built
+as PyTorch C++ extensions.
+
+================================================================================
+
+For the full text of the Apache License, Version 2.0, see the LICENSE file
+in this repository or https://www.apache.org/licenses/LICENSE-2.0.
