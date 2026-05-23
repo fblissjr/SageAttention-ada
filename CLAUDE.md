@@ -187,7 +187,10 @@ mode is `pv_accum_dtype="fp32+fp32"` (inst-buffer), NOT pure `fp32` --
 the pure-FP32 PV-accum config (SageAttention 2 / external-port
 comparand) is `pv_accum_dtype="fp32"` ->
 `qk_int8_sv_f8_accum_f32_fuse_v_scale_attn`; our default `fp8_cuda++`
-is `fp32+fp16`.
+is `fp32+fp16`. Comparing accum configs is a config-PAIR A/B, NOT a
+single-variable isolation: `fp32+fp16` also co-varies the V-quant
+`scale_max` (`core.py:1108-1110` -> 2.25 vs 448.0), so it changes the
+quantized V tensor, not just the PV-accum dtype.
 
 Reuse `accuracy_metrics` from `tests/test_sageattn_ltx_shapes.py:160`
 for rtol/atol comparisons (symmetric denominator; matches every
