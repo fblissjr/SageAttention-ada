@@ -73,6 +73,18 @@ on sm89 fp8++: 2026-05-13 (v0.5.5).
 Real open TODOs. Each has an explicit trigger-to-act; we don't do these
 speculatively.
 
+### Retire the nvcc-13.3 CUDA-toolkit guard once a fixed nvcc ships
+
+`build.sh` carries a `KNOWN_BAD_CUDA=" 13.3 "` blocklist that
+auto-switches the build off nvcc 13.3 (it miscompiles PyTorch >=2.12
+headers via a cudafe++ front-end regression; full A/B in v0.6.6).
+**Trigger:** a 13.3 patch or 13.4+ toolkit whose `nvcc --version` still
+reports a blocklisted version but compiles the same-TU repro clean.
+**Action:** drop the fixed version from `KNOWN_BAD_CUDA`; if the set
+empties, remove the guard block entirely. **Verify:** put the
+previously-broken toolkit first on `PATH` and confirm a `.cu` including
+`<ATen/core/function_schema.h>` compiles (the repro from v0.6.6).
+
 ### Persistent-CTA hybrid for stage-2 attention (highest e2e leverage; v0.7 candidate)
 
 After v0.6.0's production A/B, a downstream consumer characterized
@@ -782,6 +794,52 @@ a sage-fork kernel push with data. Until then the raw JSONL is
 sufficient.
 
 ## Versions
+
+### v0.6.6 -- 2026-06-26  (build robustness: `build.sh` auto-avoids the nvcc 13.3 / PyTorch-header miscompile)
+
+Build-tooling hardening, no kernel or wrapper change.
+
+**nvcc 13.3 miscompiles PyTorch >=2.12 headers.** On a box where the
+default CUDA toolkit is 13.3, every `.cu` fails during the build with a
+spurious error in PyTorch's own header (not sage source):
+
+```
+ATen/core/List_inl.h:202: error: need 'typename' before
+'decltype(...)::difference_type' because '...' is a dependent scope
+```
+
+It is a cudafe++ front-end regression in nvcc 13.3, not a host-compiler
+or sage-source problem: the pure-g++ `.cpp` compiles pass, only the
+nvcc-driven `.cu` compiles fail. Confirmed by a same-translation-unit
+A/B -- a minimal `.cu` including `<ATen/core/function_schema.h>` fails
+under `/usr/local/cuda-13.3/bin/nvcc` and compiles clean (exit 0) under
+`/usr/local/cuda-13.2/bin/nvcc`, with the host g++ (13.3) and torch
+headers held constant. PyTorch here is `2.12.1+cu132` (built against
+CUDA 13.2), so 13.2 is also the matched build toolkit.
+
+**Fix: build with 13.2, run on the 13.3 driver.** A 13.2-compiled `.so`
+runs natively on a 13.3 driver -- CUDA drivers are backward-compatible,
+so there is no Ada runtime cost. `build.sh` now detects a known-broken
+active toolkit (`KNOWN_BAD_CUDA=" 13.3 "`) and auto-switches the build
+to the newest installed toolkit under `/usr/local/cuda-*` that is not in
+the broken set, logging the switch. It overrides even a pre-exported
+`CUDA_HOME=/usr/local/cuda` that points at the broken default -- a global
+`CUDA_HOME` is common and can't be trusted as an intentional pin when it
+resolves to a broken nvcc (this was the actual failure mode on the test
+box). Overrides: pick a different toolkit with
+`CUDA_HOME=/usr/local/cuda-X.Y ./build.sh`, or force the broken one with
+`SAGE_SKIP_CUDA_GUARD=1`. Remove 13.3 from the set once NVIDIA ships a
+fixed nvcc.
+
+**Also documented the torch-upgrade footgun.** `uv pip install -e . -U`
+(bare, no `--no-deps`) silently upgraded torch 2.11 -> 2.12.1 over
+ComfyUI's pinned build. `build.sh` passes `--no-deps --force-reinstall`
+specifically to avoid this; CLAUDE.md Install / build now says to use
+`build.sh`, not the bare `uv pip install` form, and to rebuild sage
+after any deliberate torch upgrade (the `.so` is bound to torch's C++
+ABI). Post-rebuild, the load-bearing `tests/test_sageattn_ltx_shapes.py`
+run was clean on `2.12.1+cu132` (default `fp8_cuda++` path mean_rtol
+0.090-0.097, on-fingerprint; no drift from the 2.11 -> 2.12.1 jump).
 
 ### v0.6.5 -- 2026-05-19  (informative precondition assert on `w*_scale` type + stage-1/stage-2 bench rows)
 

@@ -100,7 +100,8 @@ work surface:
 - `setup.py` -- builds `_qattn_sm80`, `_qattn_sm89`, `_fused`. Our
   patch at line 152 adds sm89 to the SM80 build gate.
 - `build.sh` -- editable-install wrapper. Enforces `VIRTUAL_ENV`,
-  `--python` pin, MAX_JOBS cap.
+  `--python` pin, MAX_JOBS cap, and auto-avoids known-broken CUDA
+  toolkits (nvcc 13.3) -- see Install / build.
 
 Full upstream-vs-ours inventory in `docs/whats_ours_vs_upstream.md`.
 Mission and forward directions in `VISION.md` + `docs/roadmap.md`.
@@ -120,7 +121,23 @@ cd /path/to/sage-fork
 ./build.sh verify         # import-check only, no rebuild
 ```
 
-Build is 60-90s on an 8-core box with MAX_JOBS=8.
+**Run `./build.sh` (or `./build.sh clean`), NOT `uv pip install -e .
+-U`.** build.sh pins the active venv, caps `MAX_JOBS`, holds torch fixed
+(`--no-deps --force-reinstall`), and auto-selects a working CUDA
+toolkit. The bare `uv pip install -e . -U` form silently upgrades torch
+over ComfyUI's pinned build; if you upgrade torch deliberately, rebuild
+sage afterward (the `.so` is ABI-bound to torch). Build is 60-90s on an
+8-core box with MAX_JOBS=8.
+
+**CUDA toolkit:** nvcc 13.3 miscompiles PyTorch headers, so `build.sh`
+auto-switches the build to the newest non-broken installed toolkit
+(13.2 here) -- even when a global `CUDA_HOME=/usr/local/cuda` points at
+the broken default. Override with `CUDA_HOME=/usr/local/cuda-X.Y` (pick
+another) or `SAGE_SKIP_CUDA_GUARD=1` (force the broken one); the `.so`
+runs fine on a 13.3 driver. Mechanism + same-TU A/B in CHANGELOG v0.6.6;
+remove 13.3 from `KNOWN_BAD_CUDA` in `build.sh` once nvcc is fixed.
+
+After a build, restart ComfyUI to load the fresh `.so` files.
 
 Confirm install (path should point at our source tree):
 

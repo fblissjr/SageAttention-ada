@@ -62,7 +62,57 @@ if [[ -z "${VIRTUAL_ENV:-}" ]]; then
     exit 1
 fi
 
-CUDA_VER=$(nvcc --version | grep -oP 'release \K[0-9]+\.[0-9]+' | head -1)
+# --- CUDA toolkit selection ---
+# nvcc 13.3 ships a cudafe++ front-end regression that miscompiles PyTorch's
+# bundled headers: every .cu fails in ATen/core/List_inl.h with a spurious
+# "need 'typename' before ...::difference_type" error, even though the source
+# is valid (proven by a same-TU A/B -- 13.3 fails, 13.2 compiles clean; the
+# host g++ and sage's own sources are fine, it is purely the nvcc version).
+# So if the *active* toolkit is a known-broken version, switch to the newest
+# installed toolkit that is NOT in the broken set. This overrides even a
+# pre-exported CUDA_HOME -- a global CUDA_HOME=/usr/local/cuda is common and
+# usually points at the default/latest (broken) toolkit, so it can't be
+# trusted as an intentional pin. The resulting .so runs fine on a newer
+# driver (drivers are backward-compatible). Drop a version from
+# KNOWN_BAD_CUDA once a fixed nvcc for it ships.
+# Overrides: pick a good toolkit with `CUDA_HOME=/usr/local/cuda-X.Y
+# ./build.sh`; force the broken one anyway with `SAGE_SKIP_CUDA_GUARD=1`.
+KNOWN_BAD_CUDA=" 13.3 "
+
+_nvcc_ver() { "$1" --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+' | head -1; }
+
+# Honor an explicit CUDA_HOME by putting its nvcc first, so the version we
+# detect reflects the toolkit that would actually compile.
+if [[ -n "${CUDA_HOME:-}" && -x "${CUDA_HOME}/bin/nvcc" ]]; then
+    export PATH="${CUDA_HOME}/bin:${PATH}"
+fi
+
+CUDA_VER=$(_nvcc_ver "$(command -v nvcc)")
+
+if [[ "${KNOWN_BAD_CUDA}" == *" ${CUDA_VER} "* && "${SAGE_SKIP_CUDA_GUARD:-0}" != "1" ]]; then
+    _good="" _good_ver=""
+    for _d in $(ls -d /usr/local/cuda-*/ 2>/dev/null | sort -rV); do
+        _v=$(_nvcc_ver "${_d}bin/nvcc")
+        [[ -z "${_v}" || "${KNOWN_BAD_CUDA}" == *" ${_v} "* ]] && continue
+        _good="${_d%/}" _good_ver="${_v}"; break
+    done
+    if [[ -n "${_good}" ]]; then
+        echo "==> WARNING: nvcc ${CUDA_VER} miscompiles PyTorch headers (cudafe++ regression)."
+        echo "    Auto-switching the build to ${_good}."
+        echo "    Override: CUDA_HOME=/usr/local/cuda-X.Y (pick another) or"
+        echo "    SAGE_SKIP_CUDA_GUARD=1 (force ${CUDA_VER} anyway)."
+        export CUDA_HOME="${_good}"
+        export PATH="${CUDA_HOME}/bin:${PATH}"
+        CUDA_VER="${_good_ver}"
+    else
+        echo "ERROR: active nvcc is ${CUDA_VER}, which miscompiles PyTorch headers," >&2
+        echo "       and no working alternative toolkit was found under /usr/local/cuda-*." >&2
+        echo "       Install a known-good CUDA toolkit (e.g. 13.2), set CUDA_HOME to one," >&2
+        echo "       or set SAGE_SKIP_CUDA_GUARD=1 to force the broken toolkit." >&2
+        exit 1
+    fi
+fi
+
 echo "==> Detected CUDA:   ${CUDA_VER}"
 echo "==> Target archs:    ${CUDA_ARCHES}"
 echo "==> Target venv:     ${VIRTUAL_ENV}"
