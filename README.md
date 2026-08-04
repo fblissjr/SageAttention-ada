@@ -1,4 +1,4 @@
-last updated: 2026-05-23
+last updated: 2026-08-04
 
 # sage-fork
 
@@ -48,9 +48,19 @@ rather than "validated."
 - **Specific kernel exports** -- `sageattn_qk_int8_pv_fp8_cuda`,
   `sageattn_qk_int8_pv_fp16_cuda`, `sageattn_qk_int8_pv_fp16_triton`.
   Bypass the dispatcher if you want to pick the kernel yourself.
-- **Native CUDA mask support on sm89 fp8++** (v0.5.5). In-pipeline
-  observation under "What we've measured" is preliminary; the
-  kernel-correctness piece is not.
+- **Native CUDA mask support on sm89 fp8++** (v0.5.5), *reachable
+  through ComfyUI as of v0.7.0*. ComfyUI gates masked calls on
+  `"attn_mask" in inspect.signature(sageattn).parameters`; ours lived
+  in `**kwargs`, so that probe read False and every masked call went to
+  torch SDPA. The kernel was correct the whole time and simply never
+  ran. If you are on < v0.7.0, you do not have this in practice.
+- **`sageattn_consume(qkv, ...)`** (v0.7) -- `sageattn()` that takes
+  ownership of a `[q, k, v]` list and empties it, releasing the float
+  tensors as soon as they are quantized. A normal call cannot do this:
+  the caller's frame owns the references. -858 MiB peak at MiniMax H3's
+  fl2va shape. Against a fused QKV buffer -- how every DiT block
+  actually produces q/k/v -- the saving is ~435 MiB, because freeing q
+  and k releases nothing until the last view dies.
 - **`sageattn_partitioned(q, k, v, slices)`** -- amortizes K-quant +
   V-cast across multiple Q slices sharing the same K, V. Targets
   multi-slice partition patterns; correctness verified, peak HBM
@@ -164,6 +174,50 @@ heaviest sub-module and gives a materially larger e2e lever than
 the FFN-side primitive. The canonical breakdown + FFN-share triplet
 (three distinct readings depending on the question being asked) is
 in `docs/ltx_workload_profile.md`.
+
+### MiniMax H3 (v0.7) -- the cleanest e2e result we have
+
+H3 is a single-stream AV DiT: one unmasked self-attention per block over
+the whole packed `[text | cond | audio | video]` sequence, 56 heads,
+head_dim 128, 50 blocks. No kernel work was needed -- the existing sm89
+fp8++ kernel covers it as-is.
+
+Full render through ComfyUI at the bundled i2v template's settings
+(1344x768, 20 steps, `res_multistep`/`simple`, `int8_convrot` weights),
+warmup discarded, arms alternating on a shared seed:
+
+| length | sampler | total render | note |
+|---|---|---|---|
+| 73 frames | 1.70x | 1.62x | 152s -> 94s |
+| 124 frames | **1.91x** | **1.83x** | 360s -> 197s |
+
+Paired runs agreed within 0.3s. **The speedup grows with clip length**
+(attention is quadratic in sequence, the rest is not) while per-call
+accuracy stays flat, so longer clips are strictly the better case.
+Profiling one forward: attention 47.5%, int8 linears 40.7%, weight
+streaming only 4.5% -- so this is compute-bound, not PCIe-bound, and
+attention is still the largest single cost even after the win.
+
+Peak VRAM ~20.6 GB of 24 GB at length 73. Consumer node lives separately
+in `ComfyUI-sageattn-ada`, per the "sage-fork stays primitive" rule.
+
+### An accuracy calibration worth knowing
+
+Every rtol figure in this README comes from a synthetic bench over
+`torch.randn` inputs. On **real captured activations** the same fp8++
+kernel measures **0.026, roughly 4x lower**, and the fp8++-to-fp16 gap
+narrows from 2.6x to 1.3x. Real attention has structure -- concentrated
+softmax, correlated keys -- that quantization handles far better than
+iid gaussian noise.
+
+So the synthetic numbers below are a **pessimistic bound, not an
+estimate**. Do not read 0.098 as a quality budget. It also means a
+synthetic sweep cannot answer questions about input *distribution*: our
+first `smooth_k` experiment reported "no effect" on `torch.randn`, which
+has zero mean by construction and therefore no channel offset for
+`smooth_k` to remove. On real K the offset is substantial
+(|mean|/std 0.68) and it still does not help, most likely because
+`per_thread` quantization granularity already handles it.
 
 ### Masked self-attn (post-v0.5.5)
 
@@ -329,6 +383,15 @@ Design notes:
 Tracked in `CHANGELOG.md` under "Known kernel bugs" + "Backlog".
 Summary of the things worth knowing:
 
+- **int32 offset overflow in `quant_per_block_varlen.py`.** Inherited
+  from upstream: the Triton quant kernels compute element offsets in
+  int32, which wraps past 2^31 elements (4 GiB at bf16) -- silently
+  zeroing the tail in NHD, faulting in HND. Fixed in
+  `quant_per_thread.py` and `quant_per_block.py` in v0.7.0 via a
+  per-launch `USE_I64` specialization, so ordinary shapes keep int32
+  addressing. The varlen module is deliberately unfixed: its bound
+  needs `cu_seqlens` plumbed to the host and no ComfyUI path reaches
+  it. Reachable only above ~300k packed rows at H3's head config.
 - **sm80 + non-fp8++ sm89 CUDA paths still drop masks.** Same kernel
   pattern as the v0.5.5 fix; deferred until a workload hits one of
   those paths frequently. The dispatcher routes around the gap on
@@ -385,7 +448,14 @@ You give up:
 - **One platform's worth of validation.** Ada / sm89 only.
 - **No assertion about quality.** Our quality claim is "rtol < 0.10
   vs SDPA on the shapes we care about." That's a numerical
-  invariant, not a perceptual one.
+  invariant, not a perceptual one. The one perceptual check we have
+  run: same-seed 20-step H3 renders with sage on and off were
+  indistinguishable to the maintainer's eye. That is one prompt, one
+  model, one pair of eyes -- not a quality benchmark. Note also that
+  comparing finished renders *numerically* measures trajectory chaos
+  rather than degradation, since any perturbation diverges a 20-step
+  ODE; the honest instruments are fixed-input kernel divergence and
+  human judgement, not PSNR between samples.
 
 ---
 
