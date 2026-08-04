@@ -18,18 +18,30 @@ import torch
 import triton
 import triton.language as tl
 
+from ._int_offsets import needs_int64_offsets
+
 @triton.jit
 def quant_per_block_int8_kernel(Input, Output, Scale, L,
                                 stride_iz, stride_ih, stride_in,
                                 stride_oz, stride_oh, stride_on,
                                 stride_sz, stride_sh,
                                 sm_scale,
-                                C: tl.constexpr, BLK: tl.constexpr):
+                                C: tl.constexpr, BLK: tl.constexpr,
+                                USE_I64: tl.constexpr = False):
     off_blk = tl.program_id(0)
     off_h = tl.program_id(1)
     off_b = tl.program_id(2)
 
+    # See _int_offsets: past 2**31 elements the int32 address arithmetic
+    # wraps. Promoting the base covers the batch and head terms, which
+    # overflow before the row term does in HND.
+    if USE_I64:
+        off_h = off_h.to(tl.int64)
+        off_b = off_b.to(tl.int64)
+
     offs_n = off_blk * BLK + tl.arange(0, BLK)
+    if USE_I64:
+        offs_n = offs_n.to(tl.int64)
     offs_k = tl.arange(0, C)
 
     input_ptrs = Input + off_b * stride_iz + off_h * stride_ih + offs_n[:, None] * stride_in + offs_k[None, :]
@@ -78,7 +90,8 @@ def per_block_int8_q(q, BLKQ=128, sm_scale=None, tensor_layout="HND"):
         stride_bz_qo, stride_h_qo, stride_seq_qo,
         q_scale.stride(0), q_scale.stride(1),
         sm_scale=(sm_scale * 1.44269504),
-        C=head_dim, BLK=BLKQ
+        C=head_dim, BLK=BLKQ,
+        USE_I64=needs_int64_offsets(q, q_int8, tensor_layout=tensor_layout, blk=BLKQ)
     )
     return q_int8, q_scale
 
@@ -114,7 +127,8 @@ def per_block_int8_k(k, km=None, BLKK=64, tensor_layout="HND"):
         stride_bz_ko, stride_h_ko, stride_seq_ko,
         k_scale.stride(0), k_scale.stride(1),
         sm_scale=1.0,
-        C=head_dim, BLK=BLKK
+        C=head_dim, BLK=BLKK,
+        USE_I64=needs_int64_offsets(k, k_int8, tensor_layout=tensor_layout, blk=BLKK)
     )
     return k_int8, k_scale
 

@@ -18,18 +18,31 @@ import torch
 import triton
 import triton.language as tl
 
+from ._int_offsets import needs_int64_offsets
+
+
 @triton.jit
 def quant_query_per_thread_int8_kernel(Input, Output, Scale, L,
                                         stride_iz, stride_ih, stride_in,
                                         stride_oz, stride_oh, stride_on,
                                         stride_sz, stride_sh,
-                                        C: tl.constexpr, BLK: tl.constexpr):
+                                        C: tl.constexpr, BLK: tl.constexpr,
+                                        USE_I64: tl.constexpr = False):
     off_blk = tl.program_id(0) // 8
     off_tld = tl.program_id(0) % 8
     off_h = tl.program_id(1)
     off_b = tl.program_id(2)
 
+    # Promoting the base offset covers every term at once: the batch and
+    # head products overflow int32 before the row term does in HND, so
+    # promoting only the row index still faults there.
+    if USE_I64:
+        off_h = off_h.to(tl.int64)
+        off_b = off_b.to(tl.int64)
+
     offs_n = off_blk * BLK + tl.arange(0, BLK // 8) * 8 + off_tld
+    if USE_I64:
+        offs_n = offs_n.to(tl.int64)
     offs_k = tl.arange(0, C)
 
     input_ptrs = Input + off_b * stride_iz + off_h * stride_ih + offs_n[:, None] * stride_in + offs_k[None, :]
@@ -50,11 +63,16 @@ def quant_key_per_thread_int8_kernel(Input, Output, Scale, L,
                                         stride_iz, stride_ih, stride_in,
                                         stride_oz, stride_oh, stride_on,
                                         stride_sz, stride_sh,
-                                        C: tl.constexpr, BLK: tl.constexpr):      
+                                        C: tl.constexpr, BLK: tl.constexpr,
+                                        USE_I64: tl.constexpr = False):
     off_blk = tl.program_id(0) // 4
     off_tld = tl.program_id(0) % 4
     off_h = tl.program_id(1)
     off_b = tl.program_id(2)
+
+    if USE_I64:
+        off_h = off_h.to(tl.int64)
+        off_b = off_b.to(tl.int64)
 
     # offs_n = off_blk * BLK + tl.cat(tl.arange(0, BLK // 8) * 8, tl.arange(0, BLK // 8) * 8 + 1, True) + off_tld * 2
     # offs_k = tl.arange(0, C)
@@ -74,6 +92,9 @@ def quant_key_per_thread_int8_kernel(Input, Output, Scale, L,
 
     offs_n0 = off_blk * BLK + tl.arange(0, BLK // 8) * 8 + off_tld * 2
     offs_n1 = off_blk * BLK + tl.arange(0, BLK // 8) * 8 + off_tld * 2 + 1
+    if USE_I64:
+        offs_n0 = offs_n0.to(tl.int64)
+        offs_n1 = offs_n1.to(tl.int64)
     offs_k = tl.arange(0, C)
 
     input_ptrs0 = Input + off_b * stride_iz + off_h * stride_ih + offs_n0[:, None] * stride_in + offs_k[None, :]
@@ -183,13 +204,22 @@ def per_thread_int8(q, k, km=None, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64, sm_sca
     if sm_scale is None:
         sm_scale = head_dim**-0.5
 
+    # int64 addressing only where the offsets actually need it: past 2**31
+    # elements the int32 arithmetic wraps, which corrupts the tail silently
+    # in NHD and faults in HND. Specializing keeps ordinary shapes on the
+    # cheaper int32 path.
+    # Check the int8 outputs too: a broadcast or otherwise oddly-strided
+    # input can have a smaller bound than the contiguous tensor written back.
+    q_i64 = needs_int64_offsets(q, q_int8, tensor_layout=tensor_layout, blk=BLKQ)
+    k_i64 = needs_int64_offsets(k, k_int8, tensor_layout=tensor_layout, blk=BLKK)
+
     grid = ((qo_len + BLKQ - 1) // BLKQ * (BLKQ // WARPQ) * 8, h_qo, b)
     quant_query_per_thread_int8_kernel[grid](
         q, q_int8, q_scale, qo_len,
         stride_bz_q, stride_h_q, stride_seq_q,
         stride_bz_qo, stride_h_qo, stride_seq_qo,
         q_scale.stride(0), q_scale.stride(1),
-        C=head_dim, BLK=WARPQ
+        C=head_dim, BLK=WARPQ, USE_I64=q_i64
     )
 
     grid = ((kv_len + BLKK - 1) // BLKK * (BLKK // WARPK) * 4, h_kv, b)
@@ -198,7 +228,7 @@ def per_thread_int8(q, k, km=None, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64, sm_sca
         stride_bz_k, stride_h_k, stride_seq_k,
         stride_bz_ko, stride_h_ko, stride_seq_ko,
         k_scale.stride(0), k_scale.stride(1),
-        C=head_dim, BLK=WARPK
+        C=head_dim, BLK=WARPK, USE_I64=k_i64
     )
 
     return q_int8, q_scale, k_int8, k_scale
