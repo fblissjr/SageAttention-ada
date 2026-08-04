@@ -100,6 +100,49 @@ def test_sageattn_dispatcher_routes_masked_calls_correctly():
     print(f"ok  sageattn() masked call routed to {got!r}")
 
 
+def test_attn_mask_is_an_introspectable_parameter():
+    # ComfyUI decides whether sage may see masks at all by introspecting
+    # our signature, not by trying a call:
+    #   comfy/ldm/modules/attention.py:27
+    #   SAGE_ATTENTION_SUPPORTS_MASK = "attn_mask" in
+    #       inspect.signature(sageattn).parameters
+    # and attention_sage falls back to attention_pytorch for every masked
+    # call when that reads False. With attn_mask arriving via **kwargs the
+    # probe misses it, so the v0.5.5 native CUDA mask path above is
+    # unreachable through the stock dispatcher no matter how correct the
+    # kernel is. Delete this and that regression is invisible: every test
+    # here calls sageattn() directly and keeps passing.
+    import inspect
+
+    params = inspect.signature(sageattn).parameters
+    assert "attn_mask" in params, (
+        "attn_mask must be a named parameter of sageattn(), not routed "
+        "through **kwargs -- ComfyUI's SAGE_ATTENTION_SUPPORTS_MASK probe "
+        f"inspects the signature. Got: {list(params)}"
+    )
+    assert params["attn_mask"].default is None, (
+        "attn_mask must default to None so unmasked callers are unaffected"
+    )
+    print("ok  attn_mask is introspectable on sageattn()")
+
+
+def test_attn_mask_still_accepted_positionally_free():
+    # The probe fix must not reorder the existing positional parameters.
+    # Consumers call sageattn(q, k, v, "HND", False) positionally; if
+    # attn_mask were inserted among those, tensor_layout would silently
+    # bind to a mask.
+    import inspect
+
+    ordered = [
+        name for name, p in inspect.signature(sageattn).parameters.items()
+        if p.kind is p.POSITIONAL_OR_KEYWORD
+    ]
+    assert ordered[:7] == [
+        "q", "k", "v", "tensor_layout", "is_causal", "sm_scale", "return_lse"
+    ], f"positional prefix changed, breaking existing callers: {ordered}"
+    print("ok  positional parameter order preserved")
+
+
 def test_direct_triton_call_records_fp16_triton():
     _reset_dispatch_for_test()
     q, k, v = _make_qkv()
@@ -247,6 +290,8 @@ def main() -> int:
     test_initial_value_is_none()
     test_sageattn_dispatcher_records_fp8_pp_on_sm89()
     test_sageattn_dispatcher_routes_masked_calls_correctly()
+    test_attn_mask_is_an_introspectable_parameter()
+    test_attn_mask_still_accepted_positionally_free()
     test_direct_triton_call_records_fp16_triton()
     test_direct_fp16_cuda_call_records_fp16_cuda()
     test_fp8_cuda_variant_records_correct_subname()

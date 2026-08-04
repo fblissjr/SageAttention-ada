@@ -202,6 +202,7 @@ def sageattn(
     is_causal: bool = False,
     sm_scale: Optional[float] = None,
     return_lse: bool = False,
+    attn_mask: Optional[torch.Tensor] = None,
     **kwargs: Any,
 ):
     """
@@ -266,8 +267,11 @@ def sageattn(
       handle causal mode natively via `MaskMode::kCausal`).
     """
 
-    # Extract attn_mask up-front so per-arch dispatch sees a clean kwargs.
-    attn_mask = kwargs.pop("attn_mask", None)
+    # attn_mask is a named parameter rather than a **kwargs entry because
+    # ComfyUI gates masked calls on `"attn_mask" in
+    # inspect.signature(sageattn).parameters` (comfy/ldm/modules/attention.py)
+    # and routes everything masked to torch SDPA when that reads False --
+    # which made the v0.5.5 native CUDA mask path unreachable in production.
     arch = _cuda_archs[q.device.index]
 
     if attn_mask is not None:
