@@ -911,7 +911,8 @@ buffer only dies with the last view. At H3's shape the saving in that
 configuration is 435 MiB, not 858, and the peak is set inside
 `per_channel_fp8` rather than by the output allocation. See Backlog.
 
-Consumer node shipped separately as `ComfyUI-sageattn-ada`, per the
+Consumer node shipped separately as
+[ComfyUI-sageattn-ada](https://github.com/fblissjr/ComfyUI-sageattn-ada), per the
 "sage-fork stays primitive" rule in CLAUDE.md.
 
 **In-pipeline validation (2026-08-04).** Unlike v0.6 sage_ffn, this one
