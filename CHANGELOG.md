@@ -940,6 +940,34 @@ because the packed sequence is short enough that attention stops
 dominating: the win is a property of the sequence length, not of the
 model.
 
+**Accuracy, and a calibration correction.** Perceptual verdict first: on
+a same-seed 20-step pair at length 124, sage on vs off, the owner reports
+no visible difference. That is the verdict that matters -- comparing
+finished renders numerically measures trajectory chaos, not degradation,
+because any perturbation diverges a 20-step ODE.
+
+The kernel-level numbers back it up, but only once measured on real
+activations. On q/k/v captured from an actual H3 forward, fp8++ lands at
+mean_rtol **0.026** against an fp32 reference -- roughly **4x lower than
+the 0.098 the synthetic bench reports**, and the fp8++-to-fp16 gap
+narrows from 2.6x to 1.3x. Real attention has structure that quantization
+handles far better than iid gaussian noise does. **Every accuracy figure
+this repo quotes from a synthetic bench is a pessimistic bound, not an
+estimate.** Worth remembering before treating 0.098 as a quality budget.
+
+Divergence is also flat across sequence length (0.0960 at S=2k to 0.0979
+at S=38k), so the `scale_max=2.25` compression mechanism does not compound
+on longer clips. Length changes the speed and VRAM equations only.
+
+`smooth_k` was checked properly and left off. K really does carry a
+substantial channel offset on real activations (|mean|/std 0.68 mean,
+6.09 max), so the precondition for it helping holds -- and it still does
+not help (0.0264 -> 0.0266 on fp8++). The likely reason is that
+`qk_quant_gran="per_thread"` already scales finely enough that a
+per-channel offset never dominates any single scale. KJNodes' H3 patch
+enables it, which costs a K-mean pass for no measurable accuracy gain at
+these shapes; note that KJ did not A/B it either way.
+
 The first attempt at this measurement reported **405x** for the sage arm.
 That was ComfyUI's node cache serving a byte-identical graph, so nothing
 executed and the run "finished" in 0.0 s. Any e2e harness re-submitting
