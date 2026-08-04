@@ -914,6 +914,39 @@ configuration is 435 MiB, not 858, and the peak is set inside
 Consumer node shipped separately as `ComfyUI-sageattn-ada`, per the
 "sage-fork stays primitive" rule in CLAUDE.md.
 
+**In-pipeline validation (2026-08-04).** Unlike v0.6 sage_ffn, this one
+was gated on a real render before the claim went anywhere. Full H3 render
+through a running ComfyUI at the bundled i2v template's settings
+(1344x768, length 73, 20 steps, `res_multistep`/`simple`, `int8_convrot`
+weights), warmup discarded, arms alternating, two paired runs:
+
+| | sampler | total render |
+|---|---|---|
+| sage off | 141.2 s | 151.9 s |
+| sage on | 82.9 s | 93.6 s |
+| | **1.70x** | **1.62x** |
+
+Both paired runs agreed within 0.3 s on every figure. The sampler is 93%
+of total at these settings, which is why the end-to-end ratio stays close
+to the sampler ratio -- unusually favourable compared with LTX, and the
+reason the synthetic-to-production gap that sank sage_ffn does not appear
+here. Peak VRAM ~20.6 GB of 24 GB.
+
+Two results worth keeping for calibration. The per-module bench (one
+`Attention` at S=41822) reads 2.12x; the sampler reads 1.70x; the render
+reads 1.62x. That ladder is the shape to expect -- each rung adds work
+attention cannot touch. And at length 5 the same e2e A/B measures 1.02x,
+because the packed sequence is short enough that attention stops
+dominating: the win is a property of the sequence length, not of the
+model.
+
+The first attempt at this measurement reported **405x** for the sage arm.
+That was ComfyUI's node cache serving a byte-identical graph, so nothing
+executed and the run "finished" in 0.0 s. Any e2e harness re-submitting
+the same graph needs a varying seed and a hard error when the timed node
+never fires; recorded because the failure mode produces a spectacular
+number that looks like a win.
+
 ### v0.6.6 -- 2026-06-26  (build robustness: `build.sh` auto-avoids the nvcc 13.3 / PyTorch-header miscompile)
 
 Build-tooling hardening, no kernel or wrapper change.
