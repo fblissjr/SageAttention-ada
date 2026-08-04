@@ -33,6 +33,29 @@ additions (we own the contract).
 
 ## Our additions and modifications (tracked in CHANGELOG.md)
 
+- `sageattention/triton/_int_offsets.py` (new) +
+  `quant_per_thread.py` / `quant_per_block.py` -- **fix to an upstream
+  defect, candidate to send back to `thu-ml`.** The INT8 quant kernels
+  compute element offsets in int32, which wraps past 2**31 elements
+  (4 GiB at bf16): silently all-zero output in NHD, illegal memory
+  access in HND. Fixed with a `USE_I64` constexpr selected per launch so
+  ordinary shapes keep int32 addressing. `quant_per_block_varlen.py` has
+  the same defect and is deliberately not fixed -- see CHANGELOG Backlog.
+  v0.7.0.
+- `sageattention/core.py::sageattn` -- `attn_mask` promoted from a
+  `**kwargs` entry to a named parameter (after `return_lse`, so the
+  positional prefix is unchanged). Not cosmetic: ComfyUI gates masked
+  calls on `"attn_mask" in inspect.signature(sageattn).parameters`, so
+  upstream's `**kwargs` form makes any mask support unreachable through
+  ComfyUI regardless of kernel correctness. Also worth sending upstream.
+  v0.7.0.
+- `sageattention/core.py::sageattn_consume(qkv, ...)` -- ours, no
+  upstream equivalent. Takes ownership of a `[q, k, v]` list and empties
+  it so the float tensors are released once quantized, which a normal
+  `sageattn(q, k, v)` call cannot do (the caller's frame owns them).
+  Carries an internal `_qkv_box` parameter on
+  `sageattn_qk_int8_pv_fp8_cuda`. v0.7.0.
+
 - `setup.py:152` -- one-line tuple change so `_qattn_sm80` builds on
   sm89 boxes (was gated on 8.0/8.6/8.7 only; Ada is forward-compat to
   SM80).

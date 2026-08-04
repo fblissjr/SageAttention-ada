@@ -73,6 +73,50 @@ on sm89 fp8++: 2026-05-13 (v0.5.5).
 Real open TODOs. Each has an explicit trigger-to-act; we don't do these
 speculatively.
 
+### Drop `per_channel_fp8`'s full-size bf16 transpose buffer
+
+`per_channel_fp8` allocates `v_transposed_permutted` at V's full size in
+bf16, fills it via `transpose_pad_permute_cuda`, then quantizes it into a
+separate fp8 tensor (`sageattention/quant.py:269-292`). At MiniMax H3's
+fl2va shape that transient is 572 MiB, and it -- not the output
+allocation -- is what sets the peak for the whole attention call:
+
+```
+after qkv views                                    1715 MiB
++ q_int8, k_int8                                   2287 MiB
++ v_transposed_permutted (bf16, transient)         2862 MiB
++ v_fp8                                            3148 MiB   <- peak
+```
+
+It also caps what `sageattn_consume` can deliver in the configuration
+that matters. When q/k/v are views of one fused QKV buffer, releasing the
+buffer cannot happen until V is quantized, by which point the transient
+has already set the peak: 435 MiB saved instead of 858.
+
+The scale is per-channel over the full sequence, so it needs two passes
+either way. The fix is to compute the per-channel max reading V directly
+and then transpose-and-quantize straight to fp8, never materializing the
+bf16 intermediate -- trading a second read of V for 572 MiB at this
+shape.
+
+**Trigger:** a workload that OOMs at the attention peak, or an in-pipeline
+measurement showing weight-streaming pressure that the extra headroom
+would relieve. Kernel-day work in `csrc/fused/fused.cu`; scope it first
+per the scoping-doc precedent, and gate on in-pipeline A/B since the
+extra V read is a real cost that synthetic bench will show as a
+regression.
+
+### Fix the int32 offset overflow in `quant_per_block_varlen.py`
+
+The v0.7.0 overflow fix covers `quant_per_thread.py` and
+`quant_per_block.py`. The varlen module has the same defect and was left
+alone: its bound depends on `cu_seqlens` values loaded inside the kernel,
+so the host-side check needs the cumulative-length array plumbed through,
+and no ComfyUI path reaches `sageattn_varlen` for us to test against.
+
+**Trigger:** a consumer adopts `sageattn_varlen`, or we upstream the
+v0.7.0 fix (in which case send all three modules together).
+
 ### Retire the nvcc-13.3 CUDA-toolkit guard once a fixed nvcc ships
 
 `build.sh` carries a `KNOWN_BAD_CUDA=" 13.3 "` blocklist that
@@ -794,6 +838,81 @@ a sage-fork kernel push with data. Until then the raw JSONL is
 sufficient.
 
 ## Versions
+
+### v0.7.0 -- 2026-08-04  (MiniMax H3 coverage: mask-probe fix, quant overflow fix, `sageattn_consume`)
+
+Triggered by MiniMax H3 (`Comfy-Org/MiniMax-H3`) landing in ComfyUI. The
+model turned out to need no kernel work at all -- 56 heads, head_dim 128,
+unmasked, one self-attention per block over a ~42k-row packed sequence,
+which the existing sm89 fp8++ kernel covers as-is at 4.10x over
+EFFICIENT_ATTENTION and 2.70x over torch flash. Probing it did surface
+three real defects, two of them inherited from upstream.
+
+**1. `attn_mask` was invisible to ComfyUI's capability probe.** ComfyUI
+decides whether sage may see masks by introspecting our signature:
+
+```python
+SAGE_ATTENTION_SUPPORTS_MASK = "attn_mask" in inspect.signature(sageattn).parameters
+```
+
+Ours arrived via `**kwargs`, so this read `False` and `attention_sage`
+routed every masked call to `attention_pytorch`. The v0.5.5 native CUDA
+mask path has therefore never run in production -- masked LTX cross-attn
+has been on torch SDPA the whole time, regardless of kernel correctness.
+`attn_mask` is now a named parameter, added after `return_lse` so the
+positional prefix is unchanged. Verified end to end through comfy's
+`attention_sage`: probe reads `True`, masked calls land on `fp8_cuda++`,
+rtol 0.0904 vs torch on an LTX-shaped masked cross-attn.
+
+This changes which kernel runs for masked calls in production. The kernel
+is unchanged and was measured at v0.5.5; the e2e effect of actually
+reaching it is not yet validated in-pipeline.
+
+**2. int32 element-offset overflow in the INT8 quant kernels** (upstream
+defect, `thu-ml/SageAttention`). Triton's `program_id` is int32 and the
+stride arguments are passed as int32, so
+`off_b*stride_z + off_h*stride_h + offs_n*stride_n + offs_k` is evaluated
+in int32 and wraps past 2**31 elements (4 GiB at bf16). The two layouts
+fail differently and neither warns:
+
+| layout | first term to cross | measured failure |
+|---|---|---|
+| NHD | `stride_n` = heads*head_dim | silently all-zero tail (tail cosine +0.0000 at S=303689) |
+| HND | `stride_h` = seq*head_dim | `CUDA error: an illegal memory access` at S=310000 |
+
+Fixed in `quant_per_thread.py` and `quant_per_block.py` via a `USE_I64`
+constexpr chosen per launch, so ordinary shapes keep int32 addressing --
+verified no change to `fp8_cuda++` wall-clock or rtol at the production
+shape. Promoting the base offset matters: promoting only the row index
+(as KJNodes' vendored copy does) still faults in HND.
+
+Reachable by parameter on MiniMax H3 -- 1008 rows/frame at 1344x768 means
+~1008 frames, and the node allows up to 3600 -- but not on 24 GB of VRAM,
+where q+k+v alone would be 12.9 GB on top of a 21 GB checkpoint. Worth
+reporting upstream.
+
+**3. `sageattn_consume(qkv, ...)`** -- new entry point that takes
+ownership of a `[q, k, v]` list and empties it, releasing each tensor once
+its quantized form exists. `sageattn()` cannot do this: the caller's frame
+owns the references. The fp8 CUDA wrapper gained an internal `_qkv_box` so
+it can drop its own parameters before allocating the q-shaped output.
+Output is bit-identical to `sageattn()`; only free timing changes.
+
+Measured at H3's fl2va shape (S=41822, heads 56, head_dim 128), one arm
+per process: `sageattn()` 3148 MiB peak, `sageattn_consume()` 2290 MiB
+(-858 MiB). 2290 MiB is parity with a hand-rolled per-arch call sequence
+into the private quant helpers, so consumers no longer need to reach for
+those.
+
+Caveat worth knowing before quoting that number: when q/k/v are three
+views of one fused QKV projection buffer -- which is how every DiT block
+actually produces them -- freeing q and k releases nothing, because the
+buffer only dies with the last view. At H3's shape the saving in that
+configuration is 435 MiB, not 858, and the peak is set inside
+`per_channel_fp8` rather than by the output allocation. See Backlog.
+
+Consumer node shipped separately as `ComfyUI-sageattn-ada`, per the
+"sage-fork stays primitive" rule in CLAUDE.md.
 
 ### v0.6.6 -- 2026-06-26  (build robustness: `build.sh` auto-avoids the nvcc 13.3 / PyTorch-header miscompile)
 

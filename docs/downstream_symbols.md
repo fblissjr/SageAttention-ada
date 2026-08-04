@@ -22,10 +22,15 @@ our fork even on sm89 boxes (depends on whether KJ's import is
 try/except-guarded). The Hopper kernel removal was correct; the
 *consideration* of the downstream blast radius was missing.
 
-## Known importers (audit 2026-05-01)
+## Known importers (audit 2026-05-01, re-checked 2026-08-04)
 
-KJNodes `ComfyUI-KJNodes/nodes/ltxv_nodes.py` (the LTX-2 per-block
-patch) imports these from `sageattention.core` directly:
+KJNodes `ComfyUI-KJNodes/nodes/ltxv_nodes.py` imports these from
+`sageattention.core` directly. As of the 2026-08-04 re-check the same
+file drives three per-block patches, not just LTX-2: `WanVideo...`,
+`MiniMaxH3MemoryEfficientSageAttentionPatch`, and the LTX-2 one. All
+three funnel through a single `_sageattn_int8_fp8_nhd` helper that
+hand-rolls the per-arch dispatch, so the whole symbol list below is
+exercised by every one of them:
 
 ```
 _qattn_sm80, _qattn_sm89, _qattn_sm90        # compiled .so extensions
@@ -47,6 +52,28 @@ _qattn_sm89.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf
 The other pybind methods in `csrc/qattn/pybind_sm89.cpp:23-30` are
 load-bearing for our own dispatcher and effectively in the same
 risk class -- treat the full list as protected.
+
+Two things the 2026-08-04 re-check turned up that matter for this
+contract:
+
+- **`_qattn_sm89` is not importable from `core`; the fallback is what
+  actually binds.** KJNodes tries `from sageattention.core import
+  _qattn_sm89` and falls back to `sm89_compile` on ImportError. Against
+  our build only the fallback resolves, and its feature probe
+  (`hasattr(mod, "qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf")`)
+  returns `True`, so they land on our fp8++ kernel. That means
+  `sm89_compile`'s attribute names are load-bearing for a real consumer,
+  not just an internal detail -- renaming one silently downgrades them to
+  the `fp32+fp32` arm rather than raising.
+
+- **They vendor a patched copy of `quant_per_thread.py`.** KJNodes ships
+  `_per_thread_int8_i64`, described in-file as vendored from ours "with
+  the row offsets promoted to int64 to avoid overflow on large
+  sequences" -- the upstream defect we fixed in v0.7.0. Their copy
+  promotes only the row term, which is sufficient for their NHD usage but
+  still faults in HND. Now that `per_thread_int8_triton` handles this
+  itself, the vendored copy is redundant against our fork; it is not
+  redundant against stock upstream, so expect it to stay.
 
 ## Pre-removal checklist
 
