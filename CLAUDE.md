@@ -416,6 +416,26 @@ Sage exposes three surfaces to downstream consumers:
    sm89); the quantitative wedge does not on the tested workload.
    v0.6.1 candidates to close the gap: persistent-CTA hybrid and
    CUTLASS-based CUDA backend (see CHANGELOG Backlog).
+4. **`sageattn_consume(qkv, ...)`** (v0.7) -- `sageattn()` that takes
+   ownership of a `[q, k, v]` list and empties it, so the float
+   tensors are released once quantized instead of at end-of-call.
+   `sageattn()` cannot do this: the caller's frame owns the refs.
+   Same signature otherwise; output bit-identical. Measured -858 MiB
+   peak at MiniMax H3's fl2va shape, which is parity with
+   hand-rolling the per-arch call sequence into the private quant
+   helpers -- the point is that consumers no longer need to. Caveat:
+   when q/k/v are three views of one fused QKV buffer (how every DiT
+   block produces them) freeing q and k releases nothing, and the
+   saving is ~435 MiB with the peak set inside `per_channel_fp8`
+   instead. Only the sm89 fp8 path releases early; other kernels
+   fall back to the ordinary path, correct but with no saving.
+
+**`attn_mask` must stay a named parameter of `sageattn()`**, not a
+`**kwargs` entry. ComfyUI gates masked calls on `"attn_mask" in
+inspect.signature(sageattn).parameters`; when that reads False it
+routes every masked call to torch SDPA, which silently stranded the
+v0.5.5 CUDA mask kernel until v0.7.0. Enforced by a test in
+`tests/test_dispatched_kernel_telemetry.py`.
 
 Mask-routing fix landed v0.3.0 (2026-04-26); audit trail in
 `internal/audit_2026-04-26.md`. Native CUDA mask landed v0.5.5

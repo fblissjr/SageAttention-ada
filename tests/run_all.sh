@@ -91,9 +91,24 @@ echo
 echo "[3/4] running tests/test_sageattn_image_shapes.py"
 "${PY}" tests/test_sageattn_image_shapes.py 2>&1 | tee "${IMAGE_LOG}"
 
-# 4. torch.compile spike.
+# 4. Correctness suites that gate on an assertion rather than a number.
+# These are fast and have no baseline to drift, so they run unconditionally
+# and fail the whole script -- unlike the benches above, a failure here is
+# a defect, not a measurement.
 echo
-echo "[4/4] running tests/spike_torch_compile.py"
+echo "[4/5] running correctness suites"
+for t in test_quant_offset_overflow test_sageattn_consume test_dispatched_kernel_telemetry; do
+    echo "  - tests/${t}.py"
+    "${PY}" "tests/${t}.py" > "internal/log/${t}_${DATE}.log" 2>&1 || {
+        echo "error: tests/${t}.py failed. See internal/log/${t}_${DATE}.log" >&2
+        tail -20 "internal/log/${t}_${DATE}.log" >&2
+        exit 1
+    }
+done
+
+# 5. torch.compile spike.
+echo
+echo "[5/5] running tests/spike_torch_compile.py"
 "${PY}" tests/spike_torch_compile.py 2>&1 | tee "${SPIKE_LOG}"
 
 echo
