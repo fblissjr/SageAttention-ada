@@ -948,6 +948,7 @@ def sageattn_qk_int8_pv_fp8_cuda(
     smooth_k: bool = True,
     smooth_v: bool = False,
     return_lse: bool = False,
+    _qkv_box: Optional[list] = None,
     **kwargs: Any,
 ) -> torch.Tensor:
     """
@@ -1099,7 +1100,13 @@ def sageattn_qk_int8_pv_fp8_cuda(
     elif qk_quant_gran == "per_thread":
         q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64)
 
-    o = torch.empty(q.size(), dtype=dtype, device=q.device)
+    # Output is q-shaped, but allocating it here would stack on top of the
+    # still-live float q/k/v. Capture the shape and allocate after those are
+    # released instead -- see the _qkv_box path below.
+    o_shape = q.size()
+    if _qkv_box is not None:
+        del q, k, km
+        _qkv_box[0] = _qkv_box[1] = None
 
     if pv_accum_dtype == 'fp32+fp32' and smooth_v:
         warnings.warn("pv_accum_dtype is 'fp32+fp32', smooth_v will be ignored.")
@@ -1114,6 +1121,12 @@ def sageattn_qk_int8_pv_fp8_cuda(
         quant_v_scale_max = 2.25
 
     v_fp8, v_scale, vm = per_channel_fp8(v, tensor_layout=tensor_layout, scale_max=quant_v_scale_max, smooth_v=smooth_v)
+
+    if _qkv_box is not None:
+        del v
+        _qkv_box[2] = None
+
+    o = torch.empty(o_shape, dtype=dtype, device=q_int8.device)
 
     if pv_accum_dtype == "fp32":
         _record_dispatch(KERNEL_FP8_CUDA)
@@ -1157,6 +1170,97 @@ def sageattn_qk_int8_pv_fp8_cuda(
         return o, lse / 1.44269504 + lse_correction * sm_scale if smooth_k else lse / 1.44269504
     else:
         return o
+
+
+def sageattn_consume(
+    qkv: list,
+    tensor_layout: str = "HND",
+    is_causal: bool = False,
+    sm_scale: Optional[float] = None,
+    attn_mask: Optional[torch.Tensor] = None,
+    **kwargs: Any,
+):
+    """`sageattn()` that takes ownership of `qkv` to cut peak VRAM.
+
+    Attention is the memory peak in a large DiT block, and most of that
+    peak is not sage's working set -- it is the caller's float q/k/v
+    sitting alive underneath it. A normal `sageattn(q, k, v)` call cannot
+    do anything about that: the caller's frame still references those
+    tensors, so nothing sage does internally can release them.
+
+    This entry point takes a `[q, k, v]` list instead and empties it, so
+    the float tensors are freed as soon as their quantized forms exist
+    rather than at the end of the call.
+
+    Measured at MiniMax H3's fl2va shape (S=41822, heads 56, head_dim 128,
+    bf16), one arm per process:
+
+        sageattn()                     3148 MiB peak
+        sageattn_consume()             2290 MiB peak   (-858 MiB)
+
+    Against ComfyUI's `attention_sage` wrapper, which carries another
+    ~570 MiB of its own, the same shape reads 3720 -> 2290 MiB, so a
+    consumer node replacing that path sees roughly 1430 MiB. Either way it
+    is per attention call, which is what makes it matter when a 21 GB
+    checkpoint is resident on a 24 GB card.
+
+    Parameters
+    ----------
+    qkv : list
+        A 3-element `[q, k, v]` list. **Emptied by this call.** The caller
+        must hold no other references to those tensors, or the saving does
+        not materialize -- the whole point is that this list is the last
+        owner. Pass `[q, k, v]` and `del q, k, v` before calling.
+
+    Everything else matches `sageattn()`.
+
+    Returns
+    -------
+    Same as `sageattn()`.
+
+    Notes
+    -----
+    Only the sm89 fp8 CUDA kernels release early today; other kernels fall
+    back to the ordinary path, which is correct but keeps q/k/v alive for
+    the duration and so saves nothing.
+    """
+    if len(qkv) != 3:
+        raise ValueError(f"qkv must be a 3-element [q, k, v] list, got {len(qkv)}")
+
+    q = qkv[0]
+    arch = _cuda_archs[q.device.index]
+    fp8_arch = arch in {"sm89", "sm100", "sm120", "sm121"}
+    del q
+
+    if not fp8_arch:
+        # No early-release path here; behave exactly like sageattn() and
+        # let the list drop its references when the caller releases it.
+        q, k, v = qkv
+        qkv.clear()
+        return sageattn(
+            q, k, v, tensor_layout=tensor_layout, is_causal=is_causal,
+            sm_scale=sm_scale, attn_mask=attn_mask, **kwargs,
+        )
+
+    if arch == "sm89" and get_cuda_version() < (12, 8):
+        kwargs.setdefault("pv_accum_dtype", "fp32+fp32")
+    else:
+        kwargs.setdefault("pv_accum_dtype", "fp32+fp16")
+    if arch != "sm89":
+        kwargs.setdefault("qk_quant_gran", "per_warp")
+    _log_routing_choice_once(
+        arch, attn_mask is not None, kwargs["pv_accum_dtype"],
+        KERNEL_FP8_CUDA_PP if kwargs["pv_accum_dtype"] == "fp32+fp16"
+        else KERNEL_FP8_CUDA_FP32,
+    )
+    # The box is passed rather than unpacked into locals here: a local
+    # binding in this frame would outlive the callee's `del` and pin the
+    # tensor for the whole call, defeating the purpose.
+    return sageattn_qk_int8_pv_fp8_cuda(
+        qkv[0], qkv[1], qkv[2],
+        tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale,
+        attn_mask=attn_mask, _qkv_box=qkv, **kwargs,
+    )
 
 
 def sageattn_warmup(
