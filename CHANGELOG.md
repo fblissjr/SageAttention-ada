@@ -964,9 +964,17 @@ substantial channel offset on real activations (|mean|/std 0.68 mean,
 6.09 max), so the precondition for it helping holds -- and it still does
 not help (0.0264 -> 0.0266 on fp8++). The likely reason is that
 `qk_quant_gran="per_thread"` already scales finely enough that a
-per-channel offset never dominates any single scale. KJNodes' H3 patch
-enables it, which costs a K-mean pass for no measurable accuracy gain at
-these shapes; note that KJ did not A/B it either way.
+per-channel offset never dominates any single scale.
+
+Its cost is near zero either way, so this is a wash rather than a
+mistake: peak VRAM is byte-identical with it on (the `k - km` copy is
+transient and freed before `per_channel_fp8` sets the peak), and
+wall-clock rises ~1 ms -- 3.6% at S=22.5k, 0.5% at S=41.8k, shrinking in
+relative terms because the K-mean pass is O(S) against attention's
+O(S^2). KJNodes' H3 patch enables it and pays nothing meaningful for it;
+we leave it off and gain nothing meaningful either. Worth keeping in mind
+if a future model uses a coarser `qk_quant_gran`, where the offset would
+actually bite -- turning it on is close to free.
 
 The first attempt at this measurement reported **405x** for the sage arm.
 That was ComfyUI's node cache serving a byte-identical graph, so nothing
