@@ -68,6 +68,41 @@ Discovered: 2026-04-23 via `tests/test_sageattn_ltx_shapes.py` (the
 seq_kv sweep exposed the rtol-vs-seq_kv scaling signature). Closed
 on sm89 fp8++: 2026-05-13 (v0.5.5).
 
+### The CUDA quant kernels form global offsets in uint32 (ceiling ~199,729 rows)
+
+The v0.7.0 int64 fix covered the Triton quant kernels. `csrc/fused/fused.cu`
+has the same defect one type wider: every kernel there takes its strides as
+`uint32_t` and forms the global offset as
+
+```cpp
+input + batch_id * stride_bz_input + head_id * stride_h_input
+      + thread_base_token * stride_seq_input + ...
+```
+
+with all four operands `uint32_t`, so the sum wraps at 2**32 elements rather
+than 2**31. `per_channel_fp8` and the sub-mean/quant pre-kernels read the
+caller's original bf16 V, which in a DiT block is a view into a fused QKV
+buffer carrying `stride_seq = 3*heads*head_dim`. At MiniMax H3's config that
+puts the ceiling at:
+
+| layout | stride_seq | wraps at |
+|---|---|---|
+| fused QKV view (production) | 21,504 | S = 199,729 rows (~660 frames at 1344x768) |
+| contiguous | 7,168 | S = 599,186 rows |
+
+Measured safe below it: at S=109,126 (362 frames, the largest a 24 GB card
+reaches) the largest offset formed is 2.35e9, inside uint32's 4.29e9. So this
+is a latent ceiling, not a live defect -- and on 24 GB it is unreachable,
+since q+k+v alone at S=199,729 would be 8.6 GB on top of a ~20 GB checkpoint.
+
+**Trigger to fix:** a card with enough VRAM to reach it, or a model whose
+`stride_seq` is wider than H3's. Fixing it means promoting the offset
+expressions to `size_t` in `csrc/fused/fused.cu`; unlike the Triton side
+there is no cheap per-launch specialization, so measure the cost before
+taking it.
+
+Recorded: 2026-08-05, while validating the Triton fix at 362 frames.
+
 ## Backlog
 
 Real open TODOs. Each has an explicit trigger-to-act; we don't do these
@@ -838,6 +873,75 @@ a sage-fork kernel push with data. Until then the raw JSONL is
 sufficient.
 
 ## Versions
+
+### v0.7.1 -- 2026-08-05  (long-sequence validation: the v0.7.0 overflow fix holds at 362 frames, and the int64 path is free)
+
+No code change. This closes a measurement gap that v0.7.0 left open and
+corrects an env pin.
+
+**Every sage number on file stopped at S=41,822.** That is MiniMax H3's
+fl2va shape at the node's default 124 frames, and it is 2.9x shorter than a
+362-frame request at the same 1344x768 canvas, which packs S=109,126 rows.
+v0.7.0 fixed the int32 offset overflow and reasoned about where it bites,
+but the fix was never exercised at a length a user actually asked for --
+and 362 frames is past the boundary in the layout production uses, where
+q/k/v are three views of one fused QKV buffer and `stride_seq` is 21,504
+rather than 7,168.
+
+`tests/spikes/spike_h3_long_sequence.py` measures both layouts at four
+lengths. The contiguous arm is the control: same S, half the stride, so the
+specialization does not fire and the two arms differ only in addressing.
+
+| frames | S | layout | int64 | sage fp8++ | flash | ratio | mean rtol | tail cos | tail zeros |
+|---|---|---|---|---|---|---|---|---|---|
+| 124 | 37,774 | fused | no | 90.1 ms | 253.5 ms | 2.81x | 0.0981 | 0.9992 | 0.0% |
+| 209 | 63,256 | fused | no | 256.0 ms | 708.2 ms | 2.77x | 0.0980 | 0.9992 | 0.0% |
+| 311 | 93,836 | fused | no | 556.5 ms | 1560.3 ms | 2.80x | 0.0985 | 0.9992 | 0.0% |
+| 362 | 109,126 | fused | **yes** | 757.7 ms | 2107.9 ms | 2.78x | 0.0978 | 0.9992 | 0.0% |
+| 362 | 109,126 | contig | no | 757.2 ms | 2112.4 ms | 2.79x | 0.0981 | 0.9992 | 0.0% |
+
+Three results:
+
+**The fix works where it fires.** The specialization engages exactly at the
+predicted boundary -- fused at 362 frames and nowhere else -- and the output
+is correct there. The tail is scored separately on purpose: the NHD failure
+signature is a silently all-zero tail, which a whole-tensor mean rtol can
+absorb. Tail cosine is 0.9992 and the zero fraction is 0.0% at every length.
+
+**The int64 path costs nothing.** 757.7 ms with it against 757.2 ms without,
+same S, a 0.07% difference that is inside run-to-run noise. v0.7.0 verified
+the specialization did not slow down shapes that skip it; this is the other
+half of that claim, and it means the `needs_int64_offsets` check could be
+dropped for a simpler unconditional int64 if it ever became a maintenance
+burden. Addressing is not what these kernels are bound on.
+
+**The kernel ratio is flat in sequence length.** 2.77-2.81x across a 2.9x
+span of S. Sage does not degrade on long clips; it is the same multiplier,
+applied to a quadratically larger number.
+
+**Reconciliation with a production render.** A 362-frame render logged
+20 steps at 49.66 s/it (workflow `h3_t2v_sage_ui.json`, 1344x768, euler /
+simple, 20 steps, sage mode `auto`). H3 runs one self-attention per block
+over 50 blocks, so the measured 757.7 ms per call predicts 37.9 s of
+attention per step -- **76% of the step**. Carrying the non-attention
+remainder from the 124-frame configuration forward linearly in S predicts
+51.0 s/it against 49.66 s observed, a 2.7% error. The step is accounted
+for; nothing is silently falling back.
+
+That share is the useful number. At 124 frames attention is ~50% of the
+step; at 362 it is 76%, because attention grows as S^2 while everything
+else grows as S. Substituting the measured flash time for sage at the same
+length puts the same step at ~118 s/it, so sage is worth roughly 39.5 min
+against 16.6 min on this render -- and any further work on long-sequence H3
+should be aimed at attention, since three quarters of the clock is there.
+
+**Env pin correction.** v0.7.0 cites e2e numbers without recording a stack,
+against the rule in CLAUDE.md. Its measurements were taken on
+`torch 2.13.0+cu132` / `triton 3.7.1`, not the `2.12.1+cu132` that v0.6.6
+recorded -- the `.so` files and torch were installed in the same session on
+2026-07-11 and have not moved since. The tables above are on the same stack.
+Fresh snapshot: `internal/bench_env_2026-08-05.txt` (the previous one was
+from 2026-04-25 and still said torch 2.11).
 
 ### v0.7.0 -- 2026-08-04  (MiniMax H3 coverage: mask-probe fix, quant overflow fix, `sageattn_consume`)
 
