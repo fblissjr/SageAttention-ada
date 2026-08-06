@@ -566,6 +566,15 @@ graph-breaks at, the trigger to revisit, and the estimated work in
   changes and what it does to our H3 baselines. Kernel-side numbers
   survive it; any comparison of rendered output across the merge does
   not. Read before re-running an H3 quality A/B.
+- `docs/sparse_attention_quality_gating.md` -- how to decide whether an
+  approximate-attention setting is acceptable on long video. Separates the
+  two late-clip phenomena that get merged (broad decay near the trained
+  frame-range top, whose lever is frame count, versus threshold-graded
+  content instability, which is the approximation's own artifact), why a
+  per-layer binary exemption is the wrong shape for a graded sensitivity
+  profile, and the gate procedure: intra-clip, never numeric, video not
+  stills, prove the knob fired. Read before running a quality A/B on any
+  attention approximation.
 - `docs/moving_targets.md` -- how to work when the dependencies change
   by the hour: pin versions with the measurement not the session,
   re-verify upstream gates in both directions, treat a name in a
