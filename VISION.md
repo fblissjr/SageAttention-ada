@@ -2,32 +2,49 @@ last updated: 2026-05-23 (library reframe: a sm89 kernel library for ComfyUI con
 
 # sage-fork
 
-*A sm89 kernel library for ComfyUI consumer workloads.*
+*A trusted sm89 build, a measurement rig, and a place to test ideas.*
 
-A sm89 / RTX 4090 **kernel library** for **ComfyUI consumer workloads** --
-a coherent set of quantized kernels (attention, fp8 MLP, RoPE, and the
-fp8/int8 quant primitives underneath) consumed *as a library* by a
-personal repo ecosystem (today: the audio-loop consumer node; more
-over time). Structurally this is the shape comfy-kitchen takes -- one
-library, many primitives, a clean consumable boundary -- scoped to sm89.
-The name "sage-fork" is historical: sage attention is the founding
-module, not the whole library, and the `sageattention` import name is
-kept because the ecosystem pins it.
+Three things, in order of how much they have actually delivered:
 
-The mission is to make the workflows we actually run faster, more
-memory-efficient, and more measurable -- anchored in DiT-class diffusion
-(LTX 2.3 video, Flux / Z-Image image gen) and expanding to multi-modal
-pipelines (audio-conditioned video, cross-modal attention, two-pass
-tensor-loop samplers) as those become consumer workload classes worth
-attacking. The DiT and LLM worlds are converging; we expect new workload
-shapes over time and structure the work to absorb them.
+**1. A trusted fork.** The build that compiles for sm89 and stays correct
+on the shapes we run. Concretely: `setup.py:152` (without which sage does
+not build for Ada from source at all), the int32 offset overflow fix that
+keeps 362-frame renders from silently zeroing their tail, the stream-safety
+fix, the dispatcher mask-routing fix, and `attn_mask` as an introspectable
+parameter. Upstream defects, mostly -- found here, fixed here, and several
+of them worth sending back.
 
-Sage attention is the historical foundation and remains a primary
-deliverable. v0.6 added `sage_ffn` (fp8 MLP fusion). Forward directions
-span attention, FFN, VAE, ComfyUI integration shims, workflow profiling
-tools, persistent-CTA kernel rewrites, and whatever the load-bearing
-measurement says needs attacking next. We optimize where the wedge is,
-not where the repo name points.
+**2. A measurement rig.** The LTX and H3 bench surfaces, the e2e harness,
+the workload profiler, and `docs/perf_research_framework.md`. This is what
+produces the results people can act on -- that upstream's Sol-Attn defaults
+are wrong past 300 frames, that a 32B text encoder costs 1.5s, that H3's
+area cap makes 1:1 three times cheaper than 16:9, that `smooth_k` is a
+wash. None of it required writing a fast kernel.
+
+**3. A place to test ideas.** `sage_ffn`, `sageattn_partitioned`,
+`fused_rope_split`, the torch.compile spike. Kept because negative results
+are worth keeping, not because they shipped wins.
+
+**What this repo has never done is make anything faster.** Every speed
+number in these docs is upstream's kernel -- the sm89 INT8-QK / FP8-PV
+design from `thu-ml` via `woct0rdho`, shipped here unmodified. The version
+titles record the pattern honestly: v0.6.0 `sage_ffn` "not currently a perf
+win in production", v0.5.4 `sageattn_partitioned` "honest negative result",
+v0.3.0 "correctness fix", v0.6.6 "build robustness". Even the Triton
+autotune addition only confirmed the existing hardcoded config was already
+optimal. Not one release has shipped a measured speedup from code written
+here.
+
+That is not a failure to fix by trying harder at kernels. It is what the
+evidence says this repo is good at, and the framing should match: **prove
+things, fix things, and be the build you trust** -- for whatever workload
+is in front of us. Nothing here is limited to sage attention or to
+attention at all; the scope is whatever a ComfyUI render on sm89 actually
+spends time on, and the deliverable is usually a measurement or a fix
+rather than a kernel.
+
+If a real kernel win ever does land, it should arrive with an in-pipeline
+A/B attached, and this section should be rewritten to say so.
 
 **The hard constraint: sm89 / RTX 4090 only.** Hopper / Blackwell /
 Ampere stay out of scope. Everything else -- kernel surface
