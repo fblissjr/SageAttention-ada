@@ -70,7 +70,10 @@ on sm89 fp8++: 2026-05-13 (v0.5.5).
 
 ### The CUDA quant kernels form global offsets in uint32 (ceiling ~199,729 rows)
 
-The v0.7.0 int64 fix covered the Triton quant kernels. `csrc/fused/fused.cu`
+Same lineage as the v0.7.0 int32 overflow: an upstream defect, in code we
+ship unmodified (`csrc/fused/` is on the upstream-unmodified list in
+`docs/whats_ours_vs_upstream.md`), found while testing our own fix. The
+v0.7.0 int64 fix covered the Triton quant kernels; `csrc/fused/fused.cu`
 has the same defect one type wider: every kernel there takes its strides as
 `uint32_t` and forms the global offset as
 
@@ -918,6 +921,16 @@ burden. Addressing is not what these kernels are bound on.
 **The kernel ratio is flat in sequence length.** 2.77-2.81x across a 2.9x
 span of S. Sage does not degrade on long clips; it is the same multiplier,
 applied to a quadratically larger number.
+
+Attribution, since these tables invite the wrong reading: **that ratio is
+upstream's kernel**, the sm89 INT8-QK / FP8-PV design from `thu-ml` via
+`woct0rdho`, which we ship unmodified (`csrc/qattn/sm89_qk_int8_sv_f8_*.cu`
+is on the upstream-unmodified list). This fork made none of it faster. What
+v0.7.0/v0.7.1 contribute at this length is that the kernel *builds* for
+sm89 and stays *correct* past 99,864 rows -- and the defect being fixed is
+upstream's too. Independent corroboration that it is not obscure: kijai hit
+the same int32 wrap in Sol-Attn's own Triton kernels on 2026-08-04
+(`9cab9a0`) and patched it the same day from a different direction.
 
 **Reconciliation with a production render.** A 362-frame render logged
 20 steps at 49.66 s/it (workflow `h3_t2v_sage_ui.json`, 1344x768, euler /
