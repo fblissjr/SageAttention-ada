@@ -190,17 +190,29 @@ render drops. Worth establishing the minimum viable step count on the new
 sampler before ranking further long-sequence H3 attention work by leverage --
 the Amdahl input changes, even though the per-step profile does not.
 
-## Watch items
+## Known break
 
-Unverified, flagged for checking rather than asserted:
+**A generic flow-shift node breaks packed AV sampling (verified against
+upstream main).** `MiniMaxH3.audio_scale()` reads
+`self.model_sampling.audio_scale`, which exists only on `ModelSamplingAV`.
+`ModelSamplingSD3` -- the standard flow-shift node, and the obvious thing to
+reach for to change shift -- patches in
+`ModelSamplingAdvanced(ModelSamplingDiscreteFlow, CONST)`
+(`comfy_extras/nodes_model_advanced.py`, `ModelSamplingSD3.patch`), which has no
+such attribute. `audio_scale()` returns early only when `latent_shapes` is None
+or shorter than 2, so on any packed AV latent it reaches the attribute and
+raises `AttributeError`. `ModelSamplingAuraFlow` subclasses `ModelSamplingSD3`
+and `ModelSamplingFlux` builds the same way, so all three share the path.
 
-- `MiniMaxH3.audio_scale()` reads `self.model_sampling.audio_scale`, which only
-  exists on `ModelSamplingAV`. A workflow that patches `model_sampling` with a
-  generic flow-shift node rather than the H3-specific one would install an
-  object without that attribute. Worth confirming what happens on that path
-  before running H3 benches with a patched sampling object.
-- Whether `audio_shift` reaches `set_parameters` in every path that constructs
-  H3 sampling, or only via `sampling_settings` and the H3 shift node.
+This also answers the second question that was open here: `audio_shift` reaches
+sampling either from `sampling_settings` in `supported_models.py` or from the H3
+shift node's `set_parameters`. A generic node routes around both, which is
+exactly why the attribute is missing rather than merely unset.
+
+Narrow but real: it needs a user to apply a stable-diffusion-category shift node
+to an H3 model. Worth reporting upstream if the PR is otherwise landing -- the
+one substantive review comment on it is already about how `model_sampling` is
+fetched, so the seam has attention.
 
 ## Status and triggers
 
