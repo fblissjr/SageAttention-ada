@@ -65,8 +65,7 @@ The work surface, by layer:
 - **Forward record** -- `docs/roadmap.md` (tiered directions, trigger-
   conditional, including stack-leverage opportunities and external
   design references), `CHANGELOG.md` (versioned divergence + Decision
-  log + Backlog + Workload intel), `internal/PLAN.md` (gitignored
-  live operational doc).
+  log + Backlog + Workload intel).
 
 ## The metric
 
@@ -289,11 +288,11 @@ and we add a perceptual layer.
   Triton 3.7, PyTorch 2.12) + External design references
   (Megakernels, ThunderKittens) sections. Not a committed schedule;
   the user remains the scheduler.
-- [`internal/PLAN.md`](./internal/) (gitignored) — live operational
-  doc. Backlog with triggers, experiment log (TSV), the research
-  loop. Edit every session.
 - [`CHANGELOG.md`](./CHANGELOG.md) — versioned divergence record,
-  Known kernel bugs, Decision log, Workload intel.
+  Known kernel bugs, Decision log, Backlog with triggers, Workload
+  intel. Single source of truth for both open triggers and closed
+  decisions; the `internal/PLAN.md` that used to mirror it was
+  retired 2026-08-05 after drifting out of date against it.
 
 ## What we might be wrong about
 

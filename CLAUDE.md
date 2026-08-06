@@ -541,11 +541,14 @@ graph-breaks at, the trigger to revisit, and the estimated work in
 - `CHANGELOG.md` -- versioned divergence + Known kernel bugs +
   Backlog + Decision log + Recurring process items. Source of truth
   for closed decisions.
-- `internal/PLAN.md` (gitignored) -- live operational doc: current
-  state, active backlog with triggers, cross-repo coupling,
-  experiment log. Edit every session. Mirrors CHANGELOG's Backlog
-  and Recurring sections in active form. Pairs with
-  `internal/log/log_<date>.md` and `internal/audit_<date>.md`.
+- `internal/log/log_<date>.md` and `internal/audit_<date>.md`
+  (gitignored) -- session narrative and durable findings. There is no
+  separate live plan doc: `internal/PLAN.md` was retired 2026-08-05
+  because it duplicated CHANGELOG's Backlog and Decision log while
+  drifting out of date against them, which made it a second and
+  quietly wrong answer to "what is the current state". CHANGELOG is
+  the single source of truth for both open triggers and closed
+  decisions; don't reintroduce a mirror of it.
 - Scoping-doc precedent for kernel-day work that needs a discipline
   check (PTX bit-identity diff of the kNone specialization, register-
   pressure read, four-place-coupling audit) BEFORE committing to the

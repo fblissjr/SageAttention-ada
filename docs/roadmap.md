@@ -22,7 +22,10 @@ user remains the scheduler.
   synthetic-vs-in-pipeline discipline.
 - **`docs/ltx_workload_profile.md`** -- canonical workload share
   data. Anything claiming "X% of wall" cites this.
-- **`internal/PLAN.md`** (gitignored) -- live operational state.
+- **`CHANGELOG.md`** Backlog and Decision log -- open triggers and
+  closed decisions. Single source of truth for current state; the
+  separate `internal/PLAN.md` that used to mirror it was retired
+  2026-08-05 for drifting out of date against it.
 
 ## What we're specialized in (the portfolio)
 
