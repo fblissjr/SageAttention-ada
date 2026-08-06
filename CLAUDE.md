@@ -566,6 +566,14 @@ graph-breaks at, the trigger to revisit, and the estimated work in
   changes and what it does to our H3 baselines. Kernel-side numbers
   survive it; any comparison of rendered output across the merge does
   not. Read before re-running an H3 quality A/B.
+- `docs/moving_targets.md` -- how to work when the dependencies change
+  by the hour: pin versions with the measurement not the session,
+  re-verify upstream gates in both directions, treat a name in a
+  capability list as a name, prefer call-time counters to install-time
+  logs, and record each finding's expiry condition. Read this before
+  measuring anything that depends on a fast-moving third-party node.
+  Rigour here means "a result plus the state that produced it plus what
+  makes it stale", not "a reproducible result".
 - `internal/h3_sol_diary.md` (gitignored) -- running diary for MiniMax H3
   and the sparse-attention consumer node. Names specific third-party
   nodes, so it cannot be committed material. It is the narrative index
