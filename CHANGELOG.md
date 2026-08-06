@@ -137,12 +137,32 @@ and then transpose-and-quantize straight to fp8, never materializing the
 bf16 intermediate -- trading a second read of V for 572 MiB at this
 shape.
 
-**Trigger:** a workload that OOMs at the attention peak, or an in-pipeline
-measurement showing weight-streaming pressure that the extra headroom
-would relieve. Kernel-day work in `csrc/fused/fused.cu`; scope it first
-per the scoping-doc precedent, and gate on in-pipeline A/B since the
-extra V read is a real cost that synthetic bench will show as a
-regression.
+**Trigger, rewritten 2026-08-05.** It used to read "a workload that OOMs at
+the attention peak" -- i.e. wait for the failure. That is the wrong trigger
+for a robustness item. The 362-frame H3 measurement shows why: the render
+phase peaks at 21,228 MiB of 24,101 and the text-encode phase touched
+**24,076 MiB, 99.9% of the card**. The pipeline stages 51,418 MiB of models
+against 24,101 MiB of VRAM (2.1x oversubscribed) and currently completes
+with no meaningful slack. One bad allocation kills a 17-minute render.
+
+**Do not justify this as a speedup.** The recoverable time is bounded at
+~2.6% (0.6% per-step weight streaming, which the trace shows is already
+fully hidden behind compute, plus 2.0% phase swapping), and part of that
+2.0% is unavoidable since the TE and DiT are 45.9 GB together and can never
+co-reside. Framed as perf this is `sage_ffn` again: plausible mechanism,
+real synthetic number, dies in the production A/B. Framed as headroom on a
+pipeline running at 99.9% of the card, it stands up.
+
+**Prerequisite before any kernel work:** confirm ComfyUI's dynamic VRAM
+actually keeps more weights resident when the attention peak drops. If its
+staging does not react to the freed headroom, the whole causal chain
+(lower peak -> more resident -> less streaming) is severed and the work
+buys only OOM margin. Cheap to test with `sageattn_consume` on vs off while
+sampling resident VRAM.
+
+Kernel-day work in `csrc/fused/fused.cu` (upstream code); scope it first per
+the scoping-doc precedent, and gate on in-pipeline A/B since the extra V
+read is a real cost that synthetic bench will show as a regression.
 
 ### Fix the int32 offset overflow in `quant_per_block_varlen.py`
 
