@@ -205,7 +205,12 @@ Unverified, flagged for checking rather than asserted:
 ## Status and triggers
 
 `Comfy-Org/ComfyUI#15243`, opened 2026-08-03, open and unmerged as of
-2026-08-06. One review comment. The mechanism analysis above is durable whether
+2026-08-06. Three inline review comments from one contributor, all minor: one
+asking for `get_model_object('model_sampling')` for consistency and safety, two
+file-encoding fixes. None touch the schedule math, so nothing in review so far
+bears on the analysis above. (The `get_model_object` note lands on the same seam
+as the first watch item below, which is weak corroboration that the seam is
+worth checking.) The mechanism analysis above is durable whether
 or not this specific PR is the version that lands -- the two-schedule problem
 and the change-of-variables solution are properties of the model, not of the
 patch.
