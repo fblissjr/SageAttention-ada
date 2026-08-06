@@ -520,6 +520,11 @@ graph-breaks at, the trigger to revisit, and the estimated work in
   claim is real and independently replicated; the per-MMA
   accumulator overflow constraint kills the rtol budget on DiT
   activation distributions specifically.
+- `docs/minimax_h3_av_sampling.md` -- H3's packed AV latent carries two
+  flow schedules under one sampler; what the upstream schedule fix
+  changes and what it does to our H3 baselines. Kernel-side numbers
+  survive it; any comparison of rendered output across the merge does
+  not. Read before re-running an H3 quality A/B.
 - `internal/pyright_noise.md` (gitignored) -- pyright false-positives
   to ignore in `sageattention/` and `tests/`. Two recurring categories
   worth knowing up front: "unreachable code" on `@triton.jit` kernel
