@@ -139,6 +139,25 @@ computable from the geometry.
 clip time, so longer clips are the higher-risk case, not the safer one. A
 verdict from a short clip does not license a long one.
 
+**A threshold verdict is scoped to the kernel implementation.** It is a
+property of the approximation as built, not of the algorithm in the
+abstract. A reimplementation -- a port to a different language or backend,
+a change in accumulate order or block-skip criterion -- can move the onset
+in either direction. This one fires more often than it sounds like it
+should: these kernels are actively developed.
+
+**And to the checkpoint.** The failure is a signal-to-noise phenomenon, so
+the noise floor entering attention is part of the operating point. A
+different weight quantization changes that floor even when the attention
+inputs remain the same dtype in the same basis -- which is the usual case,
+since rotation-based quantization schemes invert their rotation inside the
+linear layer and hand attention ordinary activations. Nothing kernel-side
+changes; the margin does.
+
+Four axes, all independently live. Record which ones a verdict was
+established under, at the time it is established. Re-deriving them later
+means re-running the render.
+
 **One knob not covered here.** Implementations that gate sparsity to a
 sampling-percentage window leave the first and last steps exact. Widening
 that window is a speed lever, but it removes dense warm-up steps, and early
