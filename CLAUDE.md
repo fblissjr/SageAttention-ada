@@ -240,6 +240,41 @@ GPU OOM mid-test usually means contention, not a bug. Check
 before debugging -- a sibling process likely holds the VRAM Triton
 autotune needs.
 
+**Before trusting a green result, ask what state would turn it red --
+then check that you actually created that state.** A check that passes
+because the condition it guards was never reproduced reads as coverage
+while asserting nothing. The recurring defect class in this repo is not
+wrong kernels; it is instruments that structurally could not have
+detected what they were trusted to detect. The mechanism is the same
+every time: the thing under test is not a pure function of its declared
+inputs, but gets measured as though it were. Four instances, each caught
+only after the fact:
+
+- **Prior launch's shared memory.** The v0.7.2 `kNoFill` defect does not
+  fire in a fresh process -- the unfixed kernel passes its own regression
+  sweep at mean_rtol 0.0345. It needs an earlier launch to have left
+  non-finite values in the smem bank, so
+  `tests/test_short_seq_tail.py` dirties with `+inf` before every sweep.
+  Written without that step the file is green against a kernel already
+  proven broken.
+- **Prior arm's allocator state.** The peak-HBM rule below.
+- **Neighboring modules' L2 footprint.** v0.6 sage_ffn benched 1.26-1.36x
+  in isolation and came back +1.79% e2e slower. The synthetic harness
+  could not see cache contention by construction, not by oversight.
+- **Position in time within a render.** The Sol-Attn quality gate compared
+  four still frames per arm and signed off; the failure it missed is a
+  small object losing its identity mid-clip, which no still can show. The
+  instrument was fine, the time sampling was wrong.
+
+Two corollaries worth applying by default. **Measure the config that
+ships:** `tests/test_sageattn_consume.py` records its peak with
+`smooth_k=False` while production defaults to True (`core.py:948`), so
+those numbers describe a configuration no consumer runs. And **prefer a
+paired comparand to a bare sweep:** an exact-multiple shape measured
+beside a ragged one attributes a delta to the tail, whereas a sweep in
+which every shape is ragged smears the same effect across all rows with
+nothing to attribute it against.
+
 **Peak-HBM cumulative measurement benches: do NOT precede the
 cumulative arm with a per-call-reset arm that does
 `gc.collect`/`empty_cache` between calls.** The reset arm trains the
@@ -525,6 +560,15 @@ graph-breaks at, the trigger to revisit, and the estimated work in
   changes and what it does to our H3 baselines. Kernel-side numbers
   survive it; any comparison of rendered output across the merge does
   not. Read before re-running an H3 quality A/B.
+- `internal/h3_sol_diary.md` (gitignored) -- running diary for MiniMax H3
+  and the sparse-attention consumer node. Names specific third-party
+  nodes, so it cannot be committed material. It is the narrative index
+  for that work: standing state, what is still open, and what was
+  superseded plus what disproved it. Read it before re-running an H3
+  measurement -- two conclusions have already gone stale without anyone
+  noticing at the time, and the third-party nodes involved ship
+  behaviour-changing commits faster than our docs track them. Detail
+  lives in the files it points at, not in the diary.
 - `internal/pyright_noise.md` (gitignored) -- pyright false-positives
   to ignore in `sageattention/` and `tests/`. Two recurring categories
   worth knowing up front: "unreachable code" on `@triton.jit` kernel
