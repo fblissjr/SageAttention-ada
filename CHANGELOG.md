@@ -111,7 +111,49 @@ Recorded: 2026-08-05, while validating the Triton fix at 362 frames.
 Real open TODOs. Each has an explicit trigger-to-act; we don't do these
 speculatively.
 
-### Drop `per_channel_fp8`'s full-size bf16 transpose buffer
+### Drop `per_channel_fp8`'s full-size bf16 transpose buffer -- SUPERSEDED 2026-08-06, not withdrawn
+
+**Superseded by consumer-side head-group chunking. Do not start this as a
+kernel day.** Everything below about the mechanism is still true, which is
+exactly why this entry stays: the bf16 transpose buffer really does set the
+attention peak, and a future reader who rediscovers that will re-propose
+this same work. It should arrive pre-answered.
+
+Two reasons, in order of durability.
+
+**We do not buy insurance with kernel days on this box.** The
+headroom-to-speed conversion here is bounded at ~2.6% (see below), so this
+was never a speed item -- it is insurance on a pipeline running at 99.9% of
+the card. A consumer node now slices attention into head groups and
+quantizes per group, which shrinks the same transient by the group count
+with no kernel change at all. Spending a kernel day on insurance that a
+caller-side `for` loop already provides is the wrong trade regardless of how
+the two compare numerically.
+
+**And numerically it is not close.** The per-call transient is ~1430 MiB
+(q_int8+k_int8 572, the bf16 transpose buffer 572, v_fp8 286) on top of the
+1715 MiB fused QKV buffer, which reconciles with the measured 3148 MiB peak.
+Chunking scales that transient by 1/n: roughly 2430 MiB at n=2 and 2073 at
+n=4, so ~1070 MiB recovered against the ~572 MiB this item would deliver.
+
+**What it costs, and why this may come back.** Chunking multiplies attention
+calls by n. At 50 blocks x 20 steps that is 1000 calls per render becoming
+4000 at n=4, each expanding to several CUDA launches. That is four times the
+call count at which `sage_ffn` died on cumulative launch overhead, on a
+kernel that is already the dominant cost -- so chunking is a VRAM-versus-
+wall-clock dial, not a free win, and it needs an in-pipeline A/B before
+anyone ships it. **If that A/B goes badly and nobody adopts chunking, this
+item is live again.**
+
+**Preserve on the way past:** the in-place mean-subtraction prerequisite
+found while measuring `sageattn_consume` (v0.7.3). Dropping the transpose
+buffer alone moves the fused-case peak 3148 -> 2859, because `k = k - km`
+then sets the floor; the pair together reaches 2573. Whoever picks this back
+up needs both halves or the work under-delivers and looks like a failed bet.
+
+---
+
+Original entry follows.
 
 `per_channel_fp8` allocates `v_transposed_permutted` at V's full size in
 bf16, fills it via `transpose_pad_permute_cuda`, then quantizes it into a
