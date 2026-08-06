@@ -455,15 +455,21 @@ Sage exposes three surfaces to downstream consumers:
    ownership of a `[q, k, v]` list and empties it, so the float
    tensors are released once quantized instead of at end-of-call.
    `sageattn()` cannot do this: the caller's frame owns the refs.
-   Same signature otherwise; output bit-identical. Measured -858 MiB
-   peak at MiniMax H3's fl2va shape, which is parity with
-   hand-rolling the per-arch call sequence into the private quant
-   helpers -- the point is that consumers no longer need to. Caveat:
-   when q/k/v are three views of one fused QKV buffer (how every DiT
-   block produces them) freeing q and k releases nothing, and the
-   saving is ~435 MiB with the peak set inside `per_channel_fp8`
-   instead. Only the sm89 fp8 path releases early; other kernels
-   fall back to the ordinary path, correct but with no saving.
+   Same signature otherwise; output bit-identical. **What it saves is
+   configuration-dependent, and in the arrangement DiT blocks actually
+   use it currently saves nothing** -- measured at fl2va, peak per call:
+   separate allocations -858 MiB at `smooth_k=False` but only -287 at
+   the shipped `smooth_k=True` (`per_thread_int8` allocates the int8
+   outputs before evaluating `k = k - km`, so a full bf16 K copy lands
+   on top); fused QKV views **0 MiB either way**, because releasing q
+   and k frees nothing while v holds the same allocation, and by the
+   time v goes `per_channel_fp8`'s bf16 transpose buffer has set a
+   higher peak. The earlier "~435 MiB in the fused case" figure was
+   wrong; corrected in CHANGELOG v0.7.3. Making the fused case pay
+   needs the transpose buffer dropped **and** the mean-subtraction done
+   in place -- either alone leaves the other setting the floor. Only
+   the sm89 fp8 path releases early; other kernels fall back to the
+   ordinary path, correct but with no saving.
 
 **`attn_mask` must stay a named parameter of `sageattn()`**, not a
 `**kwargs` entry. ComfyUI gates masked calls on `"attn_mask" in

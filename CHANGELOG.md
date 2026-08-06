@@ -897,6 +897,60 @@ sufficient.
 
 ## Versions
 
+### v0.7.3 -- 2026-08-06  (correction: `sageattn_consume` saves nothing in the configuration DiT blocks actually use)
+
+No code change. This retracts a number v0.7.0 shipped and replaces it with
+the full measurement.
+
+v0.7.0 recorded `sageattn_consume` at -858 MiB peak, with a caveat putting
+the fused-QKV case at "~435 MiB with the peak set inside `per_channel_fp8`
+instead." The -858 is reproducible but describes a configuration no
+consumer runs. The ~435 is simply wrong. Measured at fl2va (S=41822, heads
+56, head_dim 128, bf16), peak per call, consume arm first so allocator
+state cannot bias it:
+
+| allocation | `smooth_k` | `sageattn` | `sageattn_consume` | saved |
+|---|---|---|---|---|
+| separate | False | 3148 MiB | 2290 MiB | -858 |
+| separate | True | 3148 MiB | 2862 MiB | -287 |
+| fused QKV views | False | 3148 MiB | 3148 MiB | **0** |
+| fused QKV views | True | 3148 MiB | 3148 MiB | **0** |
+
+Production is the bottom row. Two independent axes, neither obvious from
+reading the function:
+
+- **`smooth_k` defaults to True** (`core.py:948`), and `per_thread_int8`
+  allocates `q_int8`/`k_int8` *before* evaluating `k = k - km`
+  (`quant_per_thread.py:176-180`), so a full bf16 copy of K is live on top
+  of the int8 outputs. That alone costs 571 of the 858 MiB.
+- **Fused q/k/v erases the rest.** `qkv_proj(x).split(...)` leaves the three
+  as views over one allocation, so releasing q and k frees nothing, and by
+  the time v is released `per_channel_fp8`'s full-size bf16 transpose buffer
+  has already set a higher peak.
+
+Isolated against the obvious confound: the fused arm also runs NHD, so
+separate-NHD was measured as the missing cell and returned -858 / -287,
+identical to separate-HND. Layout is not the cause; fusion is.
+
+**Consequence for the backlog.** Dropping `per_channel_fp8`'s transpose
+buffer and doing the mean-subtraction in place are not two independent
+wins -- in the fused case each alone leaves the other setting the floor
+(transpose alone 3148 -> 2859, both together 3148 -> 2573). They have to
+ship as one change or neither is worth doing.
+
+Not retracted by `git revert` per the usual convention: the wrong number
+rode in on `bbd5fca`, which is the feature commit, so reverting would
+remove `sageattn_consume` itself. The forward-facing surfaces
+(`core.py` docstring, CLAUDE.md consumer surface) are corrected in place
+and point here.
+
+Why it survived three months: `tests/test_sageattn_consume.py` asserted a
+single threshold at `smooth_k=False` with separate tensors. It passed, and
+a passing test that measures the wrong configuration reads as
+verification. The test now publishes all four arms and deliberately
+asserts no threshold on the matrix -- see the measurement-validity rule in
+CLAUDE.md, of which this is the fourth logged instance.
+
 ### v0.7.2 -- 2026-08-06  (ragged tails no longer inherit stale shared memory)
 
 `csrc/qattn/attn_utils.cuh:131` issued its predicated `cp.async` with

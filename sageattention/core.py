@@ -1192,17 +1192,35 @@ def sageattn_consume(
     the float tensors are freed as soon as their quantized forms exist
     rather than at the end of the call.
 
+    **What this saves depends entirely on how the caller allocated q/k/v,
+    and in the most common arrangement it currently saves nothing.**
     Measured at MiniMax H3's fl2va shape (S=41822, heads 56, head_dim 128,
-    bf16), one arm per process:
+    bf16), peak per call, one arm per process:
 
-        sageattn()                     3148 MiB peak
-        sageattn_consume()             2290 MiB peak   (-858 MiB)
+        allocation      smooth_k   sageattn   consume    saved
+        separate           False      3148       2290     -858
+        separate           True       3148       2862     -287
+        fused QKV views    False      3148       3148        0
+        fused QKV views    True       3148       3148        0
 
-    Against ComfyUI's `attention_sage` wrapper, which carries another
-    ~570 MiB of its own, the same shape reads 3720 -> 2290 MiB, so a
-    consumer node replacing that path sees roughly 1430 MiB. Either way it
-    is per attention call, which is what makes it matter when a 21 GB
-    checkpoint is resident on a 24 GB card.
+    Both axes matter and neither is obvious:
+
+    - `smooth_k` defaults to True, and `per_thread_int8` allocates
+      q_int8/k_int8 *before* evaluating `k = k - km`, so a full bf16 copy of
+      K sits on top of them and eats most of the saving.
+    - When q/k/v are three views of one fused QKV buffer -- which is what
+      `qkv_proj(x).split(...)` produces, i.e. how essentially every DiT block
+      makes them -- releasing q and k frees nothing, because v still
+      references the same allocation. By the time v is released,
+      `per_channel_fp8`'s full-size bf16 transpose buffer has already set a
+      higher peak.
+
+    So the honest summary is: worth calling when q/k/v are separate
+    allocations, a no-op when they are views of one buffer. Making the fused
+    case pay requires dropping that transpose buffer *and* doing the
+    mean-subtraction in place; either alone leaves the other setting the
+    floor. Verified in `tests/test_sageattn_consume.py`, which measures all
+    four arms rather than asserting a single headline number.
 
     Parameters
     ----------

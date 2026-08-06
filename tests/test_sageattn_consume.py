@@ -99,17 +99,35 @@ def test_rejects_malformed_input():
     print("  malformed input rejected")
 
 
-def _peak_over_call(use_consume):
+def _qkv_fused(s, dtype=torch.bfloat16):
+    """Three NHD views into one packed QKV buffer -- how a DiT block makes them.
+
+    `qkv_proj(x).split(heads*head_dim, dim=-1)` leaves q/k/v as views over a
+    single allocation, so `stride_seq` is 3*H*D (21504 here) rather than H*D.
+    That is what makes releasing q and k free nothing: v still references the
+    same block. The buffer handle is dropped before returning so the views are
+    its only owners, as in production.
+    """
+    buf = torch.randn(1, s, 3 * H * D, device="cuda", dtype=dtype)
+    views = [
+        buf[:, :, i * H * D : (i + 1) * H * D].view(1, s, H, D) for i in range(3)
+    ]
+    del buf
+    return views
+
+
+def _peak_over_call(use_consume, smooth_k=False, fused=False):
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
-    q, k, v = _qkv(S_PEAK)
+    layout = "NHD" if fused else "HND"
+    q, k, v = (_qkv_fused if fused else _qkv)(S_PEAK)
     if use_consume:
         box = [q, k, v]
         del q, k, v
-        o = sageattn_consume(box, tensor_layout="HND", smooth_k=False)
+        o = sageattn_consume(box, tensor_layout=layout, smooth_k=smooth_k)
     else:
-        o = sageattn(q, k, v, tensor_layout="HND", smooth_k=False)
+        o = sageattn(q, k, v, tensor_layout=layout, smooth_k=smooth_k)
         del q, k, v
     torch.cuda.synchronize()
     peak = torch.cuda.max_memory_allocated() - base
@@ -139,6 +157,46 @@ def test_peak_vram_is_lower():
     )
 
 
+def test_peak_across_shipped_config():
+    """Claim: the headline saving is configuration-dependent, and the case
+    above is not the configuration consumers run.
+
+    `test_peak_vram_is_lower` passes `smooth_k=False` with three separately
+    allocated tensors. Production is the opposite on both axes: `smooth_k`
+    defaults to True (core.py:948) and a DiT block hands over three views of
+    one fused QKV buffer. Both axes move the peak, for different reasons:
+
+      smooth_k=True  -- `per_thread_int8` allocates q_int8/k_int8 first, then
+        does `k = k - km` (quant_per_thread.py:176-180), so a full bf16 copy
+        of K is live on top of them.
+      fused          -- releasing q and k frees nothing, because v still
+        references the same allocation.
+
+    This case does not assert a threshold. Its job is to publish the real
+    numbers so a doc quoting one of them says which arm it came from; a
+    threshold here would just re-freeze the same mistake one config over.
+    """
+    print(f"  {'arm':<34}{'sageattn':>10}{'consume':>10}{'saved':>10}")
+    results = {}
+    for fused in (False, True):
+        for smooth_k in (False, True):
+            # consume first: a prior arm trains the caching allocator and
+            # biases whatever runs second (CLAUDE.md, peak-HBM discipline).
+            c = _peak_over_call(True, smooth_k=smooth_k, fused=fused)
+            p = _peak_over_call(False, smooth_k=smooth_k, fused=fused)
+            label = f"{'fused qkv' if fused else 'separate'}, smooth_k={smooth_k}"
+            results[(fused, smooth_k)] = (p, c)
+            print(
+                f"  {label:<34}{p / 2**20:>9.0f}M{c / 2**20:>9.0f}M"
+                f"{(p - c) / 2**20:>+9.0f}M"
+            )
+    shipped = results[(True, True)]
+    print(
+        f"  shipped config (fused + smooth_k=True) saves "
+        f"{(shipped[0] - shipped[1]) / 2**20:+.0f} MiB"
+    )
+
+
 LIGHT_CASES = [
     test_matches_sageattn_output,
     test_empties_the_list,
@@ -159,6 +217,7 @@ def main() -> int:
     free, _ = torch.cuda.mem_get_info()
     if free >= PEAK_VRAM_BYTES:
         cases.append(test_peak_vram_is_lower)
+        cases.append(test_peak_across_shipped_config)
     else:
         print(
             f"Skipping the peak-VRAM case: needs "
