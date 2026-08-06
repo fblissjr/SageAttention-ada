@@ -897,6 +897,63 @@ sufficient.
 
 ## Versions
 
+### v0.7.2 -- 2026-08-06  (ragged tails no longer inherit stale shared memory)
+
+`csrc/qattn/attn_utils.cuh:131` issued its predicated `cp.async` with
+`SharedMemFillMode::kNoFill`, so the out-of-range lanes of a ragged K/V
+tile kept whatever the previous launch left in that shared-memory bank.
+Flipped to `kFillZero`. Free: the mode is a compile-time `if constexpr`
+in `csrc/cp_async.cuh` and zero-fill is a native `cp.async` operand, not
+an added store.
+
+Same defect `woct0rdho/SageAttention` fixed in `e147939` (2026-07-16),
+which this fork had not picked up. Found independently here; the
+measurement narrows the characterization in three ways worth recording,
+because each one changes how the defect should be tested for.
+
+**It does not fire in a fresh process.** On the unfixed kernel the
+short-length sweep passes, worst mean_rtol 0.0345. The defect needs a
+*previous* launch to have left non-finite values in shared memory. A
+regression test that does not deliberately dirty shared memory first is
+green against a broken kernel; `tests/test_short_seq_tail.py` dirties with
+`+inf` before every sweep for exactly this reason.
+
+**The boundary is one K tile, not "non-multiples".** Dirtied, every
+`kv_len < 64` returns 100% non-finite output. `kv_len >= 64` is clean
+including ragged 127 / 385, because past the first full tile the stale
+lanes hold this launch's own earlier rows -- finite, and softmax weights
+them p=0 so they contribute nothing. Only non-finite residue survives the
+multiply.
+
+**The exposed path is sm80 fp16, not the sm89 default.** On sm89 the
+predicated loader carries K only (int8, cannot be non-finite) and the
+out-of-range columns are masked before softmax, so there the flip is
+defense-in-depth -- it removes the dependency on that mask being present
+in every variant. On sm80, `qk_int_sv_f16_cuda_sm80.cu:257,351,449` puts
+*V* through the same predicated load as fp16, and P@V has no mask to hide
+it. `sageattn_qk_int8_pv_fp16_cuda` is an exported consumer entry point
+and is forward-compatible onto Ada, so it is reachable here.
+
+Related question closed while validating: the sm89 fp8 V load
+(`load_fp8_V_global_to_share`, `qk_int_sv_f8_cuda_sm89.cuh:266`) takes no
+predicate at all, and the upstream comment at line 263 warns it "assumes
+that V is padded." It is, explicitly and at two levels --
+`per_channel_fp8` allocates the transposed buffer at
+`(kv_len + 63) // 64 * 64` (`sageattention/quant.py:273-279`), and
+`transpose_pad_permute_cuda` instantiates `TransposePadPermuteKernel` with
+`pad_zero=true`, which selects `kFillZero` at `csrc/fused/fused.cu:293`.
+The pad rows are hardware-zeroed, so the unpredicated read lands in
+deliberately zeroed memory rather than out of bounds. Verified at
+production scale: paired exact/ragged shapes at H3's config (56 heads,
+128 dim) -- 37760/37810 and 109120/109126, the latter being the 362-frame
+render shape with a 6-row tail -- all zero non-finite outputs. This holds
+for V routed through `per_channel_fp8`; a consumer that hand-rolls
+quantization and passes an unpadded `v_fp8` straight to the pybind entry
+point would hit the unguarded read.
+
+Test: `tests/test_short_seq_tail.py`, 5 cases, red before / green after.
+Two are controls that pass in both states by design and say so.
+
 ### v0.7.1 -- 2026-08-05  (long-sequence validation: the v0.7.0 overflow fix holds at 362 frames, and the int64 path is free)
 
 No code change. This closes a measurement gap that v0.7.0 left open and
