@@ -122,6 +122,8 @@ The right evidence ladder, primary to weakest:
 
    `PYTHONUNBUFFERED=1` does **not** reliably fix it: if the launcher goes through a wrapper (`uv run --active`), the variable does not propagate to the child, and it does nothing at all about a downstream pipe stage. Use `stdbuf -oL -eL`, and prefer an HTTP status endpoint (`/queue`, `/history`) over log scraping for run state -- an endpoint has no buffering stage to forget about, which is what makes it the reliable read.
 
+   Two practical forms, in order of preference. **Prefer a surface that structurally cannot buffer** -- an HTTP status endpoint was the correct read all day while three separate log-scraping attempts were not. **When only a log exists, confirm its byte count is still growing before reading meaning into an absence** (`wc -c` twice, seconds apart); a static size means you are looking at the transport, not the process.
+
    The self-check that would have caught all four: before concluding anything from an empty output, ask what a *positive* would look like on this instrument, and confirm one has ever arrived through it.
 
    The general form is worth stating because it applies to this whole ladder: **an absent log line and a silent fallback are the same observation.** Rung 2 is only evidence if you have independently established that a line which *was* written would have arrived. Before concluding "no log, therefore not firing," produce one known-good line through the same transport.
