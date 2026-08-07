@@ -19,7 +19,7 @@ per-channel across the whole sequence. A longer sequence is a longer
 window for an outlier to compress the scale and coarsen every other value
 in that channel. If that dominates, rtol should climb with S.
 
-It also settles a claim written into ComfyUI-sageattn-ada's kernel setup
+It also settles a claim written into ComfyUI-h3-explorations's kernel setup
 without evidence -- that `smooth_k` "buys nothing measurable at these
 shapes". SageAttention defaults it on, KJNodes' H3 patch enables it, and
 this node turned it off. Either the claim holds or the node is needlessly

@@ -199,9 +199,9 @@ streaming only 4.5% -- so this is compute-bound, not PCIe-bound, and
 attention is still the largest single cost even after the win.
 
 Peak VRAM ~20.6 GB of 24 GB at length 73. Consumer node lives separately
-in [ComfyUI-sageattn-ada](https://github.com/fblissjr/ComfyUI-sageattn-ada),
+in [ComfyUI-h3-explorations](https://github.com/fblissjr/ComfyUI-h3-explorations),
 per the "sage-fork stays primitive" rule. Its
-[SOLATTN.md](https://github.com/fblissjr/ComfyUI-sageattn-ada/blob/main/SOLATTN.md)
+[SOLATTN.md](https://github.com/fblissjr/ComfyUI-h3-explorations/blob/main/SOLATTN.md)
 carries the sage + Sol-Attn stacking experiments.
 
 ### An accuracy calibration worth knowing
