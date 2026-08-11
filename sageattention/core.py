@@ -1350,10 +1350,18 @@ def sageattn_consume_prefers_cloned_v(device=None) -> bool:
     `sageattn_consume`'s docstring for the measurement -- 286 MiB per call at
     S=41822 when the answer is True, and a flat 572 MiB cost when it is False.
 
-    The two halves the caller still owns are deliberately not folded in here.
-    Cloning only pays with `smooth_k=False` and only on a fused buffer, and
-    the caller knows both without asking; rolling them in would make a False
+    The halves the caller still owns are deliberately not folded in here.
+    Cloning only pays with `smooth_k=False`, only on a fused buffer, and
+    only if the list you hand over is genuinely the last owner; the caller
+    knows all three without asking, and rolling them in would make a False
     ambiguous between "wrong arch" and "your config".
+
+    That last one is the easy one to get wrong, because a True here does not
+    check it. If you slice q/k/v into groups and call in a loop, the frame
+    running the loop holds the originals for its whole duration, so the
+    per-call release frees nothing and the clone is a flat cost with nothing
+    to recover it. Decide the clone *after* you know whether you are taking
+    that path, not before.
 
     Cheap and stable: one list index against an arch table built at import,
     so it is safe to call per forward and to cache per device index. Prefer
