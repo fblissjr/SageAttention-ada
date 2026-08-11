@@ -1357,11 +1357,18 @@ def sageattn_consume_prefers_cloned_v(device=None) -> bool:
     ambiguous between "wrong arch" and "your config".
 
     That last one is the easy one to get wrong, because a True here does not
-    check it. If you slice q/k/v into groups and call in a loop, the frame
-    running the loop holds the originals for its whole duration, so the
-    per-call release frees nothing and the clone is a flat cost with nothing
-    to recover it. Decide the clone *after* you know whether you are taking
-    that path, not before.
+    check it. If you slice q/k/v into groups and call per group, the frame
+    doing the slicing holds the originals for the whole sequence, so each
+    release frees nothing and the clone is a flat cost with nothing to
+    recover it. Measured inert in `tests/test_sageattn_consume.py`, against
+    a handover arm saving 858 MiB in the same harness.
+
+    Note it is the retained parents, not the group count: a *single*-group
+    pass through the same slicing code loses the saving just as completely.
+    So a caller with both paths keeps the whole benefit only by routing the
+    unchunked case through a real handover, and decides the clone *after*
+    it knows which path it is on -- deciding earlier is how the loop case
+    slips through.
 
     Cheap and stable: one list index against an arch table built at import,
     so it is safe to call per forward and to cache per device index. Prefer

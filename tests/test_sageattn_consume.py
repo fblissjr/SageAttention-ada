@@ -36,6 +36,10 @@ Claims, i.e. what breaks if a case is deleted:
                               case. Delete and our release timing can
                               regress without any arm noticing, turning
                               a consumer's saving into a pure cost.
+  - inert_under_*_chunking  : that a caller retaining q/k/v gets nothing,
+                              which is advice we give in the predicate's
+                              docstring. Delete and that paragraph is a
+                              mechanism claim with no arm behind it.
 
 Standalone script (no pytest); run via $VIRTUAL_ENV/bin/python.
 Needs CUDA. The peak-VRAM case needs ~6 GiB free and skips without it.
@@ -296,6 +300,131 @@ def test_fused_caller_cloned_v_recovers_the_saving():
     )
 
 
+def _peak_over_chunked_call(use_consume, n_chunks):
+    """Peak over a caller that slices q/k/v into head groups and loops.
+
+    The low-VRAM pattern: attend `n_chunks` head groups in turn so the
+    kernel's own int8/fp8 transients scale with the group rather than the
+    full head count. The loop frame holds the un-sliced q/k/v throughout,
+    which is what makes this the interesting case for `sageattn_consume`.
+
+    Separate NHD allocations, deliberately. Fused views would suppress the
+    saving on their own, so a flat result at `n_chunks > 1` could not be
+    attributed to the chunking -- see the paired control in the case below.
+    """
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    q, k, v = [
+        torch.randn(1, S_PEAK, H, D, device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    ]
+    out = torch.empty((1, S_PEAK, H, D), dtype=q.dtype, device=q.device)
+    if n_chunks is None:
+        # The comparand: hand the whole thing over and retain nothing. This
+        # is what an unchunked caller does, and it is the *only* difference
+        # from the loop below -- same allocations, same output buffer.
+        if use_consume:
+            box = [q, k, v]
+            del q, k, v
+            out[:] = sageattn_consume(box, tensor_layout="NHD", smooth_k=False)
+        else:
+            out[:] = sageattn(q, k, v, tensor_layout="NHD", smooth_k=False)
+            del q, k, v
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - base
+        del out
+        torch.cuda.empty_cache()
+        return peak
+    start = 0
+    for i in range(n_chunks):
+        end = start + H // n_chunks + (1 if i < H % n_chunks else 0)
+        if use_consume:
+            box = [q[:, :, start:end], k[:, :, start:end], v[:, :, start:end]]
+            out[:, :, start:end] = sageattn_consume(
+                box, tensor_layout="NHD", smooth_k=False
+            )
+        else:
+            out[:, :, start:end] = sageattn(
+                q[:, :, start:end], k[:, :, start:end], v[:, :, start:end],
+                tensor_layout="NHD", smooth_k=False,
+            )
+        start = end
+    del q, k, v
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - base
+    del out
+    torch.cuda.empty_cache()
+    return peak
+
+
+def test_consume_is_inert_under_caller_side_chunking():
+    """Claim: a True from the predicate does not survive a slicing caller.
+
+    `sageattn_consume_prefers_cloned_v`'s docstring tells callers that if
+    they slice q/k/v into groups and call in a loop, the per-call release
+    frees nothing, because the frame running the loop holds the originals
+    for its whole duration. That sentence is committed advice, and the
+    clone half of it is measured -- a consumer found the loop shape costing
+    a flat 572 MiB with nothing to recover it. This is the other half, which
+    was reasoned rather than measured when it was written.
+
+    Equality is the claim: under chunking, consume and plain `sageattn`
+    reach the same peak. Red in either direction is informative. Lower means
+    the release does reach something and the docstring understates
+    consume; higher means consume costs something here and the advice
+    should be stronger than "no benefit".
+
+    Delete this and the docstring keeps asserting a mechanism nothing
+    checks, which is how the fused-case number stayed wrong for three
+    months.
+    """
+    n = 4
+    # Consume arm first in each pair, per the peak-HBM ordering discipline.
+    saved = {}
+    for label, chunks in (("handover", None), (f"loop, n={n}", n), ("loop, n=1", 1)):
+        c = _peak_over_chunked_call(True, chunks)
+        p = _peak_over_chunked_call(False, chunks)
+        saved[label] = (p - c) / 2**20
+        print(
+            f"  {label:<12} sageattn {p / 2**20:>5.0f} MiB, consume "
+            f"{c / 2**20:>5.0f} MiB ({saved[label]:+.0f} MiB)"
+        )
+    # The control, asserted first because the claim below is meaningless
+    # without it. Same allocations, same output buffer, differing only in
+    # whether the caller retains q/k/v: consume must show its usual saving
+    # here, or a flat result in the loop arms says nothing about looping and
+    # only says this harness cannot see a saving at all.
+    assert saved["handover"] > 400, (
+        f"handover consume saved only {saved['handover']:.0f} MiB in this "
+        f"harness; expected the usual ~858. Nothing below is trustworthy "
+        f"until this pair reproduces the saving that looping suppresses."
+    )
+    # Retention is the mechanism, not the group count. A one-group loop
+    # still passes a slice while the frame holds the parent, so it loses the
+    # saving exactly like a four-group one. Without this row, a reader could
+    # conclude that chunking is what costs them and that n=1 is safe.
+    assert abs(saved["loop, n=1"]) < 64, (
+        f"a one-group loop saved {saved['loop, n=1']:+.0f} MiB, so the "
+        f"suppression tracks the group count rather than the retained "
+        f"parents -- the stated mechanism is wrong"
+    )
+    chunked_saved = saved[f"loop, n={n}"]
+    single_saved = saved["handover"]
+    # Tolerance, not equality: both arms allocate identically, but the
+    # allocator is free to round differently across arms. The suppressed
+    # saving is ~858 MiB, so anything inside this band is unambiguous.
+    assert abs(chunked_saved) < 64, (
+        f"consume moved the peak by {chunked_saved:+.0f} MiB under {n}-way "
+        f"head chunking, while saving {single_saved:.0f} MiB unchunked in "
+        f"the same harness; expected it to be inert, because the loop frame "
+        f"holds the un-sliced q/k/v so releasing a slice frees nothing. The "
+        f"slice-and-loop paragraph in "
+        f"`sageattn_consume_prefers_cloned_v`'s docstring is now wrong in "
+        f"whichever direction this moved."
+    )
+
+
 def test_peak_across_shipped_config():
     """Claim: the headline saving is configuration-dependent, and the case
     above is not the configuration consumers run.
@@ -367,6 +496,7 @@ def main() -> int:
     if free >= PEAK_VRAM_BYTES:
         cases.append(test_peak_vram_is_lower)
         cases.append(test_fused_caller_cloned_v_recovers_the_saving)
+        cases.append(test_consume_is_inert_under_caller_side_chunking)
         cases.append(test_peak_across_shipped_config)
     else:
         print(
