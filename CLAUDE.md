@@ -466,10 +466,24 @@ Sage exposes three surfaces to downstream consumers:
    time v goes `per_channel_fp8`'s bf16 transpose buffer has set a
    higher peak. The earlier "~435 MiB in the fused case" figure was
    wrong; corrected in CHANGELOG v0.7.3. Making the fused case pay
-   needs the transpose buffer dropped **and** the mean-subtraction done
-   in place -- either alone leaves the other setting the floor. Only
-   the sm89 fp8 path releases early; other kernels fall back to the
-   ordinary path, correct but with no saving.
+   *from in here* needs the transpose buffer dropped **and** the
+   mean-subtraction done in place -- either alone leaves the other
+   setting the floor. Only the sm89 fp8 path releases early; other
+   kernels fall back to the ordinary path, correct but with no saving.
+5. **`sageattn_consume_prefers_cloned_v(device)`** (v0.7.4) -- the
+   caller-side way out of that fused case, and the answer to "should I
+   clone?". A caller that clones v before handing the list over gives
+   it its own storage, so releasing q and k frees the fused buffer:
+   -286 MiB per call at fl2va, for one third of the buffer. Both halves
+   are load-bearing and asymmetric -- cloning without consuming is a
+   flat +572 MiB, and consuming at `smooth_k=True` hands the clone
+   straight back (+286 the wrong way). ComfyUI does this in
+   `comfy/ldm/minimax/model.py` as of 2026-08-11. Consumers gate on the
+   predicate rather than on an arch check so that a) they don't copy
+   `core._EARLY_RELEASE_ARCHS` into their node where it drifts silently,
+   and b) they inherit the flip to False if the transpose-buffer backlog
+   item ever lands, which retires the clone rather than stacking with
+   it. Numbers + reasoning in CHANGELOG v0.7.4.
 
 **`attn_mask` must stay a named parameter of `sageattn()`**, not a
 `**kwargs` entry. ComfyUI gates masked calls on `"attn_mask" in

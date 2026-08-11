@@ -151,6 +151,19 @@ buffer alone moves the fused-case peak 3148 -> 2859, because `k = k - km`
 then sets the floor; the pair together reaches 2573. Whoever picks this back
 up needs both halves or the work under-delivers and looks like a failed bet.
 
+**What v0.7.4 does to this item.** Two things, in opposite directions.
+Consumers can now recover 286 of the ~575 MiB caller-side by cloning v
+(v0.7.4), with no kernel work at all, so the remaining prize here is
+smaller than it was. Against that, landing the pair *retires* the clone
+rather than stacking with it: a cloning caller's floor is 2859 (fused 1715
++ clone 572 + the int8 pair 572, all live before q and k are released),
+above the 2573 the pair reaches without cloning. So whoever ships this must
+also flip `sageattn_consume_prefers_cloned_v` to False and retire
+`test_fused_caller_cloned_v_recovers_the_saving`, which will go red for
+that reason and says so in its failure message. Consumers gate their clone
+on the predicate, not on an arch check, so the flip reaches them on upgrade
+without an edit on their side.
+
 ---
 
 Original entry follows.
@@ -938,6 +951,68 @@ a sage-fork kernel push with data. Until then the raw JSONL is
 sufficient.
 
 ## Versions
+
+### v0.7.4 -- 2026-08-11  (the fused case has a caller-side fix, and a predicate to gate it on)
+
+v0.7.3 said the fused-QKV case saves nothing and framed the only remedy as
+work inside this library. Both true, and both beside the point for the
+people calling it: a caller can clone v before handing the list over, which
+gives v its own storage so releasing q and k actually frees the fused
+buffer. It converts the fused case into the separate case for the price of
+one third of the buffer. A downstream consumer shipped for a week without
+the clone because the docstring read as "nothing to do here".
+
+Same shape, same protocol as v0.7.3's table (S=41822, heads 56, head_dim
+128, bf16, sm89, consume arm first, one arm per process):
+
+| allocation | `smooth_k` | `sageattn` | `sageattn_consume` | saved |
+|---|---|---|---|---|
+| separate | False | 3148 MiB | 2290 MiB | -858 |
+| separate | True | 3148 MiB | 2862 MiB | -287 |
+| fused QKV views | False | 3148 MiB | 3148 MiB | **0** |
+| fused QKV views | True | 3148 MiB | 3148 MiB | **0** |
+| fused, caller clones v | False | 3720 MiB | 2862 MiB | -858 |
+| fused, caller clones v | True | 3720 MiB | 3434 MiB | -287 |
+
+Read the last two rows against the 3148 a fused caller gets today, not
+against the 3720 in their own `sageattn` column: **-286 MiB** with
+`smooth_k=False`, and **+286**, i.e. worse than not cloning, with
+`smooth_k=True`. Both halves are load-bearing and the failure modes are not
+symmetric. Cloning without consuming is a flat +572 MiB. Consuming with
+`smooth_k=True` hands the clone straight back, because `per_thread_int8`
+allocates the int8 outputs before evaluating `k = k - km`.
+
+Not a hypothetical: ComfyUI added the same clone to its own H3 model on
+2026-08-11 (`62b3c94b`, "Fix peak memory issue with H3", #15486), so anyone
+running H3 through core's attention path is in the cloned column already.
+
+**New API: `sageattn_consume_prefers_cloned_v(device=None) -> bool`.**
+Whether cloning pays on that device. Callers were otherwise going to copy
+`{"sm89", "sm100", "sm120", "sm121"}` out of our dispatch, which drifts
+into a silent memory regression rather than an error. Deliberately shaped
+as the caller's question ("should I clone?") rather than ours ("do we
+release?"): those coincide today and come apart the moment the backlog's
+transpose-buffer item lands, at which point the release still happens while
+cloning becomes a 286 MiB cost. Behind the predicate that is a flip we make
+and consumers inherit on upgrade; behind `releases()` it would be a
+truthful answer to the wrong question. `smooth_k` and fused-vs-separate
+stay out of it -- the caller owns both and would only make a False
+ambiguous. One arch set, `core._EARLY_RELEASE_ARCHS`, read by the predicate
+and the dispatch alike.
+
+**Testing.** `tests/test_sageattn_consume.py` gains a `clone_v` axis, two
+published rows, and three asserting cases. The clone case is asserted where
+the neighbouring matrix deliberately only publishes, because the asymmetry
+warrants it: if our release timing regresses the clone does not merely stop
+paying, it becomes a 572 MiB penalty. Shown red both ways before being
+trusted -- clone removed reports +0 MiB, an extra owner holding the list's
+contents reports exactly -572, which is also what confirms the mechanism.
+The predicate's case mutates `_EARLY_RELEASE_ARCHS` to prove it reads that
+set rather than restating it; hardcoded, it would stay green with the set
+emptied.
+
+Contributed by the downstream consumer's clone (docstring rows and the
+clone case, `6e60b4f`), reviewed and extended here.
 
 ### v0.7.3 -- 2026-08-06  (correction: `sageattn_consume` saves nothing in the configuration DiT blocks actually use)
 

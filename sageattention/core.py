@@ -193,6 +193,39 @@ def get_cuda_arch_versions():
 # Currently get_cuda_arch_versions cannot be traced by torch.compile
 _cuda_archs = get_cuda_arch_versions()
 
+# Archs whose fp8 kernels take `sageattn_consume`'s early-release path. Kept
+# as one constant because `sageattn_consume_prefers_cloned_v` answers for it
+# too, and a second copy would let the predicate describe a dispatch that has
+# moved on -- which reaches a caller as a memory regression, not an error.
+_EARLY_RELEASE_ARCHS = frozenset({"sm89", "sm100", "sm120", "sm121"})
+
+
+def _resolve_cuda_index(device) -> int:
+    """Device index for `None` / int / str / `torch.device`, or ValueError."""
+    if device is None:
+        return torch.cuda.current_device()
+    if isinstance(device, int):
+        index = device
+    else:
+        resolved = torch.device(device)
+        if resolved.type != "cuda":
+            raise ValueError(
+                f"expected a CUDA device, got {device!r}. This asks about a "
+                f"specific GPU's kernels; there is no answer for a CPU "
+                f"tensor. If you are calling at model-patch time, the model "
+                f"may not be on its device yet -- ask in the forward instead."
+            )
+        index = (
+            torch.cuda.current_device() if resolved.index is None
+            else resolved.index
+        )
+    if not 0 <= index < len(_cuda_archs):
+        raise ValueError(
+            f"CUDA device index {index} out of range; this machine has "
+            f"{len(_cuda_archs)} device(s)"
+        )
+    return index
+
 
 def sageattn(
     q: torch.Tensor,
@@ -1235,6 +1268,13 @@ def sageattn_consume(
     with H3") and ComfyUI-h3-explorations does it in its H3 attention
     forward, gated on the mode reaching this entry point at all.
 
+    Gate that clone on `sageattn_consume_prefers_cloned_v(device)` rather
+    than on an arch check of your own: only the archs below release early,
+    and on the others the clone is a flat 572 MiB loss. Going through the
+    predicate also means a caller picks up the day we make the fused case
+    pay from in here, at which point cloning becomes a cost and the answer
+    flips to False.
+
     So the honest summary is: worth calling when q/k/v are separate
     allocations or when the caller is willing to clone v and pass
     `smooth_k=False`; a no-op on fused views otherwise. Verified in
@@ -1267,7 +1307,7 @@ def sageattn_consume(
 
     q = qkv[0]
     arch = _cuda_archs[q.device.index]
-    fp8_arch = arch in {"sm89", "sm100", "sm120", "sm121"}
+    fp8_arch = arch in _EARLY_RELEASE_ARCHS
     del q
 
     if not fp8_arch:
@@ -1299,6 +1339,49 @@ def sageattn_consume(
         tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale,
         attn_mask=attn_mask, _qkv_box=qkv, **kwargs,
     )
+
+
+def sageattn_consume_prefers_cloned_v(device=None) -> bool:
+    """Should a caller with a fused QKV buffer clone v before `sageattn_consume`?
+
+    Answers the caller-side question, not a question about our internals: if
+    your q/k/v are views of one allocation and you pass `smooth_k=False`,
+    does giving v its own storage lower the peak on this device? See
+    `sageattn_consume`'s docstring for the measurement -- 286 MiB per call at
+    S=41822 when the answer is True, and a flat 572 MiB cost when it is False.
+
+    The two halves the caller still owns are deliberately not folded in here.
+    Cloning only pays with `smooth_k=False` and only on a fused buffer, and
+    the caller knows both without asking; rolling them in would make a False
+    ambiguous between "wrong arch" and "your config".
+
+    Cheap and stable: one list index against an arch table built at import,
+    so it is safe to call per forward and to cache per device index. Prefer
+    calling it in the forward over model-patch time -- a patched model may
+    not be on its final device yet, and on a multi-GPU box that bakes an
+    answer for the wrong GPU.
+
+    Parameters
+    ----------
+    device : None, int, str or torch.device
+        Which GPU to answer for. `None` means the current device. A non-CUDA
+        device raises rather than returning False, because a plausible
+        boolean for the wrong device is the failure this exists to prevent.
+
+    Returns
+    -------
+    bool
+        Today this is exactly "does this arch take the early-release path",
+        because the caller's clone is what lets the fused buffer die once q
+        and k are released. It stops being the same question if
+        `per_channel_fp8` ever drops its transpose buffer *and* the
+        mean-subtraction moves in place (CHANGELOG Backlog): the release
+        would still happen, while the no-clone peak would fall below what a
+        cloning caller can reach, so this would go False while the release
+        path stayed on. Callers gate on this rather than on the arch set so
+        that flip reaches them on upgrade instead of needing an edit.
+    """
+    return _cuda_archs[_resolve_cuda_index(device)] in _EARLY_RELEASE_ARCHS
 
 
 def sageattn_warmup(
