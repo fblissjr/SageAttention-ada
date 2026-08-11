@@ -12,9 +12,25 @@ is evaluated in int32 and wraps once a tensor exceeds 2**31 elements
          Measured result is an illegal memory access.
 
 Both are reachable at MiniMax H3's attention config (heads 56, head_dim
-128) past roughly 300k packed rows. Rather than pay int64 address
-arithmetic everywhere, the kernels take a `USE_I64` constexpr and the
-wrappers call `needs_int64_offsets` to pick a specialization per launch.
+128), and where they become reachable depends on how the caller allocated
+q/k/v, not on sequence length alone. `max_element_offset` reads the real
+strides and so gets this right; quoting a single row count does not:
+
+  contiguous NHD -- `stride_n` is heads*head_dim = 7168, crossing near
+                    299,593 rows.
+  fused QKV view -- `stride_n` is 3*heads*head_dim = 21504, crossing near
+                    99,864 rows. Three times sooner, and it is the layout
+                    a DiT block actually produces from one qkv projection.
+
+The fused figure is the one that matters in practice. H3 at 362 frames is
+S=109,126, which is comfortably inside a 300k budget and past the real
+crossing; v0.7.1 measured the specialization firing exactly there. Any
+check written against the contiguous number stays silent on the layout
+that overflows first, so an absent warning is not evidence of clearance.
+
+Rather than pay int64 address arithmetic everywhere, the kernels take a
+`USE_I64` constexpr and the wrappers call `needs_int64_offsets` to pick a
+specialization per launch.
 
 Upstream (`thu-ml/SageAttention`) has this bug in all three quant
 modules; see CHANGELOG.md for the divergence record.
