@@ -200,6 +200,22 @@ _cuda_archs = get_cuda_arch_versions()
 _EARLY_RELEASE_ARCHS = frozenset({"sm89", "sm100", "sm120", "sm121"})
 
 
+def _has_native_mask_kernel(arch: str) -> bool:
+    """Whether this arch has a mask-correct CUDA kernel (v0.5.5, fp8++).
+
+    One function rather than one condition written twice. Both `sageattn`
+    and `sageattn_consume` decide masked routing on this, and before v0.7.6
+    only `sageattn` decided it at all, so a masked consume call took a
+    mask-dropping kernel on sm89 with CUDA < 12.8 and the native-mask path
+    on archs the dispatcher deliberately sends to Triton. Copying the
+    condition into the second caller would have fixed today's divergence
+    and left the next one available: two call sites that agree by
+    inspection drift the moment one is edited, which is how the first one
+    happened.
+    """
+    return arch == "sm89" and get_cuda_version() >= (12, 8)
+
+
 def _resolve_cuda_index(device) -> int:
     """Device index for `None` / int / str / `torch.device`, or ValueError."""
     if device is None:
@@ -310,7 +326,7 @@ def sageattn(
     if attn_mask is not None:
         # Native CUDA mask only on sm89 + CUDA >= 12.8 today. Other archs
         # still need the Triton fallback for mask correctness.
-        if arch == "sm89" and get_cuda_version() >= (12, 8):
+        if _has_native_mask_kernel(arch):
             kwargs.setdefault("pv_accum_dtype", "fp32+fp16")
             _log_routing_choice_once(arch, True, "fp32+fp16", KERNEL_FP8_CUDA_PP)
             return sageattn_qk_int8_pv_fp8_cuda(
@@ -1373,9 +1389,7 @@ def sageattn_consume(
     # dispatcher deliberately routes to Triton for mask correctness. Both
     # entry points have to agree about this or the safe default is only
     # safe depending on which one a consumer reached for.
-    mask_needs_triton = attn_mask is not None and not (
-        arch == "sm89" and get_cuda_version() >= (12, 8)
-    )
+    mask_needs_triton = attn_mask is not None and not _has_native_mask_kernel(arch)
 
     if not fp8_arch or mask_needs_triton:
         # No early-release path here; behave exactly like sageattn() and

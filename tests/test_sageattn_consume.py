@@ -58,6 +58,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import sageattention
 from sageattention import core, sageattn, sageattn_consume
+from sageattention.core import KERNEL_FP16_TRITON
 
 # MiniMax H3's attention config, at a shape small enough to run anywhere
 # while still making the float tensors dominate the peak.
@@ -162,6 +163,49 @@ def test_mask_survives_the_early_release():
             f"early release must change when tensors are freed, not the math"
         )
     print("  masked consume matches masked sageattn, and the mask reaches the kernel")
+
+
+def test_both_entry_points_read_one_mask_gate():
+    """Claim: masked routing is one decision, not two that happen to agree.
+
+    `sageattn` sends masked calls to Triton unless the arch has a
+    mask-correct CUDA kernel. Until v0.7.6 `sageattn_consume` applied no
+    such gate at all, so a masked call took a mask-dropping kernel on
+    sm89 with CUDA < 12.8 and the native-mask path on archs the dispatcher
+    avoids. That divergence existed because the two entry points had
+    separate routing code nobody had diffed.
+
+    Copying the condition into the second caller would have closed the
+    instance and left the class open. Both now call
+    `_has_native_mask_kernel`, and this forces it False to prove they read
+    it: with no native mask kernel anywhere, both must route a masked call
+    to Triton.
+
+    Shown red against the copied-condition version before being trusted.
+    With consume holding its own inline copy, patching the shared function
+    moves only `sageattn`, and this reports
+    `sageattn='fp16_triton', consume='fp8_cuda++'`.
+    """
+    original = core._has_native_mask_kernel
+    q, k, v = _qkv(256)
+    mask = torch.ones(1, 1, 256, 256, device="cuda", dtype=torch.bool).tril()
+    try:
+        core._has_native_mask_kernel = lambda arch: False
+        core.get_last_dispatched_kernel()  # clear any prior value
+        sageattn(q, k, v, tensor_layout="HND", attn_mask=mask, smooth_k=False)
+        via_sageattn = core.get_last_dispatched_kernel()
+        box = [q, k, v]
+        del q, k, v
+        sageattn_consume(box, tensor_layout="HND", attn_mask=mask, smooth_k=False)
+        via_consume = core.get_last_dispatched_kernel()
+    finally:
+        core._has_native_mask_kernel = original
+    assert via_sageattn == via_consume == KERNEL_FP16_TRITON, (
+        f"with no native mask kernel, both entry points must route a masked "
+        f"call to Triton; got sageattn={via_sageattn!r}, "
+        f"consume={via_consume!r}. One of them is not reading the gate."
+    )
+    print(f"  both entry points routed to {via_sageattn} under a forced-False gate")
 
 
 class _StandInContainer:
@@ -664,6 +708,7 @@ LIGHT_CASES = [
     test_empties_the_list,
     test_rejects_malformed_input,
     test_mask_survives_the_early_release,
+    test_both_entry_points_read_one_mask_gate,
     test_accepts_containers_and_empties_them,
     test_rejects_spent_and_mixed_containers,
     test_accepts_comfyui_containers,

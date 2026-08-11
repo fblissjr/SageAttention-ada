@@ -1002,9 +1002,25 @@ An earlier attempt to verify it compared `fp32+fp32`-with-mask against
 control worked. Two variables, one comparison, no information -- the same
 unisolating-comparand error this session hit twice already.
 
+**And the first version of that second fix left the class open.** It gave
+consume the same condition rather than the same decision: two call sites
+with `arch == "sm89" and get_cuda_version() >= (12, 8)` written out
+separately, agreeing by inspection. That is the arrangement the original
+divergence came from, and it drifts the moment one side is edited. Both
+now call `_has_native_mask_kernel`, the same treatment
+`_EARLY_RELEASE_ARCHS` got a version earlier for the same reason.
+
+The case that holds it forces the gate False and asserts both entry points
+route a masked call to Triton, and it was shown red against the
+copied-condition version first: with consume holding an inline copy,
+patching the shared function moves only `sageattn`, and the case reports
+`sageattn='fp16_triton', consume='fp8_cuda++'`. A test that only asserted
+agreement would have passed against both implementations, since they agree
+on every arch this fork supports.
+
 Masked accuracy unchanged: `tests/repros/repro_cuda_mask_kernel.py` scores
 fp8++ at mean_rtol 0.087-0.094 across the kv sweep against Triton, matching
-the recorded fingerprint. 13/13 in `tests/test_sageattn_consume.py`.
+the recorded fingerprint. 14/14 in `tests/test_sageattn_consume.py`.
 
 ### v0.7.5 -- 2026-08-11  (`sageattn_consume` speaks ComfyUI's container protocol)
 
