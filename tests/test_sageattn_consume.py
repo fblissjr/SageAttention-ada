@@ -61,7 +61,7 @@ from sageattention import core, sageattn, sageattn_consume
 # while still making the float tensors dominate the peak.
 H, D = 56, 128
 S_SMALL = 4096
-S_PEAK = 41822  # fl2va at the node's default canvas
+S_PEAK = 41822  # fl2va, 16:9 canvas -- packed length, not a settable default
 PEAK_VRAM_BYTES = 6 * 2**30
 
 
