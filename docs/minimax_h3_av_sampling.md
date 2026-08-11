@@ -150,7 +150,9 @@ block. Sequence length, head count, head dim, call count per step and the
 attention share of the step are all untouched. So:
 
 - the fl2va shape (S=41822, heads 56, head_dim 128) and every number taken at it
-- `sageattn_consume` and its -858 MiB / ~435 MiB peak readings
+- `sageattn_consume` and its peak readings (-858 MiB separate /
+  `smooth_k=False`, 0 against a fused QKV buffer; the "~435 MiB fused"
+  figure this line used to quote was retracted in v0.7.3)
 - the `per_channel_fp8` 572 MiB transient
 - the v0.7.0 mask-probe fix and the int32 quant-overflow fix
 - the 757.7 ms per-call figure and the 76%-of-step attention share at 362 frames
