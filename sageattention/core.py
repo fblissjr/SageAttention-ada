@@ -1133,6 +1133,34 @@ def sageattn_qk_int8_pv_fp8_cuda(
     elif qk_quant_gran == "per_thread":
         q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64)
 
+    # Mask preparation reads q and k -- dtype, device, and the broadcast
+    # target shape -- so it has to happen while they are still alive. The
+    # _qkv_box path below releases them, and doing this afterwards raised
+    # UnboundLocalError on every masked consume call from v0.7.0 to v0.7.6.
+    # Prepared here rather than by capturing q.device and a target shape for
+    # later use, so no future edit can reintroduce a read of a released name.
+    # attn_mask is already None unless pv_accum_dtype is fp32+fp16; the other
+    # variants warn and drop it above.
+    if attn_mask is not None:
+        assert attn_mask.dtype == torch.bool or attn_mask.dtype == dtype, "attn_mask must be bool or match q dtype"
+        assert attn_mask.device == q.device, "attn_mask must be on the same device"
+        assert not is_causal, "attn_mask + is_causal is not supported; choose one"
+        # Mirror the Triton path's expand semantics so the kernel sees a
+        # full (B, H, qo_len, kv_len) view with stride-0 dims handling
+        # broadcasts at zero memory cost.
+        if _tensor_layout == 1:  # HND
+            target_shape = (q.shape[0], q.shape[1], q.shape[2], k.shape[2])
+        else:  # NHD
+            target_shape = (q.shape[0], q.shape[2], q.shape[1], k.shape[1])
+        if attn_mask.dtype == torch.bool:
+            # Translate bool -> additive log-weights (0 / -inf) in q.dtype.
+            # The kernel then adds these to the scores before softmax max.
+            attn_mask = torch.where(
+                attn_mask, torch.zeros((), dtype=dtype, device=q.device),
+                torch.full((), float("-inf"), dtype=dtype, device=q.device),
+            )
+        attn_mask = attn_mask.expand(target_shape)
+
     # Output is q-shaped, but allocating it here would stack on top of the
     # still-live float q/k/v. Capture the shape and allocate after those are
     # released instead -- see the _qkv_box path below.
@@ -1172,25 +1200,8 @@ def sageattn_qk_int8_pv_fp8_cuda(
         lse = sm89_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
     elif pv_accum_dtype == "fp32+fp16":
         _record_dispatch(KERNEL_FP8_CUDA_PP)
-        if attn_mask is not None:
-            # Mirror the Triton path's expand semantics so the kernel sees a
-            # full (B, H, qo_len, kv_len) view with stride-0 dims handling
-            # broadcasts at zero memory cost.
-            assert attn_mask.dtype == torch.bool or attn_mask.dtype == q.dtype, "attn_mask must be bool or match q dtype"
-            assert attn_mask.device == q.device, "attn_mask must be on the same device"
-            assert not is_causal, "attn_mask + is_causal is not supported; choose one"
-            if _tensor_layout == 1:  # HND
-                target_shape = (q.shape[0], q.shape[1], q.shape[2], k.shape[2])
-            else:  # NHD
-                target_shape = (q.shape[0], q.shape[2], q.shape[1], k.shape[1])
-            if attn_mask.dtype == torch.bool:
-                # Translate bool -> additive log-weights (0 / -inf) in q.dtype.
-                # The kernel then adds these to the scores before softmax max.
-                attn_mask = torch.where(
-                    attn_mask, torch.zeros((), dtype=q.dtype, device=q.device),
-                    torch.full((), float("-inf"), dtype=q.dtype, device=q.device),
-                )
-            attn_mask = attn_mask.expand(target_shape)
+        # attn_mask was validated and expanded above, while q and k were
+        # still alive.
         lse = sm89_compile.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
             q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale,
             _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse,

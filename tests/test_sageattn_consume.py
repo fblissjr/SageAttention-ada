@@ -113,6 +113,43 @@ def test_rejects_malformed_input():
     print("  malformed input rejected")
 
 
+def test_mask_survives_the_early_release():
+    """Claim: consuming q/k/v does not break a masked call.
+
+    `sageattn_consume` declares `attn_mask` and forwards it, and on sm89 it
+    routes to the fp8++ kernel, the one CUDA variant with native mask
+    support (v0.5.5). That kernel prepares the mask from q and k -- dtype,
+    device, and the broadcast target shape -- at a point the consuming path
+    has already released them. A bool mask short-circuits past the dtype
+    assert and dies on the device one instead.
+
+    Delete this and a masked consume call raises `UnboundLocalError` from
+    inside the kernel wrapper, which is exactly what it did from v0.7.0
+    until this case was written: no other test in the suite passes a mask
+    through `sageattn_consume`, so the whole path was uncovered while
+    looking covered.
+    """
+    s = 512
+    causal = torch.ones(1, 1, s, s, device="cuda", dtype=torch.bool).tril()
+    additive = torch.where(
+        causal,
+        torch.zeros((), device="cuda", dtype=torch.bfloat16),
+        torch.full((), float("-inf"), device="cuda", dtype=torch.bfloat16),
+    )
+    for label, mask in (("bool", causal), ("additive", additive)):
+        torch.manual_seed(0)
+        q, k, v = _qkv(s)
+        expect = sageattn(q, k, v, tensor_layout="HND", attn_mask=mask, smooth_k=False)
+        box = [q, k, v]
+        del q, k, v
+        got = sageattn_consume(box, tensor_layout="HND", attn_mask=mask, smooth_k=False)
+        assert torch.equal(got.view(torch.uint16), expect.view(torch.uint16)), (
+            f"masked consume ({label}) diverged from masked sageattn; the "
+            f"early release must change when tensors are freed, not the math"
+        )
+    print("  masked consume matches masked sageattn (bool and additive)")
+
+
 class _StandInContainer:
     """Shaped like ComfyUI's `AttentionTensorContainer`, without importing it.
 
@@ -612,6 +649,7 @@ LIGHT_CASES = [
     test_matches_sageattn_output,
     test_empties_the_list,
     test_rejects_malformed_input,
+    test_mask_survives_the_early_release,
     test_accepts_containers_and_empties_them,
     test_rejects_spent_and_mixed_containers,
     test_accepts_comfyui_containers,
