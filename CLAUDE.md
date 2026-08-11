@@ -452,9 +452,14 @@ Sage exposes three surfaces to downstream consumers:
    v0.6.1 candidates to close the gap: persistent-CTA hybrid and
    CUTLASS-based CUDA backend (see CHANGELOG Backlog).
 4. **`sageattn_consume(qkv, ...)`** (v0.7) -- `sageattn()` that takes
-   ownership of a `[q, k, v]` list and empties it, so the float
-   tensors are released once quantized instead of at end-of-call.
-   `sageattn()` cannot do this: the caller's frame owns the refs.
+   ownership of q/k/v so the float tensors are released once quantized
+   instead of at end-of-call. `sageattn()` cannot do this: the caller's
+   frame owns the refs. Takes a `[q, k, v]` list, which it empties, or
+   three single-owner containers exposing `peek()`/`take()` -- the
+   protocol ComfyUI added in `bf4c9a08` and wraps H3's q/k/v in on every
+   call (v0.7.5). Taken here rather than by the caller deliberately:
+   unwrapping in the caller's frame re-binds all three for the duration
+   of the call, which is the retention this entry point exists to avoid.
    Same signature otherwise; output bit-identical. **What it saves is
    configuration-dependent, and in the arrangement DiT blocks actually
    use it currently saves nothing** -- measured at fl2va, peak per call:

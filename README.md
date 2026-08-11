@@ -55,12 +55,27 @@ rather than "validated."
   torch SDPA. The kernel was correct the whole time and simply never
   ran. If you are on < v0.7.0, you do not have this in practice.
 - **`sageattn_consume(qkv, ...)`** (v0.7) -- `sageattn()` that takes
-  ownership of a `[q, k, v]` list and empties it, releasing the float
-  tensors as soon as they are quantized. A normal call cannot do this:
-  the caller's frame owns the references. -858 MiB peak at MiniMax H3's
-  fl2va shape. Against a fused QKV buffer -- how every DiT block
-  actually produces q/k/v -- the saving is ~435 MiB, because freeing q
-  and k releases nothing until the last view dies.
+  ownership of q/k/v and releases each float tensor as soon as its
+  quantized form exists. A normal call cannot do this: the caller's frame
+  owns the references. Takes either a `[q, k, v]` list, which it empties,
+  or three single-owner containers exposing `peek()`/`take()`, which is
+  what ComfyUI hands an attention backend (v0.7.5).
+
+  What it saves is configuration-dependent, and the configuration DiT
+  blocks actually use is the one where it saves nothing. Peak per call at
+  MiniMax H3's fl2va shape: -858 MiB with separate allocations and
+  `smooth_k=False`, -287 MiB at the shipped `smooth_k=True`, and **0
+  against a fused QKV buffer**, because releasing q and k frees nothing
+  while v still references the same allocation. An earlier "~435 MiB in
+  the fused case" figure was wrong and is retracted; see CHANGELOG v0.7.3.
+
+  A caller gets it back by cloning v before handing over, which gives v
+  its own storage and converts the fused case into the separate one for
+  the price of a third of the buffer: -286 MiB at that shape, against a
+  flat +572 MiB cost if the release does not happen. Gate that clone on
+  **`sageattn_consume_prefers_cloned_v(device)`** (v0.7.4) rather than on
+  an arch check of your own, so a future change to when the release pays
+  reaches you on upgrade instead of drifting silently.
 - **`sageattn_partitioned(q, k, v, slices)`** -- amortizes K-quant +
   V-cast across multiple Q slices sharing the same K, V. Targets
   multi-slice partition patterns; correctness verified, peak HBM

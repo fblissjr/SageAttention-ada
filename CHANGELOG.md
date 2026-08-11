@@ -952,6 +952,62 @@ sufficient.
 
 ## Versions
 
+### v0.7.5 -- 2026-08-11  (`sageattn_consume` speaks ComfyUI's container protocol)
+
+ComfyUI added a single-owner container protocol for attention inputs on
+2026-08-10 (`bf4c9a08`): `AttentionTensorContainer` with `peek()`/`take()`,
+a `container_function` hook that a backend sets to receive containers
+rather than tensors, and `wrap_attn` calling `take()` itself for backends
+that do not. Its H3 model wraps q/k/v in them on every call, and the
+`v = v.clone()` directly above that wrapping exists for the same reason
+ours does: so `take()` on v frees something.
+
+That is the ownership transfer `sageattn_consume` performs with a list it
+empties, arrived at independently on both sides, and it is now the
+ecosystem's shape rather than ours. `sageattn_consume` therefore accepts
+either: a `[q, k, v]` list, or three objects exposing `peek()`/`take()`.
+Containers and list slots are both emptied.
+
+Taking them here rather than making the caller unwrap is the entire point.
+Unwrapping into a list binds all three tensors in the caller's frame for
+the duration of the call, which is the retention this entry point exists
+to avoid, and which was measured three separate ways this week: the clone
+before the branch, the slice-and-loop suppression, and a downstream
+override that re-pinned tensors core had already handed it sole ownership
+of. An adapter written by the caller would have reintroduced it.
+
+A mix of tensors and containers is rejected, and so is a container already
+spent, because a `RuntimeError` escaping `take()` into a quant kernel reads
+as a kernel fault rather than a caller error.
+
+**The discriminator is `not isinstance(t, torch.Tensor)`, not `hasattr(t,
+"take")`.** `torch.Tensor.take(index)` exists, so duck-typing on the method
+name matches every tensor. The first draft did exactly that and
+`test_matches_sageattn_output` failed on the first case. No ComfyUI import
+either way; containers are structural here.
+
+Three test cases. Two use a local stand-in and carry the coverage; the
+third imports the real class, resolved via `$COMFYUI_ROOT` or
+`comfyui_root` in `internal/local_config.json`, and exists to fail the day
+ComfyUI renames `take()` or changes what a spent container does. It runs
+rather than skips on this box, which is the only thing that makes it worth
+having. Peak behaviour is inherited rather than re-measured: after the take
+the path is identical to the list path, and the cases assert the containers
+end up empty, which is the property the saving depends on.
+
+Also in this version, no code change: `sageattention/triton/_int_offsets.py`
+said the int32 overflow becomes reachable "past roughly 300k packed rows."
+That is the contiguous stride, `heads*head_dim` = 7168. A DiT block hands
+these kernels three views of one qkv projection, where `stride_n` is
+`3*heads*head_dim` = 21504 and the crossing lands near 99,864 rows instead.
+`max_element_offset` reads real strides so the specialization always fired
+correctly; only the prose was wrong, and it was wrong in the direction that
+reassures. v0.7.1 measured the specialization engaging at S=109,126, which
+a reader of that sentence would have filed as comfortably safe. Both
+thresholds are now stated. Found while reviewing the identical defect in a
+third-party node's overflow warning; ours was in a docstring rather than a
+check, which is why nothing caught it. Prose has no oracle.
+
 ### v0.7.4 -- 2026-08-11  (the fused case has a caller-side fix, and a predicate to gate it on)
 
 v0.7.3 said the fused-QKV case saves nothing and framed the only remedy as
