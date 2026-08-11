@@ -1332,6 +1332,12 @@ buffer only dies with the last view. At H3's shape the saving in that
 configuration is 435 MiB, not 858, and the peak is set inside
 `per_channel_fp8` rather than by the output allocation. See Backlog.
 
+> **Superseded by v0.7.3.** The 435 in the paragraph above is wrong: the
+> fused-QKV saving is 0, not 435. Left in place rather than edited, because
+> the number rode in on this version's feature commit and the audit trail of
+> what was believed here is the point of a dated entry. v0.7.4 adds the
+> caller-side route that recovers 286 of it.
+
 Consumer node shipped separately as
 [ComfyUI-h3-explorations](https://github.com/fblissjr/ComfyUI-h3-explorations), per the
 "sage-fork stays primitive" rule in CLAUDE.md.
