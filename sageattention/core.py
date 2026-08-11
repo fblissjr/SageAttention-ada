@@ -1368,6 +1368,14 @@ def sageattn_consume_prefers_cloned_v(device=None) -> bool:
         device raises rather than returning False, because a plausible
         boolean for the wrong device is the failure this exists to prevent.
 
+        If your clone decision sits *outside* a guard that degrades to a
+        fallback attention on kernel failure, short-circuit non-CUDA to
+        False on your side rather than letting this raise through: on a
+        device that will not reach these kernels the clone is moot, and a
+        raise there converts a graceful degrade into a dead render. The
+        raise is aimed at the caller who asks at model-patch time, where
+        an offloaded or uncast model gives a confidently wrong answer.
+
     Returns
     -------
     bool
