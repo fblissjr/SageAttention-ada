@@ -47,9 +47,11 @@ Needs CUDA. The peak-VRAM case needs ~6 GiB free and skips without it.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
+import orjson
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -109,6 +111,139 @@ def test_rejects_malformed_input():
             f"expected ValueError for a {len(bad)}-element qkv list"
         )
     print("  malformed input rejected")
+
+
+class _StandInContainer:
+    """Shaped like ComfyUI's `AttentionTensorContainer`, without importing it.
+
+    `sageattn_consume` duck-types on `take()` rather than importing comfy,
+    because this library does not depend on ComfyUI. This stand-in proves the
+    duck-typing accepts anything with that shape;
+    `test_accepts_comfyui_containers` runs the real class when ComfyUI is
+    importable, which is the half that catches the real contract drifting
+    away from this copy.
+    """
+
+    __slots__ = ("tensor",)
+
+    def __init__(self, tensor):
+        self.tensor = tensor
+
+    def peek(self):
+        if self.tensor is None:
+            raise RuntimeError("attention tensor container has already been consumed")
+        return self.tensor
+
+    def take(self):
+        tensor = self.peek()
+        self.tensor = None
+        return tensor
+
+
+def test_accepts_containers_and_empties_them():
+    """Claim: the ownership handoff works in ComfyUI's shape, not just ours.
+
+    ComfyUI hands attention backends `AttentionTensorContainer` objects with
+    `peek()`/`take()` (`comfy/ldm/modules/attention.py`), and H3's model wraps
+    q/k/v in them on every call. Our own convention is a `[q, k, v]` list we
+    empty. A caller on the container protocol should not have to unwrap into
+    a list first, because unwrapping binds all three into their frame, which
+    is exactly the retention this function exists to avoid.
+
+    Delete this and a container-protocol caller either writes an adapter that
+    reintroduces the retention, or passes containers and gets a confusing
+    failure deep in the quant path.
+    """
+    torch.manual_seed(0)
+    q, k, v = _qkv(S_SMALL)
+    expect = sageattn(q, k, v, tensor_layout="HND", smooth_k=False)
+
+    # Held separately from the list we hand over, because the call empties
+    # both and each is a distinct guarantee: `take()` transfers the tensor,
+    # clearing the slots drops the caller's handle on the container itself.
+    containers = [_StandInContainer(t) for t in (q, k, v)]
+    boxed = list(containers)
+    del q, k, v
+    got = sageattn_consume(boxed, tensor_layout="HND", smooth_k=False)
+
+    assert torch.equal(got.view(torch.uint16), expect.view(torch.uint16)), (
+        "the container path must produce the same output as passing tensors"
+    )
+    assert all(c.tensor is None for c in containers), (
+        "every container must be emptied; one still holding its tensor means "
+        "the caller's reference survived the call and nothing was released"
+    )
+    assert all(slot is None for slot in boxed), (
+        "the list must be emptied too, same contract as the tensor path"
+    )
+    print("  containers consumed, list emptied, output matches the tensor path")
+
+
+def test_rejects_spent_and_mixed_containers():
+    """Claim: a container that cannot give up its tensor fails loudly.
+
+    `take()` on a spent container raises RuntimeError from ComfyUI's own
+    class. Letting that escape would surface as an unrelated-looking error
+    from inside a quant kernel; a caller that half-unwrapped its arguments
+    gets no signal at all. Both are shaped like the malformed-input case
+    above and are raised the same way.
+    """
+    spent = _StandInContainer(torch.empty(1, H, 64, D, device="cuda", dtype=torch.bfloat16))
+    spent.take()
+    tensors = _qkv(64)
+    bad_inputs = [
+        [spent, _StandInContainer(tensors[1]), _StandInContainer(tensors[2])],
+        [_StandInContainer(tensors[0]), tensors[1], tensors[2]],
+    ]
+    for bad in bad_inputs:
+        try:
+            sageattn_consume(bad, tensor_layout="HND", smooth_k=False)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {[type(b).__name__ for b in bad]}")
+    print("  spent and mixed containers rejected")
+
+
+def test_accepts_comfyui_containers():
+    """Claim: the duck-typing matches the real class, not just our copy of it.
+
+    Skips when ComfyUI cannot be located, which makes it worthless as the
+    only coverage -- hence the stand-in cases above. Its job is to fail the
+    day ComfyUI renames `take()` or changes what a spent container does.
+
+    Resolution order is the repo's usual one: `$COMFYUI_ROOT`, then
+    `comfyui_root` in `internal/local_config.json` (gitignored, so the path
+    stays out of committed material), then skip.
+    """
+    root = os.environ.get("COMFYUI_ROOT")
+    if not root:
+        cfg = Path(__file__).resolve().parent.parent / "internal" / "local_config.json"
+        if cfg.is_file():
+            root = orjson.loads(cfg.read_bytes()).get("comfyui_root")
+    if not root or not Path(root).is_dir():
+        print("  skipped: set $COMFYUI_ROOT or comfyui_root in local_config.json")
+        return
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    try:
+        from comfy.ldm.modules.attention import AttentionTensorContainer
+    except Exception as exc:
+        print(f"  skipped: ComfyUI not importable ({type(exc).__name__})")
+        return
+    torch.manual_seed(0)
+    q, k, v = _qkv(S_SMALL)
+    expect = sageattn(q, k, v, tensor_layout="HND", smooth_k=False)
+    containers = [AttentionTensorContainer(t) for t in (q, k, v)]
+    del q, k, v
+    got = sageattn_consume(list(containers), tensor_layout="HND", smooth_k=False)
+    assert torch.equal(got.view(torch.uint16), expect.view(torch.uint16))
+    for c in containers:
+        try:
+            c.peek()
+        except RuntimeError:
+            continue
+        raise AssertionError("a real AttentionTensorContainer was not emptied")
+    print("  real AttentionTensorContainer consumed and emptied")
 
 
 def test_prefers_cloned_v_answers_for_a_device():
@@ -477,6 +612,9 @@ LIGHT_CASES = [
     test_matches_sageattn_output,
     test_empties_the_list,
     test_rejects_malformed_input,
+    test_accepts_containers_and_empties_them,
+    test_rejects_spent_and_mixed_containers,
+    test_accepts_comfyui_containers,
     test_prefers_cloned_v_answers_for_a_device,
     test_prefers_cloned_v_tracks_the_dispatch_arch_set,
 ]

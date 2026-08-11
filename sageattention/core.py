@@ -1290,6 +1290,15 @@ def sageattn_consume(
         not materialize -- the whole point is that this list is the last
         owner. Pass `[q, k, v]` and `del q, k, v` before calling.
 
+        The three entries may instead be single-owner containers exposing
+        `peek()`/`take()`, which is what ComfyUI hands an attention backend
+        and what its H3 model wraps q/k/v in on every call. They are taken
+        here rather than by the caller on purpose: unwrapping in the
+        caller's frame binds all three tensors there for the duration of
+        the call, which is the retention this entry point exists to avoid.
+        Containers and list slots are both emptied. Mixing tensors and
+        containers, or passing one already consumed, raises `ValueError`.
+
     Everything else matches `sageattn()`.
 
     Returns
@@ -1304,6 +1313,35 @@ def sageattn_consume(
     """
     if len(qkv) != 3:
         raise ValueError(f"qkv must be a 3-element [q, k, v] list, got {len(qkv)}")
+
+    # ComfyUI hands attention backends single-owner container objects rather
+    # than tensors, and its H3 model wraps q/k/v in them on every call. Taking
+    # them here rather than making the caller unwrap first is the whole point:
+    # unwrapping in the caller's frame binds all three there for the duration
+    # of the call, which is the retention this entry point exists to avoid.
+    # Classified by what it is NOT, because `torch.Tensor.take(index)` exists
+    # and duck-typing on `take` alone matches every tensor.
+    boxed = [not isinstance(t, torch.Tensor) for t in qkv]
+    if any(boxed):
+        if not all(boxed):
+            raise ValueError(
+                "qkv must be all tensors or all containers, not a mix; got "
+                f"{[type(t).__name__ for t in qkv]}"
+            )
+        if not all(hasattr(t, "take") and hasattr(t, "peek") for t in qkv):
+            raise ValueError(
+                "qkv entries must be tensors, or single-owner containers "
+                "exposing peek()/take(); got "
+                f"{[type(t).__name__ for t in qkv]}"
+            )
+        try:
+            taken = [t.take() for t in qkv]
+        except RuntimeError as exc:
+            # A spent container reaching a quant kernel would surface far from
+            # its cause, so it is rejected the same way a malformed list is.
+            raise ValueError(f"a qkv container was already consumed: {exc}") from exc
+        qkv[0] = qkv[1] = qkv[2] = None
+        qkv = taken
 
     q = qkv[0]
     arch = _cuda_archs[q.device.index]
