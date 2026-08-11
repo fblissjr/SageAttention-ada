@@ -140,14 +140,28 @@ def test_mask_survives_the_early_release():
         torch.manual_seed(0)
         q, k, v = _qkv(s)
         expect = sageattn(q, k, v, tensor_layout="HND", attn_mask=mask, smooth_k=False)
+        unmasked = sageattn(q, k, v, tensor_layout="HND", smooth_k=False)
         box = [q, k, v]
         del q, k, v
         got = sageattn_consume(box, tensor_layout="HND", attn_mask=mask, smooth_k=False)
+        # Agreement between the two arms is not enough on its own. Both route
+        # to the same kernel, and the variants that do not support masks drop
+        # them behind a `warnings.warn` rather than failing, so a silently
+        # dropped mask would make both arms agree on the wrong answer and
+        # leave this case green. The control is that a masked call must not
+        # equal an unmasked one.
+        assert not torch.equal(
+            expect.view(torch.uint16), unmasked.view(torch.uint16)
+        ), (
+            f"masked and unmasked sageattn produced identical output "
+            f"({label}); the mask is not reaching the kernel, so the "
+            f"comparison below proves nothing"
+        )
         assert torch.equal(got.view(torch.uint16), expect.view(torch.uint16)), (
             f"masked consume ({label}) diverged from masked sageattn; the "
             f"early release must change when tensors are freed, not the math"
         )
-    print("  masked consume matches masked sageattn (bool and additive)")
+    print("  masked consume matches masked sageattn, and the mask reaches the kernel")
 
 
 class _StandInContainer:

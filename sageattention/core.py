@@ -1133,14 +1133,17 @@ def sageattn_qk_int8_pv_fp8_cuda(
     elif qk_quant_gran == "per_thread":
         q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64)
 
-    # Mask preparation reads q and k -- dtype, device, and the broadcast
-    # target shape -- so it has to happen while they are still alive. The
-    # _qkv_box path below releases them, and doing this afterwards raised
-    # UnboundLocalError on every masked consume call from v0.7.0 to v0.7.6.
-    # Prepared here rather than by capturing q.device and a target shape for
-    # later use, so no future edit can reintroduce a read of a released name.
-    # attn_mask is already None unless pv_accum_dtype is fp32+fp16; the other
-    # variants warn and drop it above.
+    # Mask validation and its broadcast target shape read q and k, so they
+    # have to happen while those are alive: the _qkv_box path below releases
+    # them, and reading afterwards raised UnboundLocalError on every masked
+    # consume call from v0.7.0 to v0.7.5. Only the two values needed later
+    # are carried across, and deliberately as values rather than tensors --
+    # the bool conversion allocates a full dtype-sized mask, so doing it
+    # here would stack that on top of the still-live floats and raise the
+    # very peak this entry point exists to lower.
+    # attn_mask is already None unless pv_accum_dtype is fp32+fp16; the
+    # other variants warn and drop it above.
+    mask_target_shape = mask_device = None
     if attn_mask is not None:
         assert attn_mask.dtype == torch.bool or attn_mask.dtype == dtype, "attn_mask must be bool or match q dtype"
         assert attn_mask.device == q.device, "attn_mask must be on the same device"
@@ -1149,17 +1152,10 @@ def sageattn_qk_int8_pv_fp8_cuda(
         # full (B, H, qo_len, kv_len) view with stride-0 dims handling
         # broadcasts at zero memory cost.
         if _tensor_layout == 1:  # HND
-            target_shape = (q.shape[0], q.shape[1], q.shape[2], k.shape[2])
+            mask_target_shape = (q.shape[0], q.shape[1], q.shape[2], k.shape[2])
         else:  # NHD
-            target_shape = (q.shape[0], q.shape[2], q.shape[1], k.shape[1])
-        if attn_mask.dtype == torch.bool:
-            # Translate bool -> additive log-weights (0 / -inf) in q.dtype.
-            # The kernel then adds these to the scores before softmax max.
-            attn_mask = torch.where(
-                attn_mask, torch.zeros((), dtype=dtype, device=q.device),
-                torch.full((), float("-inf"), dtype=dtype, device=q.device),
-            )
-        attn_mask = attn_mask.expand(target_shape)
+            mask_target_shape = (q.shape[0], q.shape[2], q.shape[1], k.shape[1])
+        mask_device = q.device
 
     # Output is q-shaped, but allocating it here would stack on top of the
     # still-live float q/k/v. Capture the shape and allocate after those are
@@ -1200,8 +1196,18 @@ def sageattn_qk_int8_pv_fp8_cuda(
         lse = sm89_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
     elif pv_accum_dtype == "fp32+fp16":
         _record_dispatch(KERNEL_FP8_CUDA_PP)
-        # attn_mask was validated and expanded above, while q and k were
-        # still alive.
+        if attn_mask is not None:
+            # Validated above against q and k; converted here, after the
+            # floats are gone, because this allocation is dtype-sized.
+            if attn_mask.dtype == torch.bool:
+                # Translate bool -> additive log-weights (0 / -inf) in q's
+                # dtype. The kernel adds these to the scores before the
+                # softmax max.
+                attn_mask = torch.where(
+                    attn_mask, torch.zeros((), dtype=dtype, device=mask_device),
+                    torch.full((), float("-inf"), dtype=dtype, device=mask_device),
+                )
+            attn_mask = attn_mask.expand(mask_target_shape)
         lse = sm89_compile.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
             q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale,
             _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse,
@@ -1359,7 +1365,19 @@ def sageattn_consume(
     fp8_arch = arch in _EARLY_RELEASE_ARCHS
     del q
 
-    if not fp8_arch:
+    # Native CUDA mask support is sm89 + CUDA >= 12.8 only, the same gate
+    # `sageattn()` applies. Without matching it here, a masked call on
+    # sm89 + CUDA < 12.8 would take fp32+fp32, whose warn-block drops the
+    # mask and returns numerically wrong output, and a masked call on
+    # sm100/sm120/sm121 would take the native-mask path on archs the
+    # dispatcher deliberately routes to Triton for mask correctness. Both
+    # entry points have to agree about this or the safe default is only
+    # safe depending on which one a consumer reached for.
+    mask_needs_triton = attn_mask is not None and not (
+        arch == "sm89" and get_cuda_version() >= (12, 8)
+    )
+
+    if not fp8_arch or mask_needs_triton:
         # No early-release path here; behave exactly like sageattn() and
         # let the list drop its references when the caller releases it.
         q, k, v = qkv

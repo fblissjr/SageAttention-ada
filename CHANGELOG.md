@@ -952,6 +952,60 @@ sufficient.
 
 ## Versions
 
+### v0.7.6 -- 2026-08-11  (masked `sageattn_consume` crashed, and routed unsafely on two archs)
+
+Two defects on the same path, both present since v0.7.0, both invisible
+because nothing in the suite passed a mask through `sageattn_consume`.
+
+**It raised `UnboundLocalError`.** `sageattn_consume` declares `attn_mask`
+and forwards it, and on sm89 it lands on fp8++, the one CUDA variant with
+native mask support. That kernel prepared the mask from q and k -- dtype,
+device, and the broadcast target shape -- at a point the `_qkv_box` path
+had already deleted them. A bool mask got one line further than a float
+one: the dtype assert short-circuits on `torch.bool` and never evaluates
+`q.dtype`, so it died on the device assert instead.
+
+Validation and the target shape now happen before the release, since they
+read q and k. The bool-to-additive conversion stays after it, because that
+allocates a full dtype-sized mask and hoisting it would stack that on top
+of the still-live floats -- raising the peak this entry point exists to
+lower, on exactly the calls it was being fixed for. Only a device and a
+shape tuple cross the release.
+
+**It disagreed with `sageattn()` about masked routing.** The dispatcher
+sends any masked call to Triton unless the arch is sm89 with CUDA >= 12.8,
+because that is the only configuration with a mask-correct CUDA kernel.
+`sageattn_consume` applied no such gate, so a masked call on sm89 with
+CUDA < 12.8 took `fp32+fp32`, whose warn-block drops the mask and returns
+numerically wrong output behind a `warnings.warn`; and a masked call on
+sm100/sm120/sm121 took the native-mask path on archs the dispatcher
+deliberately avoids for mask correctness. Consume now applies the same
+gate and falls back to `sageattn()` when it does not hold, which routes to
+Triton correctly and simply forgoes the early release.
+
+Worth stating the shape of this one: the two entry points are documented
+as differing only in ownership, so a consumer choosing between them was
+also unknowingly choosing a mask-routing policy. "Same signature
+otherwise" has to mean it.
+
+**On the test that covers it.** Comparing masked consume against masked
+`sageattn` is not sufficient on its own, because both route to the same
+kernel and the variants without mask support drop masks behind a warning
+rather than failing -- so a silently dropped mask leaves both arms
+agreeing on the wrong answer and the case green. The case therefore
+asserts first that a masked call differs from an unmasked one. That
+control was verified red-capable: within one variant, `fp32+fp32` returns
+output bit-identical with and without a mask, while `fp32+fp16` does not.
+
+An earlier attempt to verify it compared `fp32+fp32`-with-mask against
+`fp32+fp16`-without, found them unequal, and would have concluded the
+control worked. Two variables, one comparison, no information -- the same
+unisolating-comparand error this session hit twice already.
+
+Masked accuracy unchanged: `tests/repros/repro_cuda_mask_kernel.py` scores
+fp8++ at mean_rtol 0.087-0.094 across the kv sweep against Triton, matching
+the recorded fingerprint. 13/13 in `tests/test_sageattn_consume.py`.
+
 ### v0.7.5 -- 2026-08-11  (`sageattn_consume` speaks ComfyUI's container protocol)
 
 ComfyUI added a single-owner container protocol for attention inputs on
