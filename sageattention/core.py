@@ -1197,11 +1197,13 @@ def sageattn_consume(
     Measured at MiniMax H3's fl2va shape (S=41822, heads 56, head_dim 128,
     bf16), peak per call, one arm per process:
 
-        allocation      smooth_k   sageattn   consume    saved
-        separate           False      3148       2290     -858
-        separate           True       3148       2862     -287
-        fused QKV views    False      3148       3148        0
-        fused QKV views    True       3148       3148        0
+        allocation             smooth_k   sageattn   consume    saved
+        separate                  False      3148       2290     -858
+        separate                  True       3148       2862     -287
+        fused QKV views           False      3148       3148        0
+        fused QKV views           True       3148       3148        0
+        fused, caller clones v    False      3720       2862     -858
+        fused, caller clones v    True       3720       3434     -287
 
     Both axes matter and neither is obvious:
 
@@ -1215,12 +1217,30 @@ def sageattn_consume(
       `per_channel_fp8`'s full-size bf16 transpose buffer has already set a
       higher peak.
 
+    Making the fused case pay *from in here* requires dropping that transpose
+    buffer **and** doing the mean-subtraction in place; either alone leaves
+    the other setting the floor.
+
+    **But the caller can fix it without us**, and callers do. Cloning v
+    before handing the list over gives it its own storage, so releasing q and
+    k actually frees the fused buffer -- it converts the fused case into the
+    separate case for the price of one third of the buffer. Read the last two
+    rows against the 3148 the caller would otherwise get, not against the
+    3720 in their own sageattn column: -286 with `smooth_k=False`, and +286,
+    i.e. *worse than not cloning*, with `smooth_k=True`. Both halves are
+    load-bearing. Cloning without consuming is a pure 572 MiB cost, and
+    consuming without `smooth_k=False` gives the clone back.
+
+    ComfyUI does this in `comfy/ldm/minimax/model.py` ("Fix peak memory issue
+    with H3") and ComfyUI-h3-explorations does it in its H3 attention
+    forward, gated on the mode reaching this entry point at all.
+
     So the honest summary is: worth calling when q/k/v are separate
-    allocations, a no-op when they are views of one buffer. Making the fused
-    case pay requires dropping that transpose buffer *and* doing the
-    mean-subtraction in place; either alone leaves the other setting the
-    floor. Verified in `tests/test_sageattn_consume.py`, which measures all
-    four arms rather than asserting a single headline number.
+    allocations or when the caller is willing to clone v and pass
+    `smooth_k=False`; a no-op on fused views otherwise. Verified in
+    `tests/test_sageattn_consume.py`, which measures every arm rather than
+    asserting a single headline number, and asserts the caller-clone case
+    specifically because consumers now depend on it.
 
     Parameters
     ----------

@@ -116,12 +116,17 @@ def _qkv_fused(s, dtype=torch.bfloat16):
     return views
 
 
-def _peak_over_call(use_consume, smooth_k=False, fused=False):
+def _peak_over_call(use_consume, smooth_k=False, fused=False, clone_v=False):
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
     layout = "NHD" if fused else "HND"
     q, k, v = (_qkv_fused if fused else _qkv)(S_PEAK)
+    if clone_v:
+        # The move a caller can make without touching this library: give v its
+        # own storage, so releasing q and k in here actually frees the fused
+        # buffer instead of leaving v pinning all three thirds of it.
+        v = v.clone()
     if use_consume:
         box = [q, k, v]
         del q, k, v
@@ -154,6 +159,45 @@ def test_peak_vram_is_lower():
         f"sageattn_consume saved only {saved_mib:.0f} MiB at S={S_PEAK}; "
         f"expected >800. The ownership chain is broken somewhere -- some "
         f"frame is still holding q/k/v across the call."
+    )
+
+
+def test_fused_caller_cloned_v_recovers_the_saving():
+    """Claim: the fused case is not a dead end, and the fix is the caller's.
+
+    `test_peak_across_shipped_config` shows fused q/k/v saving nothing,
+    because v pins the buffer q and k were released from. The docstring on
+    `sageattn_consume` frames the fix as work in here -- drop the transpose
+    buffer, subtract the mean in place. There is a third route that needs no
+    kernel change at all: the caller clones v first, which turns the fused
+    case into the separate case for the price of one third of the buffer.
+
+    Consumers rely on this now. ComfyUI does it in `comfy/ldm/minimax/model.py`
+    ("Fix peak memory issue with H3"), and ComfyUI-h3-explorations does it in
+    its H3 attention forward, where it is worth 286 MiB per call at this exact
+    shape. If our ownership chain stops releasing early, that saving silently
+    becomes a pure cost -- the clone is still paid for, and nothing is freed.
+
+    Delete this case and that regression is invisible from in here: every
+    other arm still passes, because none of them clone.
+    """
+    # consume first: a prior arm trains the caching allocator and biases
+    # whatever runs second (CLAUDE.md, peak-HBM measurement discipline).
+    cloned = _peak_over_call(True, fused=True, clone_v=True)
+    plain = _peak_over_call(True, fused=True, clone_v=False)
+    saved_mib = (plain - cloned) / 2**20
+    print(
+        f"  fused qkv, consume: {plain / 2**20:.0f} MiB -> "
+        f"caller clones v: {cloned / 2**20:.0f} MiB ({saved_mib:+.0f} MiB)"
+    )
+    # Measured ~286 MiB at this shape. The floor is set well under that: the
+    # clone costs a third of the buffer up front, so a broken release chain
+    # does not merely zero this out, it drives it negative. Anything still
+    # comfortably positive means q and k are being freed early.
+    assert saved_mib > 150, (
+        f"caller-cloned v saved only {saved_mib:.0f} MiB at S={S_PEAK}; "
+        f"expected >150. Either q and k are no longer released before the "
+        f"kernel allocates, or something in here is holding the fused buffer."
     )
 
 
@@ -190,6 +234,14 @@ def test_peak_across_shipped_config():
                 f"  {label:<34}{p / 2**20:>9.0f}M{c / 2**20:>9.0f}M"
                 f"{(p - c) / 2**20:>+9.0f}M"
             )
+    for smooth_k in (False, True):
+        c = _peak_over_call(True, smooth_k=smooth_k, fused=True, clone_v=True)
+        p = _peak_over_call(False, smooth_k=smooth_k, fused=True, clone_v=True)
+        label = f"fused + caller clones v, smooth_k={smooth_k}"
+        print(
+            f"  {label:<34}{p / 2**20:>9.0f}M{c / 2**20:>9.0f}M"
+            f"{(p - c) / 2**20:>+9.0f}M"
+        )
     shipped = results[(True, True)]
     print(
         f"  shipped config (fused + smooth_k=True) saves "
@@ -217,6 +269,7 @@ def main() -> int:
     free, _ = torch.cuda.mem_get_info()
     if free >= PEAK_VRAM_BYTES:
         cases.append(test_peak_vram_is_lower)
+        cases.append(test_fused_caller_cloned_v_recovers_the_saving)
         cases.append(test_peak_across_shipped_config)
     else:
         print(
