@@ -249,10 +249,30 @@ number above is the H3 evidence.
 
 The 2.7x accuracy gap is entirely fp8-vs-fp16 V storage. Our default
 buys speed at ~98% of the 0.10 rtol budget; the fp16-PV path spends
-1.59x the time and +287 MiB to sit at ~37% of it. Caveats on those
-numbers: synthetic `torch.randn` inputs (zero channel mean, so
-`smooth_k` is inert and real activations may differ in magnitude), one
-sequence length, and rtol-against-SDPA is not perceptual quality.
+1.59x the time and +287 MiB to sit at ~37% of it.
+
+**Reference convention matters and these two are not comparable.** The
+table above uses a **bf16** `EFFICIENT_ATTENTION` reference -- this
+bench's convention, which is why 0.0984 here sits alongside LTX's
+0.0978. `tests/spikes/spike_h3_kernel_divergence.py` deliberately uses
+an **fp32** reference over bf16-rounded inputs to isolate the kernel's
+own error, and reports fp8++ at **0.0264** at H3 config. Same kernel,
+3.7x apart, both correct. Always state which reference a number used;
+a table mixing them is unreadable.
+
+That has a consequence for the gap above: **the fp16-PV arm may be
+reference-limited.** At 0.0367 against a bf16 reference it is
+approaching the reference's own error, so the measurement can saturate
+and the true fp8-vs-fp16 gap may be *larger* than 2.7x. Re-running the
+mode sweep against an fp32 reference is the fix, and the divergence
+spike already establishes the convention.
+
+Further caveats: synthetic `torch.randn` inputs (zero channel mean, so
+`smooth_k` is inert), one sequence length, and rtol-against-SDPA is not
+perceptual quality. On `smooth_k` specifically, it has been measured at
+H3 config and is a wash (0.0264 -> 0.0266, fp32 reference); do not
+re-litigate it, and note that a synthetic sweep *cannot* reproduce that
+result in either direction.
 `fp16_cuda` also silently drops `attn_mask` -- irrelevant to H3, whose
 sole call site passes `mask=None`, but not to masked workloads.
 
