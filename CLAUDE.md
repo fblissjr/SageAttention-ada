@@ -251,21 +251,35 @@ The 2.7x accuracy gap is entirely fp8-vs-fp16 V storage. Our default
 buys speed at ~98% of the 0.10 rtol budget; the fp16-PV path spends
 1.59x the time and +287 MiB to sit at ~37% of it.
 
-**Reference convention matters and these two are not comparable.** The
-table above uses a **bf16** `EFFICIENT_ATTENTION` reference -- this
-bench's convention, which is why 0.0984 here sits alongside LTX's
-0.0978. `tests/spikes/spike_h3_kernel_divergence.py` deliberately uses
-an **fp32** reference over bf16-rounded inputs to isolate the kernel's
-own error, and reports fp8++ at **0.0264** at H3 config. Same kernel,
-3.7x apart, both correct. Always state which reference a number used;
-a table mixing them is unreadable.
+**The ratio is measured, not a floor, and it is flat across S.** An
+earlier version of this section guessed that the fp16 arm might be
+reference-limited by the bf16 comparand. **Disproved by re-running
+against an fp32 reference:** 0.0363 vs 0.0367 for fp16, 0.0984 either
+way for fp8++. The reference dtype does not matter here.
 
-That has a consequence for the gap above: **the fp16-PV arm may be
-reference-limited.** At 0.0367 against a bf16 reference it is
-approaching the reference's own error, so the measurement can saturate
-and the true fp8-vs-fp16 gap may be *larger* than 2.7x. Re-running the
-mode sweep against an fp32 reference is the fix, and the divergence
-spike already establishes the convention.
+Swept across a 17x range of sequence length (fp32 reference, synthetic):
+
+| S | `fp8_cuda++` | `fp16_cuda` (`fp16+fp32`) | ratio |
+|---|---|---|---|
+| 4,608 | 2.0 ms / 0.0969 | 2.8 ms / 0.0363 | 2.67x |
+| 24,576 | 39.4 ms / 0.0979 | 62.2 ms / 0.0363 | 2.70x |
+| 41,822 | 112.2 ms / 0.0984 | 178.0 ms / 0.0363 | 2.71x |
+| 78,336 | 394.7 ms / 0.0981 | 623.9 ms / 0.0362 | 2.71x |
+
+**No crossover exists**, so there is no "use fp16 above S=X" rule: the
+accuracy ratio is flat at ~2.7x and the speed cost converges to ~1.58x
+(1.40x at the small end). H3's S varies widely -- it is the packed
+`[text | refs | audio | video]` length, so canvas, aspect, clip length
+and reference count all move it (a real 345-frame 1024x768 reference
+render measures 143,386) -- and **one mode decision covers the whole
+range**. `fp16_triton` tracks at ~0.042 and OOMs at 78,336.
+
+**Unresolved: `tests/spikes/spike_h3_kernel_divergence.py` records
+fp8++ at 0.0264** at the same H, D, synthetic inputs and fp32
+reference. 3.7x from the 0.0984 above with no explanation surviving --
+reference dtype was the hypothesis and it is disproved. Do not quote
+either figure without naming the run it came from until someone
+resolves this.
 
 Further caveats: synthetic `torch.randn` inputs (zero channel mean, so
 `smooth_k` is inert), one sequence length, and rtol-against-SDPA is not
