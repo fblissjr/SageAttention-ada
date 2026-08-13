@@ -2,6 +2,11 @@ Last updated: 2026-05-16
 
 # LTX 2.3 FML2V workload profile -- where the wall-time actually lives
 
+> **Model scope: LTX 2.3 only.** There is no H3 equivalent of this
+> document. Do not rank an H3 perf bet against these shares -- H3 is
+> attention-dominated where LTX is mixed, so the FFN-share triplet below
+> has no H3 counterpart and the leverage ordering does not transfer.
+
 Canonical sage-side copy of the production wall-time breakdown for LTX
 2.3's FML2V multi-guide workflow. Sourced from a downstream consumer's
 in-pipeline A/B measurements + an extended tracer audit on the same

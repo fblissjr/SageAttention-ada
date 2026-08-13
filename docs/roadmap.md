@@ -2,6 +2,13 @@
 
 Last updated: 2026-05-23
 
+> **Model scope: written pre-H3.** "Relevance to the current workload"
+> below meant **LTX 2.3** at the time of writing; MiniMax H3 entered this
+> repo on 2026-08-04 (`3f3a121`). Re-rank before using: the FFN line
+> (`sage_ffn`, GeGLU, its persistent-CTA hybrid, the CUTLASS backend) is
+> LTX-motivated and buys H3 little, because H3's time is almost entirely
+> attention. A tier assigned here is a tier for LTX unless re-derived.
+
 Forward-looking record of directions worth pursuing on this fork --
 ranked by relevance to the current workload, technically scoped, and
 trigger-conditional. **Not a committed schedule.** This doc enumerates

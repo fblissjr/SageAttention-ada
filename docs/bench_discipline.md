@@ -2,6 +2,20 @@
 
 Last updated: 2026-05-13
 
+> **Model scope: LTX 2.3 / Z-Image.** The shapes this governs -- the
+> load-bearing **accuracy and speed** bench and every row in
+> `tests/regression_baselines.json` -- are LTX and Z-Image. **No H3 row
+> exists there** as of 2026-08-13, so a green regression run says nothing
+> about H3 accuracy or speed.
+>
+> H3 *is* covered elsewhere, and the distinction matters: correctness and
+> VRAM have H3 surfaces (`tests/test_sageattn_consume.py` at fl2va
+> S=41822, `tests/test_quant_offset_overflow.py`,
+> `tests/test_short_seq_tail.py`, and four `tests/spikes/spike_h3_*.py`).
+> It is specifically the rtol-and-wall-clock bench that has no H3 shape.
+> Adding one is gated on the workload-profile step below -- one sequence
+> length measured ad hoc is not a distribution.
+
 L3 reference for CLAUDE.md. Load this when:
 - a torch / triton / CUDA / sage-rev bump just happened
 - you're about to change bench shapes or add a new shape baseline

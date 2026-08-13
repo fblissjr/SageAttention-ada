@@ -5,6 +5,21 @@ L1 routing index. Detailed material lives in `docs/` (committed) and
 
 ## TLDR
 
+> **Two supported model workloads, and they are not interchangeable.**
+> **LTX 2.3** (video, since ~2026-04) and **MiniMax H3** (packed
+> audio-video, since **2026-08-04**, commit `3f3a121`). Flux / Z-Image
+> are image-gen shapes in the bench, not an optimization target.
+>
+> **H3 did not exist in this repo before 2026-08-04.** Every measurement,
+> rtol fingerprint, decision entry, and doc dated earlier describes **LTX
+> 2.3 or Z-Image and nothing else** -- it cannot corroborate an H3 claim,
+> however similar the mechanism looks. The two differ in ways that change
+> results: H3 has exactly one attention call site over a packed
+> `[text | refs | audio | video]` sequence with `mask=None` hardcoded
+> (`comfy/ldm/minimax/model.py:172`) and no cross-attention at all, where
+> LTX has masked cross-attn as a headline shape. **Label the model on
+> every number.** See Conventions.
+
 **Mission:** sm89 kernel optimization for ComfyUI consumer workloads.
 The repo name is "sage-fork" for historical reasons (started as a
 local fork of `woct0rdho/SageAttention`, itself a fork of
@@ -204,10 +219,40 @@ mode is `pv_accum_dtype="fp32+fp32"` (inst-buffer), NOT pure `fp32` --
 the pure-FP32 PV-accum config (SageAttention 2 / external-port
 comparand) is `pv_accum_dtype="fp32"` ->
 `qk_int8_sv_f8_accum_f32_fuse_v_scale_attn`; our default `fp8_cuda++`
-is `fp32+fp16`. Comparing accum configs is a config-PAIR A/B, NOT a
-single-variable isolation: `fp32+fp16` also co-varies the V-quant
-`scale_max` (`core.py:1108-1110` -> 2.25 vs 448.0), so it changes the
-quantized V tensor, not just the PV-accum dtype.
+is `fp32+fp16`.
+
+**Do not run accum-config A/Bs expecting an accuracy result. The PV
+accumulator is not an accuracy lever; fp8-vs-fp16 V storage is.**
+Measured 2026-08-13 at an H3 self-attn shape (1, 56, 41822, 128) bf16
+against `EFFICIENT_ATTENTION`:
+
+| mode | mean_rtol | ms | vs torch |
+|---|---|---|---|
+| `fp8_cuda++` (`fp32+fp16`, default) | 0.0984 | 111.8 | 4.21x |
+| `fp8_cuda` (`fp32+fp32`) | 0.0980 | 129.3 | 3.64x |
+| `fp8_cuda` (`fp32`) | 0.0983 | 127.6 | 3.69x |
+| `fp16_cuda` (`fp16+fp32`) | **0.0367** | 177.7 | 2.65x |
+| `fp16_cuda` (`fp32`) | 0.0375 | 195.8 | 2.40x |
+| `fp16_triton` | 0.0426 | 164.9 | 2.85x |
+
+All three fp8 variants land within 0.0004 of each other **despite
+`fp32+fp16` also co-varying the V-quant `scale_max`** (`core.py:1219-1221`
+-> 2.25 vs 448.0). So that pair is not merely a confounded isolation --
+both variables are close to inert, and it could not have produced an
+accuracy finding in either direction. The same inertness was measured
+on **LTX** shapes in 2026-04-23's "sm89 fp8 quantization scale" entry
+(448 vs 2.25, 0.097 either way) -- a different workload, so it
+corroborates the pattern rather than confirming it for H3. The H3
+number above is the H3 evidence.
+
+The 2.7x accuracy gap is entirely fp8-vs-fp16 V storage. Our default
+buys speed at ~98% of the 0.10 rtol budget; the fp16-PV path spends
+1.59x the time and +287 MiB to sit at ~37% of it. Caveats on those
+numbers: synthetic `torch.randn` inputs (zero channel mean, so
+`smooth_k` is inert and real activations may differ in magnitude), one
+sequence length, and rtol-against-SDPA is not perceptual quality.
+`fp16_cuda` also silently drops `attn_mask` -- irrelevant to H3, whose
+sole call site passes `mask=None`, but not to masked workloads.
 
 Reuse `accuracy_metrics` from `tests/test_sageattn_ltx_shapes.py:160`
 for rtol/atol comparisons (symmetric denominator; matches every
@@ -288,6 +333,33 @@ identical at a shape where they shouldn't.
 
 ## Conventions
 
+- **Label the model on every measurement, claim, and doc.** LTX 2.3 and
+  MiniMax H3 are architecturally different, not two sizes of the same
+  thing, so a number from one is not evidence about the other:
+
+  | | LTX 2.3 | MiniMax H3 |
+  |---|---|---|
+  | in this repo since | ~2026-04 | **2026-08-04** (`3f3a121`) |
+  | attention sites | self-attn + **masked cross-attn** (headline shape) | **one** call site, no cross-attn |
+  | mask | load-bearing (drove the v0.5.5 kernel) | `mask=None` hardcoded; unreachable |
+  | sequence | separate q/kv streams | one packed `[text\|refs\|audio\|video]` |
+  | **bottleneck** | mixed -- FFN is a real share (`docs/ltx_workload_profile.md`), attention is one part | **attention is almost all of it** |
+
+  **The bottlenecks differ, so the work that pays differs.** Everything in
+  the FFN line -- `sage_ffn`, the GeGLU extension, the persistent-CTA
+  hybrid for it, the CUTLASS backend -- is **LTX-motivated and buys H3
+  little**, because H3's time is in attention. Conversely, attention-kernel
+  quality and speed is nearly the whole lever on H3 and only a fraction of
+  one on LTX. Rank any perf bet against the model it targets, not against
+  the repo in general; the Amdahl ceiling is different per model and a
+  wedge that is real on one can be noise on the other.
+
+  Consequences that have already bitten: the v0.5.5 native-mask kernel is
+  LTX-motivated and buys H3 nothing; `fp16_cuda`'s silent mask-drop
+  disqualifies it for LTX but not for H3; the load-bearing bench row is an
+  LTX shape and the bench has **no H3 coverage at all**. Anything dated
+  before 2026-08-04 is LTX/Z-Image by construction -- cite it as
+  corroborating a pattern, never as confirming an H3 result.
 - Python: **always uv**. Never `pip`, never bare `python3`.
 - JSON: **orjson**, never stdlib `json`.
 - **No emojis** in any file or output.

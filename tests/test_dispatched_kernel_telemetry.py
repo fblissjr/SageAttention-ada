@@ -62,6 +62,47 @@ def test_helper_is_exported_from_package():
     print("ok  helper exported from sageattention package")
 
 
+def test_dispatch_counts_support_a_coverage_claim():
+    # Claim: `get_last_dispatched_kernel` answers "is sage reachable on this
+    # path" -- one call, one value. It cannot answer "did EVERY attention
+    # call in this render reach sage", which is a coverage question, and a
+    # consumer whose fallback logs once cannot answer it either: one warning
+    # is emitted whether 1 call or 10,000 fell back.
+    #
+    # Counts are monotonic per thread and deliberately have no reset. A
+    # consumer reads before and after a render and subtracts, so there is no
+    # clear-the-state contract to honour and no window where a concurrent
+    # call is lost to someone else's reset. Same reasoning that kept the
+    # reset out of the last-dispatch helper.
+    counts = sageattention.get_dispatch_counts()
+    assert isinstance(counts, dict), f"expected a dict, got {type(counts)!r}"
+
+    before = counts.get(KERNEL_FP8_CUDA_PP, 0)
+    _record_dispatch(KERNEL_FP8_CUDA_PP)
+    _record_dispatch(KERNEL_FP8_CUDA_PP)
+    _record_dispatch(KERNEL_FP16_TRITON)
+    after = sageattention.get_dispatch_counts()
+
+    assert after.get(KERNEL_FP8_CUDA_PP, 0) - before == 2, (
+        f"expected +2 on {KERNEL_FP8_CUDA_PP}, got "
+        f"{after.get(KERNEL_FP8_CUDA_PP, 0) - before}"
+    )
+    assert after.get(KERNEL_FP16_TRITON, 0) >= 1, (
+        "a second kernel name must be counted separately, so a coverage "
+        "check can tell 'all fp8_cuda++' from 'mostly fp8_cuda++'"
+    )
+
+    # A snapshot, not a live view: a consumer holding `before` while the
+    # render runs must not have it mutate underneath them, or the diff is
+    # always zero.
+    after[KERNEL_FP8_CUDA_PP] = 999_999
+    assert sageattention.get_dispatch_counts()[KERNEL_FP8_CUDA_PP] != 999_999, (
+        "get_dispatch_counts must return a copy; a live view makes the "
+        "before/after diff silently zero"
+    )
+    print("ok  dispatch counts support a coverage claim")
+
+
 def test_sageattn_dispatcher_records_fp8_pp_on_sm89():
     # On sm89 + CUDA >= 12.8 (the box this fork targets), sageattn()
     # routes unmasked calls to sageattn_qk_int8_pv_fp8_cuda with
@@ -251,6 +292,18 @@ def test_thread_isolation():
     # should see None even if the main thread has already dispatched.
     # Uses real kernel-name constants so the test stays inside the
     # KernelName Literal (no type-checker false flags).
+    #
+    # This is load-bearing beyond isolation. A consumer proving "the
+    # composed attention path reached sage" needs a known-None baseline,
+    # and gets it by running its probe on a fresh thread rather than by
+    # importing a reset. Collapsing this state to a module global would
+    # keep every other test in this file green while silently converting
+    # that probe into a false negative on graphs that route consistently.
+    # So this case is the guard on a downstream composition check, not
+    # only a statement about threading -- which is why it is worth more
+    # than the public reset function we considered adding and did not.
+    # (contextvars, contemplated in core.py's comment, is safe here: a new
+    # thread starts with an empty Context, so the baseline still holds.)
     _reset_dispatch_for_test()
     _record_dispatch(KERNEL_FP16_TRITON)
 

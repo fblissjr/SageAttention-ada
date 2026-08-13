@@ -166,6 +166,65 @@ without an edit on their side.
 
 ---
 
+### Optional `out=` on the sm89 entry points, so a chunking caller stops allocating a full-size intermediate
+
+**Trigger to act:** a consumer adopting head-group chunking in production
+*and* its in-pipeline A/B (the gate the entry above puts on chunking)
+coming back acceptable on wall-clock. At that point this constant is the
+binding floor on the chunked path and nothing caller-side can remove it.
+Do not start it before that -- if chunking is not adopted, the constant is
+not being paid.
+
+**The gap.** A consumer that attends in head groups must assemble the
+result itself: it allocates a full-size output buffer and writes each
+group's kernel output into a slice of it. That buffer is a straight
+addition the single-shot path does not carry, because unchunked callers
+return the kernel's own output and allocate nothing extra. It is
+`s * heads * head_dim * 2` bytes in bf16 -- 572 MiB at S=41822 with 56
+heads at head_dim 128, ~2010 MiB at the long-clip shapes, s-linear like
+everything else.
+
+Its consequence is structural, not just additive: the per-group transient
+shrinks as `1/n` while this term does not move with `n` at all, so it is
+the reason chunking's advantage stops improving as groups are added.
+Measured on a consumer-side chunked path: extra allocated across the loop
+is 1144 MiB at n=1, 858 at n=2, 715 at n=4, 643 at n=8 -- converging on the
+buffer rather than toward zero. Chunking still nets lower per call (2645
+against 2862 at n=4), so this is what narrows the lead, not what erases it.
+
+Not removable caller-side. Concatenating groups at the end is worse (it
+holds every group live at once); the buffer exists precisely because the
+kernel returns a fresh tensor rather than filling one it was handed.
+
+**Why it looks available.** The sm89 kernel is already stride-aware on its
+output -- it takes `stride_bz_o, stride_seq_o, stride_h_o` and offsets
+through them (`csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh:52`, `:685`). A
+head-slice view is a contiguous head range, so it preserves both strides
+and shifts only the base pointer by `start * stride_h_o`, with head_dim
+still innermost and contiguous, which is what `PACK_SIZE_O` requires. The
+kernel machinery is probably not the blocker. **Unverified by build or
+measurement** -- this is a source read, and it is the claim to attack first
+if the item is picked up.
+
+**What it costs.** The documented four-place coupling, plus one wrinkle.
+`sageattention/core.py` allocates `o = torch.empty(o_shape, ...)`
+unconditionally, so an optional `out=` needs the C++ entry, the
+`attn_cuda_sm89.h` decl, the pybind def with a default, and the
+`sm89_compile.py::@torch.library.custom_op` schema with its `register_fake`
+stub. The wrinkle: `out` is a *mutated* argument, so the custom_op schema
+needs the mutation annotation rather than a plain input, and `register_fake`
+must reflect that. Forgetting it fails at runtime, not at import, in the
+manner v0.5.5 documents. Wants a scoping pass before anyone commits to the
+implementation.
+
+**Relationship to the entry above.** Same shape -- both are "stop
+allocating a full-size intermediate we then copy out of" -- but they do not
+overlap and do not compete. That one removes a transient *inside* the
+kernel on every call; this one removes a buffer *outside* it that only
+chunking callers pay. Landing this lowers chunking's floor, which makes
+chunking cheaper, which makes the entry above *less* likely to come back
+live. Whoever works either should read both.
+
 Original entry follows.
 
 `per_channel_fp8` allocates `v_transposed_permutted` at V's full size in
@@ -951,6 +1010,56 @@ a sage-fork kernel push with data. Until then the raw JSONL is
 sufficient.
 
 ## Versions
+
+> **Model attribution.** MiniMax H3 work starts at **v0.7.0 / 2026-08-04**
+> (`3f3a121`). **Every entry at v0.6.x and below describes LTX 2.3 or
+> Z-Image only** -- H3 did not exist in this repo yet. The two are
+> architecturally different (one packed sequence and a single unmasked
+> attention site for H3, versus masked cross-attn for LTX) and have
+> different bottlenecks (attention is nearly all of H3's time; FFN is a
+> real share of LTX's), so an older result corroborates a pattern at most
+> and never confirms an H3 claim. `sage_ffn` and the whole FFN line are
+> LTX-motivated throughout.
+
+
+### v0.7.7 -- 2026-08-13  (`get_dispatch_counts`: coverage, not just reachability)
+
+**New public helper**, additive, no behavior change to any kernel:
+
+```python
+from sageattention import get_dispatch_counts   # -> {kernel_name: int}
+```
+
+Per-kernel dispatch counts for the calling thread. Thread-local like
+`get_last_dispatched_kernel`, monotonic, returned as a snapshot copy.
+
+**Why it exists.** `get_last_dispatched_kernel` answers "is sage reachable
+on this path" -- one call, one value. A consumer that must guarantee sage
+handled an entire generation is asking a different question, and a probe
+cannot answer it: a probe proves a path is reachable, never that it was
+taken every time. That is a coverage claim and coverage needs counting.
+
+The precipitating case: a downstream attention patch fell back to
+ComfyUI's attention on several conditions and logged the fallback *once*
+per run, so one warning was emitted whether 1 call or 10,000 degraded. A
+mostly-fallback render and a fully-sage render were indistinguishable in
+the log.
+
+**What it does and does not prove.** It proves sage ran N times. It cannot
+prove nothing else ran -- that needs the caller's own total attention-call
+count as the other half. Stated in the docstring so no one reads a healthy
+count as proof of coverage on its own.
+
+**No reset, deliberately.** Counts are monotonic and callers difference two
+snapshots. A reset would add a clear-the-state contract to honour and a
+window where a concurrent call is lost to someone else's reset. Same
+reasoning that kept a public reset off `get_last_dispatched_kernel`: a
+consumer needing a clean baseline gets one by probing from a fresh thread,
+which is structural rather than arranged.
+
+Guarded by `tests/test_dispatched_kernel_telemetry.py`, including that the
+return is a copy -- a live view would make every before/after diff silently
+zero.
 
 ### v0.7.6 -- 2026-08-11  (masked `sageattn_consume` crashed, and routed unsafely on two archs)
 

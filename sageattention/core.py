@@ -96,6 +96,10 @@ _dispatch_state = threading.local()
 
 def _record_dispatch(name: KernelName) -> None:
     _dispatch_state.last = name
+    counts = getattr(_dispatch_state, "counts", None)
+    if counts is None:
+        counts = _dispatch_state.counts = {}
+    counts[name] = counts.get(name, 0) + 1
 
 
 def get_last_dispatched_kernel() -> Optional[KernelName]:
@@ -108,6 +112,29 @@ def get_last_dispatched_kernel() -> Optional[KernelName]:
     the read, the value can be overwritten.
     """
     return getattr(_dispatch_state, "last", None)
+
+
+def get_dispatch_counts() -> dict:
+    """Per-kernel dispatch counts for this thread, as a snapshot copy.
+
+    `get_last_dispatched_kernel` answers "is sage reachable on this path".
+    This answers "how much of the work actually reached sage", which is a
+    different question and the one a caller needs to claim end-to-end
+    coverage: read before a render, read after, subtract, and compare the
+    total against the number of attention calls the caller made. A
+    consumer-side fallback that logs once cannot distinguish one degraded
+    call from every call, so the caller's own count is the other half --
+    this number alone proves sage ran, never that nothing else did.
+
+    Counts are monotonic and there is deliberately no reset: differencing
+    two snapshots needs no clear-the-state contract, and leaves no window
+    where a concurrent call is lost to someone else's reset.
+
+    Thread-local, like `get_last_dispatched_kernel` -- read it on the thread
+    that made the calls. A reader on another thread sees that thread's
+    counts, which for a fresh thread is `{}` rather than an error.
+    """
+    return dict(getattr(_dispatch_state, "counts", {}))
 
 
 def _reset_dispatch_for_test() -> None:

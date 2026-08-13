@@ -2,6 +2,14 @@
 
 Last updated: 2026-05-19
 
+> **Model scope: LTX 2.3 / Z-Image.** Written before MiniMax H3 entered
+> this repo (2026-08-04, `3f3a121`), so every number, shape and Amdahl
+> argument below is LTX-era. The method generalizes; the *numbers do not*.
+> Two specifics that mislead if carried across: the load-bearing metric
+> named here is an **LTX** shape, and the attention-share reasoning assumes
+> LTX's mix, where FFN is a real share -- H3's time is almost entirely
+> attention, so its Amdahl ceiling is different. See CLAUDE.md Conventions.
+
 L3 reference for CLAUDE.md's "Performance research" pointer. Load this
 when you are about to make a kernel change, run a perf experiment, or
 revisit the load-bearing metric. The metric itself lives in CLAUDE.md;

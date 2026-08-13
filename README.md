@@ -15,10 +15,18 @@ upstream lineage.*
 A sm89 / RTX 4090 kernel optimization and measurement surface for
 ComfyUI consumer workloads. The mission is to make the workflows we
 actually run faster, more memory-efficient, and more measurable --
-anchored in DiT-class diffusion (LTX 2.3 video, Flux / Z-Image image
-gen) and expanding to multi-modal pipelines as those become consumer
-workload classes worth attacking. See `VISION.md` for the full
-scope framing.
+anchored in DiT-class diffusion. See `VISION.md` for the full scope
+framing.
+
+**Two model workloads are supported, and they are not interchangeable:**
+**LTX 2.3** video (since ~2026-04) and **MiniMax H3** packed audio-video
+(since 2026-08-04). They differ in architecture -- H3 has a single
+unmasked attention site over one packed `[text | refs | audio | video]`
+sequence, LTX has masked cross-attn as a headline shape -- and in
+bottleneck: attention is nearly all of H3's wall-time, while LTX's is
+mixed with a real FFN share. A measurement from one is not evidence
+about the other. Flux / Z-Image appear as image-gen bench shapes, not
+as optimization targets.
 
 Sage attention is the historical foundation and remains a primary
 deliverable: INT8-quantized Q/K with FP8 PV accumulation, runtime-
@@ -169,6 +177,10 @@ Per-kernel speedup at synthetic LTX-class shapes (median over 3 timed
 runs). **These are isolation measurements, not e2e wall-time deltas
 on a render** -- the e2e contribution depends on the workload's
 attention share. Per-workload e2e numbers below.
+
+**These rows are LTX / Flux / Z-Image.** No MiniMax H3 row exists in
+the accuracy-and-speed bench; H3's coverage is correctness, VRAM and
+spikes. A one-off H3 self-attn sweep is recorded in `CLAUDE.md`.
 
 | shape                                    | sage fp8++ | torch_flash | speedup |
 |------------------------------------------|-----------:|------------:|--------:|

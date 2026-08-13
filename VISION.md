@@ -14,7 +14,9 @@ fix, the dispatcher mask-routing fix, and `attn_mask` as an introspectable
 parameter. Upstream defects, mostly -- found here, fixed here, and several
 of them worth sending back.
 
-**2. A measurement rig.** The LTX and H3 bench surfaces, the e2e harness,
+**2. A measurement rig.** The LTX and H3 test surfaces (LTX has the
+load-bearing accuracy/speed bench; H3's surfaces are correctness, VRAM
+and spikes -- **no H3 accuracy/speed row exists**), the e2e harness,
 the workload profiler, and `docs/perf_research_framework.md`. This is what
 produces the results people can act on -- that upstream's Sol-Attn defaults
 are wrong past 300 frames, that a 32B text encoder costs 1.5s, that H3's
@@ -124,6 +126,14 @@ The keep/discard rule mirrors autoresearch's: median_ms improved AND
 rtol stayed under 0.10 → keep, ship. Anything else → discard, revert.
 
 ## Why this metric, why this row, why this hardware
+
+> **Model scope: this section is LTX 2.3.** The single load-bearing metric
+> below is an LTX row, chosen before MiniMax H3 entered the repo
+> (2026-08-04, `3f3a121`). It remains the right anchor *for LTX*. H3 is a
+> different architecture with a different bottleneck -- one unmasked
+> attention site over a packed sequence, and attention is nearly all of
+> its wall-time where LTX's is mixed -- so this row does not rank H3 work
+> and H3 has no equivalent anchor row yet.
 
 **The shape (LTX 2.3 video self-attn at production seq).** On LTX 2.3
 video gen, video self-attn accounts for the overwhelming majority of
