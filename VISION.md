@@ -209,9 +209,10 @@ and we add a perceptual layer.
   is one module, not the whole library.
 - **A bench harness** that measures attention kernels at DiT shapes.
   Sage variants (5 modes), SpargeAttention, FlashInfer, three torch
-  SDPA backends — every row prints every run. Expanding to new
-  workload classes (cross-modal, multi-modal pipelines) as those
-  become recurrent.
+  SDPA backends — every row prints every run. Its shapes are **LTX and
+  Z-Image**; the multi-modal expansion has since happened (MiniMax H3,
+  2026-08-04) but **has not reached this harness** -- H3 is covered by
+  correctness, VRAM and spike surfaces, not by an accuracy/speed row.
 - **An editable install** with the SM80 build gate widened to
   compile from source on Ada. Load-bearing because every kernel-
   side change ships through it.

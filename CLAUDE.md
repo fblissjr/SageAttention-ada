@@ -27,12 +27,14 @@ local fork of `woct0rdho/SageAttention`, itself a fork of
 `VISION.md` for the full framing.
 
 We optimize the kernels that run when ComfyUI consumers fire their
-workflows on sm89 / RTX 4090. Anchored in DiT-class diffusion (LTX
-2.3 video, Flux / Z-Image image gen) and expanding to multi-modal
-pipelines as those become consumer workload classes worth attacking
-(see `VISION.md` for the full scope framing). No kernel-class
-non-goal -- attention, FFN, VAE, cross-modal, anything else that
-shows up in a render hot loop is fair game on sm89.
+workflows on sm89 / RTX 4090. Anchored in DiT-class diffusion. The
+multi-modal expansion is **not** forward-looking any more -- MiniMax
+H3 arrived 2026-08-04 and is a current target alongside LTX 2.3 (see
+`VISION.md` for the full scope framing). No kernel-class non-goal --
+attention, FFN, VAE, cross-modal, anything else that shows up in a
+render hot loop is fair game on sm89, **but rank it against a specific
+model**: the FFN line is LTX-motivated and buys H3 little, since H3's
+time is almost entirely attention.
 
 Three load-bearing surfaces:
 
