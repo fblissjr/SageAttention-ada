@@ -267,8 +267,12 @@ Swept across a 17x range of sequence length (fp32 reference, synthetic):
 | 78,336 | 394.7 ms / 0.0981 | 623.9 ms / 0.0362 | 2.71x |
 
 **No crossover exists**, so there is no "use fp16 above S=X" rule: the
-accuracy ratio is flat at ~2.7x and the speed cost converges to ~1.58x
-(1.40x at the small end). H3's S varies widely -- it is the packed
+accuracy ratio is flat at ~2.7x and the *synthetic per-call* speed cost
+converges to ~1.58x (1.40x at the small end). **That 1.58x is a kernel
+number, not a delivered one** -- the only e2e observation runs the other
+way (a consumer render measured fp16 at 2.5 min against fp8++'s 2.7,
+confounded by first-arm model loading), so the e2e effect is unmeasured
+and must not be quoted as 1.58x slower renders. H3's S varies widely -- it is the packed
 `[text | refs | audio | video]` length, so canvas, aspect, clip length
 and reference count all move it (a real 345-frame 1024x768 reference
 render measures 143,386) -- and **one mode decision covers the whole
