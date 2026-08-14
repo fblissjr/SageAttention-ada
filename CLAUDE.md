@@ -508,12 +508,17 @@ identical at a shape where they shouldn't.
   `min_tokens` gate alone and ignored the sigma window. The override's
   compose gate applies both, and a call failing *either* falls through to
   the previously installed patch -- ours -- so every step outside the sigma
-  window runs the whole DiT on sage. At the shipped `0.2 / 0.9` that is the
-  leading steps plus the last one: 5 of 16 at the consumer's settings, and
-  the count moves with step count, scheduler and shift. **Read it out of
-  `get_dispatch_counts()` rather than computing it** -- the count is the
-  only thing that distinguishes "sage handled a share" from "sage was
-  bypassed", and both look identical in a log.
+  window runs the whole DiT on sage.
+
+  That mechanism is read from the override's `_compose_module_patch` and is
+  the part to rely on. The *share* is not: "5 of 16 at `0.2 / 0.9`" is the
+  consumer's computation, taken on trust here and **not independently
+  verified** -- it needs the sigma schedule under that scheduler and shift,
+  which is not derivable from our source. It moves with step count,
+  scheduler, shift and window. **Read it out of `get_dispatch_counts()`
+  rather than quoting a number** -- the count is the only thing separating
+  "sage handled a share" from "sage was bypassed", and both look identical
+  in a log.
 
   So an H3 attention-kernel win multiplies against the dense share rather
   than against the render, and the quant-offset ceilings (CHANGELOG v0.7.0
