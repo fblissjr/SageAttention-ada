@@ -223,6 +223,29 @@ comparand) is `pv_accum_dtype="fp32"` ->
 `qk_int8_sv_f8_accum_f32_fuse_v_scale_attn`; our default `fp8_cuda++`
 is `fp32+fp16`.
 
+**A synthetic-input accuracy number is not a measurement of anything we
+ship. Capture real q/k/v.** `torch.randn` has no channel offset (so
+`smooth_k` is inert), no attention structure (so softmax is near-uniform
+and the output is a near-cancelling average, which inflates every
+element-wise relative error), and no relationship to the activation
+magnitudes a trained model produces. Measured consequence at H3 config:
+the synthetic bench reports fp8++ **4x worse** than reality and the
+fp8-vs-fp16 gap **2x wider**. `tests/spikes/spike_h3_real_activations.py`
+is the harness; it takes `.pt` files of captured q/k/v and a
+throwaway hook on the consumer's attention call site produces them. Do
+that instead of adding synthetic rows.
+
+**The same trap applies harder to anything approximate.** A quantizer's
+error does not depend on attention having structure; a block-sparse
+router's entire function does, so synthetic input measures a routed
+method precisely where its premise fails. Any approximation-vs-dense
+figure taken on `randn` is a bound so loose it is misleading in the
+pessimistic direction -- see the referent rule under Conventions.
+
+The tables below are kept as the record of what synthetic inputs said,
+and because the *speed* and VRAM columns are unaffected by input
+distribution. **Do not quote their rtol columns.**
+
 **Do not run accum-config A/Bs expecting an accuracy result. The PV
 accumulator is not an accuracy lever; the width of the PV operands is.**
 Measured 2026-08-13 at a **MiniMax H3** self-attn shape
@@ -467,15 +490,42 @@ identical at a shape where they shouldn't.
   (an out-of-ceiling length -- H3 rejects past 15.0 s after the 17n+5
   snap, so 345 is the largest legal count; the ratio is still a ratio,
   but it was taken at a shape nobody can render),
-  2026-08-14: 493.4 s against 794.7 s sage-alone (1.61x), with sage taking
-  **zero DiT calls** in the override-on arm; that baseline ran
-  `fp8_cuda++` while the graphs ship `fp16_cuda`, so it understates. So an
-  H3 attention-kernel win now multiplies against the dense share rather
+  2026-08-14: 493.4 s against 794.7 s sage-alone (1.61x); that baseline ran
+  `fp8_cuda++` while the graphs ship `fp16_cuda`, so it understates.
+
+  **Sage is not idle in the override-on arm, and an earlier version of this
+  block said it was.** The "zero DiT calls" figure was read off the
+  `min_tokens` gate alone and ignored the sigma window. The override's
+  compose gate applies both, and a call failing *either* falls through to
+  the previously installed patch -- ours -- so every step outside the sigma
+  window runs the whole DiT on sage. At the shipped `0.2 / 0.9` that is the
+  leading steps plus the last one: 5 of 16 at the consumer's settings, and
+  the count moves with step count, scheduler and shift. **Read it out of
+  `get_dispatch_counts()` rather than computing it** -- the count is the
+  only thing that distinguishes "sage handled a share" from "sage was
+  bypassed", and both look identical in a log.
+
+  So an H3 attention-kernel win multiplies against the dense share rather
   than against the render, and the quant-offset ceilings (CHANGELOG v0.7.0
   int32 fix; the `csrc/fused` uint32 ceiling under Known kernel bugs) bind
   on that path only. The sparse kernels are a separate implementation --
   `int64_t` strides and `size_t` offsets, read 2026-08-14 -- so they do
   not share that defect.
+
+  **H3's conditioning region is multi-modal; do not reason about it as
+  "the audio sink".** The packed sequence is
+  `[text | refs | audio | video]` and `refs` is image *or video*
+  references, which in a reference-heavy graph are the largest part of
+  the conditioning region by a wide margin -- far larger than audio. The
+  override's `sink_conditioning` knob is documented in terms of keeping
+  generated audio intact, and that is one modality of a packed
+  audio-video output, not the whole of what conditioning carries. When
+  the override narrows which conditioning rows keep dense queries, the
+  rows it makes sparse are mostly reference rows, and a *video*
+  reference is temporally structured in a way an image reference is not.
+  Any claim about that knob taken on a t2v graph (no refs, so the region
+  is text+audio and text is under one 64-row block) generalises to
+  nothing.
 
   **Never compare an approximate kernel's accuracy number to ours without
   checking what its reference computes.** A block-sparse kernel's
