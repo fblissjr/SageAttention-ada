@@ -476,6 +476,22 @@ identical at a shape where they shouldn't.
   on that path only. The sparse kernels are a separate implementation --
   `int64_t` strides and `size_t` offsets, read 2026-08-14 -- so they do
   not share that defect.
+
+  **Never compare an approximate kernel's accuracy number to ours without
+  checking what its reference computes.** A block-sparse kernel's
+  correctness bench typically grades it against an eager implementation of
+  *its own algorithm at the same settings*, so the approximation is on both
+  sides and cancels: that number is implementation fidelity and contains no
+  approximation error at all. Ours is distance from exact attention. The
+  two are not the same quantity and no metric conversion reconciles them --
+  check the referent before the metric. Sol's harness makes both available
+  (fidelity ~0.9999, and separately its distance from its own dense limit);
+  only the second is comparable to a sage rtol, and **both of its published
+  figures are taken at `T=512, H=4` on `torch.randn`**, which is a
+  degenerate regime for block routing (8 blocks of 64) on structureless
+  input. Expect any approximation-vs-dense figure taken there to be
+  pessimistic by a wide margin, for the same reason our own synthetic
+  numbers are -- see the real-activation correction under Testing.
 - Python: **always uv**. Never `pip`, never bare `python3`.
 - JSON: **orjson**, never stdlib `json`.
 - **No emojis** in any file or output.
