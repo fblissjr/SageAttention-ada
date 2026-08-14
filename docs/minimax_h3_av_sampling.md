@@ -155,13 +155,17 @@ attention share of the step are all untouched. So:
   figure this line used to quote was retracted in v0.7.3)
 - the `per_channel_fp8` 572 MiB transient
 - the v0.7.0 mask-probe fix and the int32 quant-overflow fix
-- the 757.7 ms per-call figure and the 76%-of-step attention share at 362 frames
+- the 757.7 ms per-call figure and the 76%-of-step attention share, both
+  taken at S=109,126 (a 362-frame packed length; see the v0.7.1 note --
+  362 frames is past H3's 15.0 s ceiling and 345 is the largest legal
+  count, so read these as measurements at that S, not at a renderable
+  shape)
 
 all stand as kernel measurements. Nothing in this PR touches the attention path.
 
 ### Affected: e2e wall time and any quality baseline
 
-The 362-frame reconciliation in CHANGELOG v0.7.1 -- 20 steps at 49.66 s/it,
+The long-sequence reconciliation in CHANGELOG v0.7.1 -- 20 steps at 49.66 s/it,
 workflow `h3_t2v_sage_ui.json`, 1344x768, euler / simple, sage mode `auto` --
 was taken under the old sampling math. The per-step accounting stays valid
 because the step is the same work. What does not survive is any comparison of
@@ -181,7 +185,7 @@ be re-shot on whichever side of the merge the comparison lives.
 ### The bigger lever: low step counts
 
 Our long-sequence H3 conclusion has been that attention is three quarters of the
-clock at 362 frames, so further work should aim there. That is still true per
+clock at long-clip lengths, so further work should aim there. That is still true per
 step. But step count is a multiplier on the whole render and sits outside the
 kernel entirely.
 

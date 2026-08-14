@@ -22,9 +22,11 @@ strides and so gets this right; quoting a single row count does not:
                     99,864 rows. Three times sooner, and it is the layout
                     a DiT block actually produces from one qkv projection.
 
-The fused figure is the one that matters in practice. H3 at 362 frames is
-S=109,126, which is comfortably inside a 300k budget and past the real
-crossing; v0.7.1 measured the specialization firing exactly there. Any
+The fused figure is the one that matters in practice. H3 at its longest
+legal length -- 345 frames, 14.375 s of the 15.0 s ceiling -- is S=104,030,
+which is comfortably inside a 300k budget and 4.2% past the real crossing;
+v0.7.1 measured the specialization firing just above there, at S=109,126.
+Any
 check written against the contiguous number stays silent on the layout
 that overflows first, so an absent warning is not evidence of clearance.
 

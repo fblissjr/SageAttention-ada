@@ -1,9 +1,21 @@
 """Does the sm89 kernel still behave past the int32 offset boundary?
 
 Every sage measurement on file stops at S=41,822 -- MiniMax H3's fl2va shape
-at the node's default 124 frames. A 362-frame request at the same 1344x768
-canvas packs S=109,126 rows, which is 2.9x longer and, in the layout
-production actually uses, past the point where int32 element offsets wrap.
+at the node's default 124 frames. The longest legal request, 345 frames at
+the same 1344x768 canvas, packs S=104,030 rows, which is 2.5x longer and, in
+the layout production actually uses, past the point where int32 element
+offsets wrap.
+
+345 is the ceiling, not 362. The reference implementation checks duration
+*after* the frame count snaps to the 17n+5 grid and rejects anything over
+15.0 s (`modular_pipelines/minimax_h3/before_denoise.py`), so 362 frames is
+15.083 s and illegal; 345 (14.375 s) is the largest count on the grid. An
+earlier version of this file swept 362 and called it "a shape a user
+actually requested" -- that came from ComfyUI's node tooltip, which claims a
+trained range of ~124-362 and has no ceiling of its own. 362 is kept in the
+sweep below as an out-of-distribution row, because the kernel question is
+about S and not about training windows, but it is not a production shape and
+no rendered output should be taken at it.
 
 Two things need separating at that size, and the synthetic bench answers
 neither today:
@@ -40,7 +52,7 @@ from test_sageattn_ltx_shapes import accuracy_metrics, time_and_vram
 HEADS = 56
 HEAD_DIM = 128
 WIDTH, HEIGHT = 1344, 768
-FRAME_COUNTS = [124, 200, 300, 362]
+FRAME_COUNTS = [124, 200, 300, 345, 362]  # 345 is the legal ceiling; 362 is OOD
 
 # Rows the DiT actually attends over, from comfy_extras/nodes_minimax_h3.py
 # geometry. Kept in step with tests/spikes/spike_minimax_h3_shapes.py.

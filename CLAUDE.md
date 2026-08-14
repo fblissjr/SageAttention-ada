@@ -285,10 +285,15 @@ Swept across a 17x range of sequence length (fp32 reference, synthetic):
 | 41,822 | 112.2 ms / 0.0984 | 178.0 ms / 0.0363 | 2.71x |
 | 78,336 | 394.7 ms / 0.0981 | 623.9 ms / 0.0362 | 2.71x |
 
-Three of those four are round numbers rather than H3 geometry -- only
-41,822 is a real packed length (fl2va, 1344x768, 124 frames) -- and the
-sweep does not reach the shipped 362-frame length of 109,126. Read it as
-a 17x span of S at H3's head config, not as four H3 configurations.
+What those four S values are is only partly recoverable, since the script
+was not committed. 41,822 is a real packed fl2va length (1344x768, 124
+frames). 24,576 and 78,336 coincide exactly with 1024x768 video-row
+counts at on-grid latent_t of 32 and 102 -- i.e. 107-frame and 345-frame
+clips -- but they are equally exactly 24x1024 and 76.5x1024, so intent is
+not recoverable from the number. 4,608 maps to no on-grid H3 geometry and
+reads as a low-end anchor. Either way the top of the sweep is at or near
+the **legal** maximum clip length, so the range is not short of
+production; describe it as a 17x span of S at H3's head config.
 
 **No crossover exists**, so there is no "use fp16 above S=X" rule: the
 synthetic accuracy ratio is flat at ~2.7x and the *synthetic per-call*
@@ -451,6 +456,26 @@ identical at a shape where they shouldn't.
   LTX shape and the bench has **no H3 coverage at all**. Anything dated
   before 2026-08-04 is LTX/Z-Image by construction -- cite it as
   corroborating a pattern, never as confirming an H3 result.
+
+  **On H3, most attention no longer reaches sage.** Since 2026-08-14 the
+  shipped consumer graphs chain a third-party block-sparse-attention CUDA
+  override (Sol-Attn, arXiv 2607.24027) above sage and give it H3's single
+  full-packed-length DiT attention call; sage is the fallback link and
+  receives only what the override declines -- depth-gated dense blocks,
+  steps outside the sigma window, sub-`min_tokens` calls, masked calls
+  (none, on H3) and kernel errors. Consumer-side e2e at 362 frames
+  (an out-of-ceiling length -- H3 rejects past 15.0 s after the 17n+5
+  snap, so 345 is the largest legal count; the ratio is still a ratio,
+  but it was taken at a shape nobody can render),
+  2026-08-14: 493.4 s against 794.7 s sage-alone (1.61x), with sage taking
+  **zero DiT calls** in the override-on arm; that baseline ran
+  `fp8_cuda++` while the graphs ship `fp16_cuda`, so it understates. So an
+  H3 attention-kernel win now multiplies against the dense share rather
+  than against the render, and the quant-offset ceilings (CHANGELOG v0.7.0
+  int32 fix; the `csrc/fused` uint32 ceiling under Known kernel bugs) bind
+  on that path only. The sparse kernels are a separate implementation --
+  `int64_t` strides and `size_t` offsets, read 2026-08-14 -- so they do
+  not share that defect.
 - Python: **always uv**. Never `pip`, never bare `python3`.
 - JSON: **orjson**, never stdlib `json`.
 - **No emojis** in any file or output.
@@ -773,7 +798,11 @@ graph-breaks at, the trigger to revisit, and the estimated work in
   measurement -- two conclusions have already gone stale without anyone
   noticing at the time, and the third-party nodes involved ship
   behaviour-changing commits faster than our docs track them. Detail
-  lives in the files it points at, not in the diary.
+  lives in the files it points at, not in the diary. The consumer repo's
+  own `docs/SOLATTN.md` (reachable through `coderef/`) is the canonical
+  write-up of the H3 sparse-attention stack -- backend choice, install,
+  the e2e arms, and the quality gate -- and it is maintained there, not
+  here.
 - `internal/pyright_noise.md` (gitignored) -- pyright false-positives
   to ignore in `sageattention/` and `tests/`. Two recurring categories
   worth knowing up front: "unreachable code" on `@triton.jit` kernel

@@ -1362,6 +1362,31 @@ Two are controls that pass in both states by design and say so.
 
 ### v0.7.1 -- 2026-08-05  (long-sequence validation: the v0.7.0 overflow fix holds at 362 frames, and the int64 path is free)
 
+> **Superseded in framing 2026-08-14, not in result: 362 frames is not a
+> legal length.** The reference implementation checks duration *after* the
+> frame count snaps to the 17n+5 grid and rejects past 15.0 s
+> (`modular_pipelines/minimax_h3/before_denoise.py`, with the 346 -> 362
+> trap named in its own comment), so 362 frames is 15.083 s. 345 (14.375 s)
+> is the largest count on the grid. "A length a user actually asked for"
+> below is wrong, and it came from ComfyUI's node tooltip, which advertises
+> a trained range of ~124-362 and enforces no ceiling at all.
+>
+> **The conclusion survives, on a much narrower envelope.** At the true
+> ceiling of 345 frames, 1344x768 packs S = 104,030, still past the
+> fused-layout wrap at S = 99,864 -- so the specialization still fires at
+> the longest legal render and the fix is still load-bearing. But the grid
+> is coarse: the next legal length down, 328 frames (latent_t 97), packs
+> S = 98,934 and stays *below* the boundary, and at the 1024x768
+> video-reference canvas even 345 frames only reaches S = 79,550. So at
+> 1344x768 exactly one legal clip length crosses, and at 1024x768 none
+> does. That is the live envelope -- narrow, but 345 at 1344x768 is a
+> shipped configuration, and references push S higher still.
+>
+> The kernel numbers in the table below remain valid
+> measurements at the sequence lengths named, because a kernel has no
+> opinion about training windows; they are not measurements of a shape
+> anyone can render. Left unedited per the retraction convention.
+
 No code change. This closes a measurement gap that v0.7.0 left open and
 corrects an env pin.
 

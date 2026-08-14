@@ -230,9 +230,18 @@ def test_h3_production_tail_is_clean():
 
     The sub-tile cases above run at toy sizes. This one runs H3's actual
     packed-sequence config, paired so the tail is the only variable: an exact
-    multiple of BLKK beside the same scale with a ragged tail. 109126 is the
-    362-frame production shape, and its 6-row tail in a 64-row tile is the
-    most exposed case we actually render.
+    multiple of BLKK beside the same scale with a ragged tail. 109126 leaves
+    a 6-row tail in a 64-row tile, which is the most exposed ratio the layout
+    can produce.
+
+    109126 is a 362-frame packed length and 362 frames is **not renderable**
+    -- the reference implementation rejects past 15.0 s measured after the
+    17n+5 snap, so the ceiling is 345 frames (S = 104,030 at 1344x768, a
+    30-row tail). Kept at 109126 deliberately rather than lowered to the
+    shipped shape: a 6-row tail reads 58 padded rows against the shipped
+    shape's 34, so this is the strictly harsher case and it still exercises
+    the same unpredicated load. Do not read the number as a production
+    geometry; it is a stress shape chosen for its tail ratio.
 
     This is about V, not the predicated loader the rest of this file covers.
     `load_fp8_V_global_to_share` (qk_int_sv_f8_cuda_sm89.cuh:266) takes no

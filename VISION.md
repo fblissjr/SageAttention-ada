@@ -9,7 +9,9 @@ Three things, in order of how much they have actually delivered:
 **1. A trusted fork.** The build that compiles for sm89 and stays correct
 on the shapes we run. Concretely: `setup.py:152` (without which sage does
 not build for Ada from source at all), the int32 offset overflow fix that
-keeps 362-frame renders from silently zeroing their tail, the stream-safety
+keeps long-clip renders from silently zeroing their tail (it fires from
+S=99,864 in the fused layout; at 1344x768 the only legal clip length past
+that is 345 frames, H3's ceiling, at S=104,030), the stream-safety
 fix, the dispatcher mask-routing fix, and `attn_mask` as an introspectable
 parameter. Upstream defects, mostly -- found here, fixed here, and several
 of them worth sending back.
