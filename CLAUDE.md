@@ -242,9 +242,19 @@ method precisely where its premise fails. Any approximation-vs-dense
 figure taken on `randn` is a bound so loose it is misleading in the
 pessimistic direction -- see the referent rule under Conventions.
 
-The tables below are kept as the record of what synthetic inputs said,
-and because the *speed* and VRAM columns are unaffected by input
-distribution. **Do not quote their rtol columns.**
+**The rule is about accuracy specifically, and the three-way split
+matters -- do not read it as "synthetic benches are bad".**
+
+| question | synthetic input | why |
+|---|---|---|
+| **speed, VRAM** | fine | input distribution does not change the work done |
+| **fidelity** -- does this kernel compute what its own reference computes; is the output bit-identical; does the load stay in bounds | fine, and often **required** | a property of the arithmetic, not of the data. Constructed inputs beat real ones here: `tests/test_short_seq_tail.py` dirties smem with `+inf` before every sweep, which real activations never produce, and without it the file is green against a kernel already proven broken |
+| **accuracy** -- distance from exact attention, or anything standing in for perceptual quality | **not a measurement** | the whole error depends on structure `randn` does not have |
+
+Cross-implementation agreement rows (`fp8++vs.triton`) are fidelity, not
+accuracy. The tables below are kept as the record of what synthetic
+inputs said and for their speed and VRAM columns. **Do not quote their
+rtol columns.**
 
 **Do not run accum-config A/Bs expecting an accuracy result. The PV
 accumulator is not an accuracy lever; the width of the PV operands is.**
