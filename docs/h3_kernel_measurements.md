@@ -8,12 +8,17 @@ roughly a hundred lines of always-loaded context whose own caption said
 not to quote most of it. Measurements belong in a dated record with
 their conditions attached, not in the routing index.
 
-## Open on 2026-09-13: two measurements drafted, harnesses committed, GPU held by a render
+## 2026-09-13: two measurements, drafted under a held GPU and closed the same day
 
-Recorded before the numbers exist so the question and its instrument are
-on file even if the result is a revert. Both run on the RTX 4090 (sm89),
-torch 2.14, the build identified by `build_info()` at the time of the run;
-the tables land in `CHANGELOG.md` under v0.7.17 with that stamp.
+Written before the numbers existed so the question and its instrument were
+on file whatever the result; kept as written, with the outcomes appended.
+Both ran on the RTX 4090 (sm89), torch 2.14.0+cu132, build
+`2.2.0 @ 071b186ba473`. **Outcomes:** (1) no cost, bit-identical at every
+length, old build fails past the ceiling and the new one does not -- table
+under v0.7.17 in `CHANGELOG.md`. (2) per-thread stays: per-warp CUDA is
+slower end to end at every length and worse on both captured cells -- table
+in the CHANGELOG decision log, "sm89 q/k quantization". The quantization
+step's share also closed the epilogue-fusion question, same log.
 
 1. **Cost and identity of the int64 strides in `csrc/fused/fused.cu`.**
    `tests/spikes/spike_fused_quant_offsets.py`, loading the pre-change

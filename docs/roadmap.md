@@ -198,7 +198,13 @@ launching attention + FFN streams concurrently, persistent-CTA's
 priority drops back to "validates the technique" rather than
 "closes the gap."
 
-### 1.4 Quantization as an epilogue, not a pass (H3; added 2026-09-13, gated on one number)
+### 1.4 Quantization as an epilogue, not a pass (H3; added and CLOSED 2026-09-13 -- the number came in under 1%)
+
+**Closed the same day**: the gating number was measured and the pass is
+under 1% of the attention call at the frame ceiling and under 2% at the
+default. Table and reopen trigger in the CHANGELOG decision log ("Fuse q/k
+quantization into the consumer's RMSNorm+RoPE epilogue"). The analysis
+below stands as the scoping record for the reopen case.
 
 **Model: MiniMax H3.** Written after the v0.7.17 session, when the owner
 asked what would happen if q/k/v were not quantized on every step. The

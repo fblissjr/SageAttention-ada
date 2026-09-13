@@ -121,51 +121,6 @@ Recorded: 2026-08-05, while validating the Triton fix at 362 frames.
 Real open TODOs. Each has an explicit trigger-to-act; we don't do these
 speculatively.
 
-### Fuse q/k quantization into the consumer's RMSNorm+RoPE epilogue (added 2026-09-13; expected to close as no-action)
-
-**Trigger to act:** `tests/spikes/spike_h3_qk_quant_gran.py` reporting the
-q/k quantization step as a share of the `sageattn_consume` call, at the
-345-frame ceiling on the fused view, large enough that removing it entirely
-would move a render. Recorded expectation, so the number can contradict it:
-small, because the pass is O(S) against an O(S^2) kernel and shrinks with
-every frame added. If the spike agrees, this closes into the Decision log
-with the measured share and is not reopened by argument, only by a new
-measurement on a shorter workload.
-
-**What it is.** Every attention call today reads q, k and v three times in
-bf16: the projection writes them, the consumer's fused RMSNorm+RoPE kernel
-reads and rewrites q and k, and sage's quantizers read all three again to
-write int8 q/k and fp8 v. The last read is a pure extra pass. The lever is
-the epilogue of the last kernel that already touches q and k -- the
-consumer's, not ours -- emitting int8 with sage's rounding and scales, and
-a sage entry point that accepts pre-quantized inputs and skips its own
-pass. Per-warp granularity makes the epilogue a block absmax reduction;
-per-thread makes it a layout puzzle, which is one reason the granularity
-A/B runs first and would subsume this if the fused epilogue picks its own.
-
-**What it is not.** Not cross-step reuse: the latent moves every sampler
-step, so every hidden state, including text and reference tokens in H3's
-packed sequence, is new each step, and nothing quantized at one step is
-valid at the next. The only step-stable quantity is the scale, and it is
-computed in the same pass that writes the values, so reusing it saves
-nothing. Sampler-level block skipping is a separate approximation with an
-accuracy cost, and on this stack that role is already taken by the
-approximate-attention override.
-
-**Scope if triggered.** Sage side small, oracle exact (feed sage's own
-quantizer outputs, require bit-identical attention). Consumer q/k side
-moderate, oracle exact (match `per_warp_int8` bit for bit). **v side out
-of scope**: v does not go through RoPE, its only fusable kernel is the
-projection GEMM's epilogue, and per-channel fp8 needs the absmax over the
-whole sequence before any value is written -- sage's own path reads v twice
-for that reason -- so a single-pass fusion means a stale scale from the
-previous step, an accuracy trade graded on captures, not a free win. Ship
-gate: in-pipeline A/B before the commit, since dispatch overhead and cache
-behaviour in the real block are what a synthetic bench cannot see. Longer
-form in `docs/roadmap.md` 1.4.
-
----
-
 ### Drop `per_channel_fp8`'s full-size bf16 transpose buffer -- SUPERSEDED 2026-08-06, but the premise needs re-checking (2026-09-08)
 
 **Read this note before the entry below.** The supersession rests on a
@@ -630,6 +585,142 @@ quant"). Today: not load-bearing.
 
 Investigations that closed without action. Recorded so we don't
 re-derive them. Each entry has an explicit reopen-trigger.
+
+### sm89 q/k quantization: per-thread Triton stays; per-warp CUDA measured slower end to end -- 2026-09-13
+
+The consumer asked whether sm89 should keep the Triton per-thread q/k
+quantization it inherits or move to the CUDA per-warp path the dispatcher
+selects on sm100/sm120/sm121, after retracting its own belief that the
+sm89 choice had been made for accuracy. The dispatcher comment only ever
+said the two branches had never been graded against each other. Now they
+have.
+
+**Speed.** `tests/spikes/spike_h3_qk_quant_gran.py`, 2026-09-13, RTX 4090
+(sm89), torch 2.14.0+cu132, build `2.2.0 @ 071b186ba473`, GPU otherwise
+idle, fused-QKV view (stride_seq 21504), NHD, heads 56, head_dim 128,
+`smooth_k=False`, `pv_accum_dtype="fp32+fp16"`, through `sageattn_consume`
+as the consumer calls it; quant step median of 7, call median of 5. Full
+stdout in `internal/records/spike_h3_qk_quant_gran_2026-09-13.log`
+(gitignored; this table is the committed copy).
+
+| S | arm | quant ms | call ms | peak MiB | rtol (synthetic, ranking only) |
+|---|---|---|---|---|---|
+| 41,822 | per_thread (Triton) | 2.141 | 110.50 | 1433 | 0.0983 |
+| 41,822 | per_warp (CUDA) | 2.126 | 112.26 | 1431 | 0.0991 |
+| 104,030 | per_thread (Triton) | 5.410 | 680.63 | 3563 | 0.0984 |
+| 104,030 | per_warp (CUDA) | 5.375 | 693.45 | 3558 | 0.0992 |
+| 109,126 | per_thread (Triton) | 5.691 | 757.39 | 3738 | 0.0986 |
+| 109,126 | per_warp (CUDA) | 5.644 | 768.22 | 3732 | 0.0994 |
+| 149,000 | per_thread (Triton) | 7.955 | 1409.53 | 5104 | 0.0981 |
+| 149,000 | per_warp (CUDA) | 7.763 | 1429.17 | 5095 | 0.0989 |
+
+**Reading, both arms measured.** The quantization step itself is a wash:
+per-warp CUDA is faster by a fraction of a percent to two percent, worth
+tens of microseconds per call. The whole call is slower with per-warp at
+every row count, by 1.4% to 1.9%, worth 2 to 20 ms per call. Those two
+facts together locate the difference: it is not the quantizer, it is the
+attention kernel, whose per-warp instantiation (`qk_quant_gran=2`) applies
+scales differently from the per-thread one and runs slower here. That is a
+mechanism read from the arithmetic of the two columns, not a profile of
+the kernel; the consistent direction across four lengths and a delta an
+order of magnitude above the quant step's own delta is what makes it a
+finding rather than noise. Multiplied by the roughly 800 attention calls
+in a 16-step render, the per-warp path would cost seconds per clip at the
+ceiling for nothing.
+
+**Accuracy, on captured activations.**
+`tests/spikes/spike_h3_real_activations.py` (per-warp arm added this
+version), same build and card, on two cells of the consumer's 2026-09-03
+base16 t2v capture at 1344x768, S=104,361: block 0 at step 4 and block 49
+at step 15, i.e. the earliest and latest cells in the set. Reference is
+fp32 `EFFICIENT_ATTENTION` over the same captured bf16 q/k/v, mean rtol
+over 8-head chunks. Full stdout in
+`internal/records/spike_h3_real_activations_qk_gran_2026-09-13.log`
+(gitignored; this table is the committed copy).
+
+| cell | per_thread (Triton) | per_warp (CUDA) | delta |
+|---|---|---|---|
+| block 0, step 4 | 0.0141 | 0.0148 | +4.6% |
+| block 49, step 15 | 0.0472 | 0.0486 | +3.0% |
+
+Per-warp is worse on both, by more than the spike's own no-effect band on
+the first cell and at its edge on the second, and in the same direction as
+the synthetic ranking above. Coarser scale granularity costs accuracy, as
+the conventional argument says; there is nothing on the speed side to buy
+it back.
+
+**Seen in passing, not acted on:** on the late cell `smooth_k=True` helps
+both fp8++ and fp16 by several percent, where the same spike on 2026-08-05
+found K essentially centred and `smooth_k` inert. The K channel offset the
+spike reports is far larger at block 49 / step 15 than at block 0 / step 4,
+so the earlier "no effect" was a statement about early cells. The consumer
+passes `smooth_k=False`, and this fork's `sageattn_consume` peak-memory
+argument depends on that. Worth its own graded question; not this one.
+
+**Decision.** sm89 keeps `per_thread`. The dispatcher comment in
+`sageattention/core.py` now says so with the date. Reopen only with a new
+measurement on a different kernel build or a different arch; a synthetic
+rtol column cannot reopen it, per the rule in `docs/testing_practices.md`.
+
+### Fuse q/k quantization into the consumer's RMSNorm+RoPE epilogue -- CLOSED 2026-09-13, no action (the pass is under 1% of the call at the ceiling)
+
+**Closed the day it was opened, by the number it was gated on.**
+`tests/spikes/spike_h3_qk_quant_gran.py`, 2026-09-13, RTX 4090, build
+`2.2.0 @ 071b186ba473`, fused view, `sageattn_consume` as the consumer calls
+it; the q/k quantization step against the whole call:
+
+| S | quant step ms | call ms | share |
+|---|---|---|---|
+| 41,822 | 2.141 | 110.50 | 1.94% |
+| 104,030 | 5.410 | 680.63 | 0.79% |
+| 109,126 | 5.691 | 757.39 | 0.75% |
+| 149,000 | 7.955 | 1409.53 | 0.56% |
+
+The expectation recorded when the entry was opened -- small, and shrinking
+with length because the pass is O(S) against an O(S^2) kernel -- is what the
+table shows. Removing the pass entirely, which no fusion can beat, recovers
+under a percent of an attention call at the frame ceiling and under two at
+the default. Not worth kernel-day on either side.
+
+**Reopen trigger:** a workload whose attention calls are short enough that
+the O(S) terms matter -- an image model, or a video model at a few thousand
+rows -- and a profile on it showing the pass above a few percent of the call.
+Not reopened by argument. The rest of the entry is kept as the scoping
+record.
+
+**What it is.** Every attention call today reads q, k and v three times in
+bf16: the projection writes them, the consumer's fused RMSNorm+RoPE kernel
+reads and rewrites q and k, and sage's quantizers read all three again to
+write int8 q/k and fp8 v. The last read is a pure extra pass. The lever is
+the epilogue of the last kernel that already touches q and k -- the
+consumer's, not ours -- emitting int8 with sage's rounding and scales, and
+a sage entry point that accepts pre-quantized inputs and skips its own
+pass. Per-warp granularity makes the epilogue a block absmax reduction;
+per-thread makes it a layout puzzle, which is one reason the granularity
+A/B runs first and would subsume this if the fused epilogue picks its own.
+
+**What it is not.** Not cross-step reuse: the latent moves every sampler
+step, so every hidden state, including text and reference tokens in H3's
+packed sequence, is new each step, and nothing quantized at one step is
+valid at the next. The only step-stable quantity is the scale, and it is
+computed in the same pass that writes the values, so reusing it saves
+nothing. Sampler-level block skipping is a separate approximation with an
+accuracy cost, and on this stack that role is already taken by the
+approximate-attention override.
+
+**Scope if triggered.** Sage side small, oracle exact (feed sage's own
+quantizer outputs, require bit-identical attention). Consumer q/k side
+moderate, oracle exact (match `per_warp_int8` bit for bit). **v side out
+of scope**: v does not go through RoPE, its only fusable kernel is the
+projection GEMM's epilogue, and per-channel fp8 needs the absmax over the
+whole sequence before any value is written -- sage's own path reads v twice
+for that reason -- so a single-pass fusion means a stale scale from the
+previous step, an accuracy trade graded on captures, not a free win. Ship
+gate: in-pipeline A/B before the commit, since dispatch overhead and cache
+behaviour in the real block are what a synthetic bench cannot see. Longer
+form in `docs/roadmap.md` 1.4.
+
+---
 
 ### Caller-side `v` clone for H3 has disappeared upstream; `sageattn_consume` now saves nothing there
 
@@ -1179,13 +1270,47 @@ needs ~14 GiB free and skips otherwise.
 
 **Before/after record.** `tests/spikes/spike_fused_quant_offsets.py`, loading
 the pre-change `.so` beside the new one so both builds run in one process on
-the same tensors. MEASUREMENT PENDING as of this commit -- the GPU was held
-by a live render for the whole session that produced it, so the code, the
-guard, its tests and this entry are committed first and the table lands in
-a follow-up commit, dated, with the `build_info()` stamp of the run. If
-that table shows a real price for the int64 arithmetic, the follow-up is a
-revert of the kernel change and this paragraph says so. Until then, treat
-the widening as untimed.
+the same tensors. Run 2026-09-13, RTX 4090 (sm89), torch 2.14.0+cu132,
+new build `2.2.0 @ 071b186ba473`, old build from
+`internal/artifacts/fused_pre_v0.7.17/`, GPU otherwise idle (a freshly
+restarted consumer server holding its bare context), heads 56, head_dim
+128, fused-QKV view (stride_seq 21504), NHD, median of 7 after 2 warmups.
+Full stdout in `internal/records/spike_fused_quant_offsets_2026-09-13.log`
+(gitignored; the table here is the committed copy).
+
+| S | kernel | new ms | old ms | new/old | bit-equal |
+|---|---|---|---|---|---|
+| 41,822 | per_warp q | 1.079 | 1.077 | 1.002 | yes |
+| 41,822 | per_block k | 1.073 | 1.072 | 1.001 | yes |
+| 41,822 | per_channel v (transpose + scale_fuse) | 2.850 | 2.869 | 0.993 | yes |
+| 104,030 | per_warp q | 2.701 | 2.697 | 1.001 | yes |
+| 104,030 | per_block k | 2.702 | 2.683 | 1.007 | yes |
+| 104,030 | per_channel v | 7.518 | 7.516 | 1.000 | yes |
+| 109,126 | per_warp q | 2.813 | 2.821 | 0.997 | yes |
+| 109,126 | per_block k | 2.806 | 2.811 | 0.998 | yes |
+| 109,126 | per_channel v | 7.875 | 7.870 | 1.001 | yes |
+| 149,000 | per_warp q | 3.837 | 3.845 | 0.998 | yes |
+| 149,000 | per_block k | 3.852 | 3.852 | 1.000 | yes |
+| 149,000 | per_channel v | 10.785 | 10.798 | 0.999 | yes |
+
+Past the ceiling, `per_channel_fp8`'s dequantized tail at S=200,768 on the
+fused view (last 4,096 rows, scored through the kernel's own permutation):
+
+| build | tail cosine | tail zeros | tail NaN |
+|---|---|---|---|
+| new (int64) | 0.9996 | 0.1% | 0.0% |
+| old (uint32) | 0.8637 | 25.5% | 0.0% |
+
+**Reading.** Cost: none. The ratios sit inside a percent of one in both
+directions, which is the noise floor of a median-of-7 on kernels this
+short, and the static check above already said why: no instantiation lost
+a resident block. Identity: every output pair is bit-equal at every row
+count, so nothing a consumer's dated record could see has changed on any
+shape a 24 GB card renders. Fix: the old build wrote zeros over a quarter
+of the tail past the ceiling -- exactly the rows whose offsets crossed
+2**32 -- and the new one does not. The revert clause above does not fire.
+`tests/test_quant_offset_overflow.py` ran live in the same session, 14 of
+14 including the three above-boundary cases.
 
 **Static half, done without the GPU (2026-09-13, `cuobjdump
 --dump-resource-usage`, sm_89 cubin, old build from
@@ -1199,9 +1324,8 @@ already bound by the SM's thread limit before its register budget: the
 1024-thread `QuantInt8Kernel` and `TransposePadPermuteKernel` blocks fit one
 per SM on either register count, the 512-thread per-warp instantiation
 three, and the 256-thread `MeanScaleKernel` six. The dynamic half -- wall
-time and bit-identity on the same tensors -- is what the table above still
-owes; the static result says the expected shape of that table is a ratio
-of one.
+time and bit-identity on the same tensors -- is the table above, and it
+came back as the static result predicted: a ratio of one.
 
 Also in this version: `tests/spikes/spike_h3_qk_quant_gran.py` and per-warp
 arms in `tests/spikes/spike_h3_real_activations.py`, for the open question

@@ -385,6 +385,9 @@ def sageattn(
         _log_routing_choice_once(arch, False, kwargs["pv_accum_dtype"], KERNEL_FP16_CUDA)
         return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, **kwargs)
     elif arch == "sm89":
+        # qk_quant_gran is deliberately left at the wrapper's per_thread
+        # default here; per_warp measured slower and less accurate on sm89
+        # (2026-09-13, CHANGELOG decision log "sm89 q/k quantization").
         if get_cuda_version() < (12, 8):
             kwargs.setdefault("pv_accum_dtype", "fp32+fp32")
             _log_routing_choice_once(arch, False, kwargs["pv_accum_dtype"], KERNEL_FP8_CUDA_FP32)
@@ -396,8 +399,12 @@ def sageattn(
     elif arch in {"sm100", "sm120", "sm121"}:
         # Looks superficially mergeable with the sm89 branch but isn't:
         # this branch sets qk_quant_gran=per_warp; sm89 leaves it at the
-        # kernel's per_thread default. Don't merge without re-grading
-        # rtol on whichever branch you change.
+        # kernel's per_thread default. On sm89 that is a measured choice
+        # (2026-09-13, CHANGELOG decision log "sm89 q/k quantization"):
+        # per_warp ran the whole call slower at every H3 length and graded
+        # worse on captured activations. This branch's per_warp is still
+        # upstream's untested default for these archs. Don't merge without
+        # re-grading rtol on whichever branch you change.
         if get_cuda_version() < (12, 8):
             # sm120 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm120.
             kwargs.setdefault("pv_accum_dtype", "fp32")
@@ -1433,6 +1440,9 @@ def sageattn_consume(
     else:
         kwargs.setdefault("pv_accum_dtype", "fp32+fp16")
     if arch != "sm89":
+        # sm89 keeps per_thread on measurement (CHANGELOG decision log,
+        # "sm89 q/k quantization", 2026-09-13); the other archs inherit
+        # upstream's per_warp default, ungraded here.
         kwargs.setdefault("qk_quant_gran", "per_warp")
     _log_routing_choice_once(
         arch, attn_mask is not None, kwargs["pv_accum_dtype"],
