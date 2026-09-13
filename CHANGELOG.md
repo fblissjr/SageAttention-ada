@@ -1187,6 +1187,22 @@ that table shows a real price for the int64 arithmetic, the follow-up is a
 revert of the kernel change and this paragraph says so. Until then, treat
 the widening as untimed.
 
+**Static half, done without the GPU (2026-09-13, `cuobjdump
+--dump-resource-usage`, sm_89 cubin, old build from
+`internal/artifacts/fused_pre_v0.7.17/` against the build of `3073dfb`, all
+44 kernel instantiations matched).** The one mechanism by which wider
+address arithmetic costs a memory-bound kernel anything is register pressure
+lowering occupancy. Registers rose by a few per thread across the board,
+most in `MeanScaleKernel`; stack and local memory stayed at zero, so nothing
+spilled. Occupancy is unchanged in every instantiation, because each is
+already bound by the SM's thread limit before its register budget: the
+1024-thread `QuantInt8Kernel` and `TransposePadPermuteKernel` blocks fit one
+per SM on either register count, the 512-thread per-warp instantiation
+three, and the 256-thread `MeanScaleKernel` six. The dynamic half -- wall
+time and bit-identity on the same tensors -- is what the table above still
+owes; the static result says the expected shape of that table is a ratio
+of one.
+
 Also in this version: `tests/spikes/spike_h3_qk_quant_gran.py` and per-warp
 arms in `tests/spikes/spike_h3_real_activations.py`, for the open question
 the consumer raised alongside -- whether sm89 should keep the Triton
