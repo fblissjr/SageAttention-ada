@@ -104,6 +104,12 @@ ${VIRTUAL_ENV}/bin/python tests/test_sageattn_h3_shapes.py --check-regression
 - JSON: **orjson**, never stdlib `json`.
 - **No emojis** in any file or output.
 - Comments: only non-obvious WHY.
+- **`main` is what the ComfyUI server runs.** The venv's editable install
+  serves whatever this tree holds at the next server start, so only
+  measured, changelog-recorded changes land on `main`; unmeasured work
+  goes on a branch, and the tree is back on `main` before a session ends.
+  Tag each build the server has run (`served/<date>`, provenance in the
+  tag message) so a render record names a commit. Why: `docs/conventions.md`.
 - **Never push without being asked.** `gh pr create` defaults `--base` to
   the upstream parent -- pin `--repo`/`--base`/`--head` or it opens a
   public PR against thu-ml.

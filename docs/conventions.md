@@ -1,6 +1,6 @@
 # Conventions: the long-form versions
 
-Last updated: 2026-09-08
+Last updated: 2026-09-13
 
 `CLAUDE.md` carries every rule in this repo as a one-liner. This file
 carries the reasoning and the worked example behind the ones where the
@@ -8,6 +8,40 @@ reasoning is the persuasive part. Extracted verbatim on 2026-09-08.
 
 If a rule here and a rule in `CLAUDE.md` ever disagree, `CLAUDE.md` is
 the one that was loaded and the one to follow -- then fix this file.
+
+## `main` is what the server runs (2026-09-13)
+
+The consumer's ComfyUI venv holds an editable install of this checkout.
+That means the server does not run a version of sage; it runs the working
+tree, whatever it holds, at the moment the process starts. A half-finished
+experiment left checked out overnight is what tomorrow's renders use, and
+nothing warns.
+
+Three rules follow, agreed with the owner on 2026-09-13:
+
+1. **Only measured, changelog-recorded changes land on `main`.** The
+   measurement is the thing that makes a change servable; the changelog
+   entry is where a later reader finds the conditions. A kernel change
+   with a pending table is not on `main` -- the one exception so far,
+   v0.7.17, was committed with its table pending and the entry saying so,
+   and only because the static check and bit-identity below the ceiling
+   were already in hand. Do not generalize from it.
+2. **Experiments go on a branch, and the tree is back on `main` before a
+   session ends.** Spikes that measure without changing shipped code can
+   land on `main` as harnesses; anything that changes what `sageattn()`
+   does or what the kernels compute stays on a branch until its record
+   exists. The last act of a session that branched is `git switch main`,
+   because the next server restart does not ask.
+3. **Tag each build the server has run.** `served/<date>` on the commit
+   whose tree the server started on, with the provenance in the tag
+   message: which commit the kernels were compiled from and when, into
+   which venv, the extension's `ELEMENT_OFFSET_BITS`, and the measurement
+   that graded it. A consumer's render record then names a commit rather
+   than "HEAD at the time", which is the gap `build_info()` was added to
+   close from the other side. Tags are local until someone is asked to
+   push.
+
+The first tag is `served/2026-09-13`. Its message is the template.
 
 ## Retracting a wrong framing
 
