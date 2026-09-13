@@ -121,6 +121,51 @@ Recorded: 2026-08-05, while validating the Triton fix at 362 frames.
 Real open TODOs. Each has an explicit trigger-to-act; we don't do these
 speculatively.
 
+### Fuse q/k quantization into the consumer's RMSNorm+RoPE epilogue (added 2026-09-13; expected to close as no-action)
+
+**Trigger to act:** `tests/spikes/spike_h3_qk_quant_gran.py` reporting the
+q/k quantization step as a share of the `sageattn_consume` call, at the
+345-frame ceiling on the fused view, large enough that removing it entirely
+would move a render. Recorded expectation, so the number can contradict it:
+small, because the pass is O(S) against an O(S^2) kernel and shrinks with
+every frame added. If the spike agrees, this closes into the Decision log
+with the measured share and is not reopened by argument, only by a new
+measurement on a shorter workload.
+
+**What it is.** Every attention call today reads q, k and v three times in
+bf16: the projection writes them, the consumer's fused RMSNorm+RoPE kernel
+reads and rewrites q and k, and sage's quantizers read all three again to
+write int8 q/k and fp8 v. The last read is a pure extra pass. The lever is
+the epilogue of the last kernel that already touches q and k -- the
+consumer's, not ours -- emitting int8 with sage's rounding and scales, and
+a sage entry point that accepts pre-quantized inputs and skips its own
+pass. Per-warp granularity makes the epilogue a block absmax reduction;
+per-thread makes it a layout puzzle, which is one reason the granularity
+A/B runs first and would subsume this if the fused epilogue picks its own.
+
+**What it is not.** Not cross-step reuse: the latent moves every sampler
+step, so every hidden state, including text and reference tokens in H3's
+packed sequence, is new each step, and nothing quantized at one step is
+valid at the next. The only step-stable quantity is the scale, and it is
+computed in the same pass that writes the values, so reusing it saves
+nothing. Sampler-level block skipping is a separate approximation with an
+accuracy cost, and on this stack that role is already taken by the
+approximate-attention override.
+
+**Scope if triggered.** Sage side small, oracle exact (feed sage's own
+quantizer outputs, require bit-identical attention). Consumer q/k side
+moderate, oracle exact (match `per_warp_int8` bit for bit). **v side out
+of scope**: v does not go through RoPE, its only fusable kernel is the
+projection GEMM's epilogue, and per-channel fp8 needs the absmax over the
+whole sequence before any value is written -- sage's own path reads v twice
+for that reason -- so a single-pass fusion means a stale scale from the
+previous step, an accuracy trade graded on captures, not a free win. Ship
+gate: in-pipeline A/B before the commit, since dispatch overhead and cache
+behaviour in the real block are what a synthetic bench cannot see. Longer
+form in `docs/roadmap.md` 1.4.
+
+---
+
 ### Drop `per_channel_fp8`'s full-size bf16 transpose buffer -- SUPERSEDED 2026-08-06, but the premise needs re-checking (2026-09-08)
 
 **Read this note before the entry below.** The supersession rests on a

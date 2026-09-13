@@ -1,6 +1,6 @@
 # Roadmap
 
-Last updated: 2026-09-08
+Last updated: 2026-09-13
 
 > **Model scope: written pre-H3.** "Relevance to the current workload"
 > below meant **LTX 2.3** at the time of writing; MiniMax H3 entered this
@@ -197,6 +197,69 @@ stream-safety fix; figures in that entry). If concurrent-dispatch ships first an
 launching attention + FFN streams concurrently, persistent-CTA's
 priority drops back to "validates the technique" rather than
 "closes the gap."
+
+### 1.4 Quantization as an epilogue, not a pass (H3; added 2026-09-13, gated on one number)
+
+**Model: MiniMax H3.** Written after the v0.7.17 session, when the owner
+asked what would happen if q/k/v were not quantized on every step. The
+answer splits into a thing that cannot be done, a thing that can, and a
+bound that probably makes the second not worth doing.
+
+**Cannot be done: skipping steps.** The sampler moves the latent every
+step, so the hidden states entering every DiT block are new, so q, k and
+v are new tensors on every call. In H3's packed `[text | refs | audio |
+video]` sequence that includes the text and reference tokens, which go
+through the same blocks and move with everything else. Nothing quantized
+at one step is valid at the next. The one approximately step-stable
+quantity is the block scale, and it is produced by the same kernel pass
+that writes the values, so reusing it removes no work. Cross-step reuse
+proper -- skip a block when its input barely moved -- is a sampler-level
+approximation with an accuracy cost, graded on captures, and the
+approximate-attention override already occupies that role on this stack;
+it is not a sage decision.
+
+**Can be done: removing the pass.** Per attention call, q, k and v are
+written in bf16 by the projection, q and k are read and rewritten by the
+consumer's fused RMSNorm+RoPE kernel, and all three are read once more by
+sage's quantizers. That last read is a full streaming pass whose only
+purpose is a format change. Fold it into the epilogue of the last kernel
+that already holds q and k -- the consumer library's, since it replaced
+this fork's own fused-RoPE in v0.7.14 -- and sage accepts int8 q/k with
+scales directly.
+
+**The bound that gates it.** Attention is O(S^2); the pass is O(S). At the
+124-frame default the kernel already runs for far longer than a streaming
+pass over its inputs, and the ratio widens with every frame. So the pass's
+share of an attention call is small where it matters least and smaller
+where it matters most, and no fusion can recover more than that share. The
+number is measured, not argued: `tests/spikes/spike_h3_qk_quant_gran.py`
+times the quantization step in isolation against the whole
+`sageattn_consume` call at four row counts. Recorded expectation: it comes
+back at a level where this section closes into the Decision log. The rule
+being applied is the one this repo learned on fused-RoPE -- get the
+wall-time share before kernel-day, not after.
+
+**If the number disagrees, the shape of the work:**
+
+| side | effort | oracle |
+|---|---|---|
+| sage: entry point taking pre-quantized q/k (+ v) | small; the fp8 wrapper already hands exactly these to the kernel | exact -- feed sage's own quantizer outputs, require bit-identical attention output |
+| consumer: int8 q/k from the RMSNorm+RoPE epilogue | moderate; block absmax over the rows sage groups, then sage's rounding. Per-warp granularity is a plain block reduce; per-thread is a layout problem | exact -- match `sageattention.quant.per_warp_int8` bit for bit |
+| v | **out of scope** | v skips RoPE, so its only fusable kernel is the projection GEMM epilogue, and per-channel fp8 needs the whole-sequence absmax before any value is written (sage's own path reads v twice for this). Single-pass means a stale previous-step scale: an accuracy trade, graded on captures |
+
+Granularity comes first: the per-thread-vs-per-warp A/B (same spike,
+accuracy on captures via `spike_h3_real_activations.py`) decides what the
+epilogue would have to emit, and a fused epilogue would pick its own
+granularity anyway, so the A/B either settles this or is subsumed by it.
+
+**Ship gate:** in-pipeline A/B before the ship commit. The risks here --
+dispatch overhead, L2 behaviour of a wider epilogue inside the real block,
+the consumer's launch pattern -- are the ones a synthetic bench cannot
+see, and this repo has shipped-then-walked-back on exactly that before
+(v0.6 `sage_ffn`).
+
+Backlog entry with the trigger: `CHANGELOG.md`, "Fuse q/k quantization
+into the consumer's RMSNorm+RoPE epilogue".
 
 ## Tier 2: Medium-relevance, conditional
 
