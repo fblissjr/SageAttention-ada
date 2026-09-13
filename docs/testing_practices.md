@@ -1,6 +1,6 @@
 # Testing practices
 
-Last updated: 2026-09-08
+Last updated: 2026-09-13
 
 Conventions and traps for writing measurements in this repo. Extracted
 verbatim from `CLAUDE.md` on 2026-09-08. `CLAUDE.md` keeps the one-line
@@ -128,3 +128,35 @@ underreported the K-quant+V-cast redundancy delta by a wide margin and
 nearly shipped wrong numbers to a downstream consumer. Symptom:
 cumulative-with-mask and cumulative-no-mask measurements that look
 identical at a shape where they shouldn't.
+
+## A guard with a failure state: key it on the build, not on a constant (2026-09-13)
+
+Worked example from v0.7.17. The fused CUDA quant kernels wrapped their
+global offsets at 2**32 elements; the fix widened the strides to int64. A
+host-side guard was asked for alongside, "refuse rather than wrap
+silently". Written the obvious way -- compare the tensor's largest offset
+against `2**32` -- the guard is wrong on the new build (it refuses shapes
+the kernels now handle) and redundant on the old one only if someone
+remembers to install it there. Written against `2**64` it can never fire,
+which is the catalogue's defect: an instrument with no state that turns it
+red.
+
+The version that ships keys on a fact the build itself asserts.
+`csrc/fused/pybind.cpp` stamps `ELEMENT_OFFSET_BITS = 64` on the
+extension; `sageattention/quant.py` reads it with a default of 32 for any
+build that lacks the attribute, and every wrapper bounds its launch against
+`2**bits`. Now the guard has a real red state: a `.so` from before the
+change, which this checkout actually contains (the interpreter-scoped
+`clean` in `build.sh` leaves the other interpreter's tag in place). The
+test creates that state by patching the width to 32 on a meta tensor and
+checks that the refusal arrives before the extension's own device check
+would have, so it also pins *where* the guard sits. The heavy case then
+drives the real kernel past the boundary, because a correct bound over a
+still-wrong kernel is the other half of the catalogue.
+
+Two readings of one number had to be kept apart to write the boundary
+case: the exact crossing (the last row the kernel dereferences) and the
+padded one (the grid it forms pointers for, up to one block wider). The
+guard uses the padded bound and so fires up to 63 rows early; the record
+carries the exact row. A test asserting the two are equal fails
+correctly, and did.

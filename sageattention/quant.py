@@ -18,6 +18,60 @@ import torch
 from typing import Any, List, Literal, Optional, Tuple, Union
 
 from . import _fused
+from .triton._int_offsets import max_element_offset
+
+# Width of the global element offsets the installed fused CUDA build can form.
+# Upstream's kernels (csrc/fused/fused.cu) carried uint32_t strides and summed
+# them in uint32_t, so a tensor past 2**32 elements read from the wrong
+# address with no error; on a fused-QKV view at MiniMax H3's config that is
+# ~199,729 rows. This fork widened the strides to int64 and stamps the width on
+# the module, so a build that predates the change -- another interpreter's
+# stale .so in this checkout, or a checkout from before the fix -- reports 32
+# here and is refused at the host instead of trusted.
+ELEMENT_OFFSET_BITS: int = getattr(_fused, "ELEMENT_OFFSET_BITS", 32)
+
+
+def _check_element_offsets(named, tensor_layout, blk, offset_bits=None):
+    """Refuse a launch whose largest element offset the kernels cannot form.
+
+    `named` is an iterable of (name, tensor) in `tensor_layout`. The kernels
+    build pointers for the whole padded grid before masking the load, so the
+    row index runs to `ceil(seq/blk)*blk - 1`; `blk` is the launch's block
+    size. `offset_bits` overrides the installed build's width, for tests.
+    """
+    bits = ELEMENT_OFFSET_BITS if offset_bits is None else offset_bits
+    ceiling = 1 << bits
+    seq_axis = 1 if tensor_layout == "NHD" else 2
+    for name, t in named:
+        off = max_element_offset(t, tensor_layout, blk)
+        if off < ceiling:
+            continue
+        rows = t.shape[seq_axis]
+        stride_seq = t.stride(seq_axis)
+        padded_rows = (rows + blk - 1) // blk * blk
+        fixed = off - (padded_rows - 1) * stride_seq
+        rows_ceiling = (ceiling - 1 - fixed) // stride_seq + 1
+        raise ValueError(
+            f"{name}: {rows:,} rows at stride_seq={stride_seq:,} form element "
+            f"offsets up to {off:,}, past the {bits}-bit ceiling "
+            f"({ceiling:,}) of the installed fused CUDA quant kernels -- about "
+            f"{rows_ceiling:,} rows at this stride. Rebuild sage with "
+            f"./build.sh for the 64-bit build, or shorten the sequence; the "
+            f"kernels would otherwise read from the wrong address silently."
+        )
+
+
+def _check_contiguous_numel(name, t, offset_bits=None):
+    """Same refusal for a contiguous intermediate the kernels index to numel."""
+    bits = ELEMENT_OFFSET_BITS if offset_bits is None else offset_bits
+    ceiling = 1 << bits
+    if t.numel() >= ceiling:
+        raise ValueError(
+            f"{name}: {t.numel():,} elements, past the {bits}-bit ceiling "
+            f"({ceiling:,}) of the installed fused CUDA quant kernels. Rebuild "
+            f"sage with ./build.sh for the 64-bit build, or shorten the sequence."
+        )
+
 
 def per_block_int8(
     q: torch.Tensor, 
@@ -93,6 +147,8 @@ def per_block_int8(
     
     sm_scale *= 1.44269504
 
+    _check_element_offsets([("q", q), ("q_int8", q_int8)], tensor_layout, BLKQ)
+    _check_element_offsets([("k", k), ("k_int8", k_int8)], tensor_layout, BLKK)
     _fused.quant_per_block_int8_cuda(q, q_int8, q_scale, sm_scale, BLKQ, _tensor_layout)
     if km is not None:
         km = km.squeeze(1) if _tensor_layout == 0 else km.squeeze(2)
@@ -169,6 +225,8 @@ def per_warp_int8(
     q_scale = torch.empty((b, h_qo, ((qo_len + BLKQ - 1) // BLKQ) * (BLKQ // WARPQ)), device=q.device, dtype=torch.float32)
     k_scale = torch.empty((b, h_kv, (kv_len + BLKK - 1) // BLKK), device=q.device, dtype=torch.float32)
 
+    _check_element_offsets([("q", q), ("q_int8", q_int8)], tensor_layout, BLKQ)
+    _check_element_offsets([("k", k), ("k_int8", k_int8)], tensor_layout, BLKK)
     _fused.quant_per_warp_int8_cuda(q, q_int8, q_scale, BLKQ, WARPQ, _tensor_layout)
 
     if km is not None:
@@ -217,6 +275,9 @@ def sub_mean(
     v_smoothed = torch.empty(v.shape, dtype=torch.float16, device=v.device)
     
     # subtract mean and store the result as fp16
+    # SubMeanKernel pads to 64 rows at head_dim 128 and 128 otherwise; 128
+    # is the conservative bound for both.
+    _check_element_offsets([("v", v), ("v_smoothed", v_smoothed)], tensor_layout, 128)
     _fused.sub_mean_cuda(v, vm, v_smoothed, _tensor_layout)
 
     return v_smoothed, vm
@@ -278,6 +339,10 @@ def per_channel_fp8(
         padded_len = (kv_len + 63) // 64 * 64
         v_transposed_permutted = torch.empty((b, head_dim, h_kv, padded_len), dtype=v.dtype, device=v.device)
     
+    # TransposePadPermuteKernel's CTA covers 64 rows; the transposed buffer
+    # is contiguous and indexed to its numel by the scale kernels after it.
+    _check_element_offsets([("v", v)], tensor_layout, 64)
+    _check_contiguous_numel("v_transposed_permutted", v_transposed_permutted)
     _fused.transpose_pad_permute_cuda(v, v_transposed_permutted, _tensor_layout)
 
     v_fp8 = torch.empty(v_transposed_permutted.shape, dtype=torch.float8_e4m3fn, device=v.device)

@@ -1,6 +1,6 @@
 # The consumer surface
 
-Last updated: 2026-09-08
+Last updated: 2026-09-13
 
 What this fork exposes to downstream callers, in full. Extracted
 verbatim from `CLAUDE.md` on 2026-09-08.
@@ -78,6 +78,22 @@ Sage exposes three surfaces to downstream consumers:
    mean-subtraction done in place -- either alone leaves the other
    setting the floor. Only the sm89 fp8 path releases early; other
    kernels fall back to the ordinary path, correct but with no saving.
+5. **`sageattention.quant.ELEMENT_OFFSET_BITS`** (v0.7.17, 2026-09-13)
+   -- the width of the global element offsets the installed fused CUDA
+   quant build can form: 64 on any build from v0.7.17 on, 32 on anything
+   earlier (the attribute is read off `_fused.ELEMENT_OFFSET_BITS` and
+   defaults to 32 when the extension lacks it). This is the fact a
+   consumer's sequence-length preflight should key on instead of
+   hardcoding the old ceiling: the tracked consumer's preflight computes
+   `2**32 // stride_seq` and reports the CUDA v quantizer's crossing as
+   "NOT fixed", which is true of a 32-bit build and false of a 64-bit
+   one, and only this attribute tells the two apart. Below the width the
+   wrappers refuse with a `ValueError` naming the row count, the stride
+   and the ceiling, before any kernel launches; a consumer that wants to
+   pre-empt that can call `sageattention.triton._int_offsets.max_element_offset`
+   on its own tensors against `2**ELEMENT_OFFSET_BITS`. Adding the
+   attribute is compatible; its name and integer type are now part of
+   this surface.
 5. **`sageattn_consume_prefers_cloned_v(device)`** (v0.7.4) -- the
    caller-side way out of that fused case, and the answer to "should I
    clone?". A caller that clones v before handing the list over gives

@@ -36,6 +36,11 @@ from test_sageattn_ltx_shapes import accuracy_metrics
 ARMS = [
     ("fp8++  smooth_k=False", "sageattn_qk_int8_pv_fp8_cuda",
      dict(pv_accum_dtype="fp32+fp16", smooth_k=False)),
+    # Same call with q/k through the CUDA per-warp kernels instead of the
+    # Triton per-thread default sm89 inherits; the speed side of that
+    # question is tests/spikes/spike_h3_qk_quant_gran.py.
+    ("fp8++  smooth_k=False per_warp", "sageattn_qk_int8_pv_fp8_cuda",
+     dict(pv_accum_dtype="fp32+fp16", smooth_k=False, qk_quant_gran="per_warp")),
     ("fp8++  smooth_k=True", "sageattn_qk_int8_pv_fp8_cuda",
      dict(pv_accum_dtype="fp32+fp16", smooth_k=True)),
     ("fp16   smooth_k=False", "sageattn_qk_int8_pv_fp16_cuda",
@@ -104,6 +109,11 @@ def run(path):
         verdict = "helps" if delta < -3 else ("hurts" if delta > 3 else "no effect")
         print(f"  smooth_k on {base.split()[0]:6s}: "
               f"{off_v:.4f} -> {on_v:.4f}  ({delta:+.1f}%, {verdict})")
+    pt, pw = results["fp8++  smooth_k=False"], results["fp8++  smooth_k=False per_warp"]
+    delta = 100.0 * (pw - pt) / pt
+    verdict = "worse" if delta > 3 else ("better" if delta < -3 else "no effect")
+    print(f"  per_warp CUDA q/k vs per_thread Triton (fp8++): "
+          f"{pt:.4f} -> {pw:.4f}  ({delta:+.1f}%, {verdict})")
 
     del q, k, v
     torch.cuda.empty_cache()

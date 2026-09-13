@@ -68,7 +68,17 @@ Discovered: 2026-04-23 via `tests/test_sageattn_ltx_shapes.py` (the
 seq_kv sweep exposed the rtol-vs-seq_kv scaling signature). Closed
 on sm89 fp8++: 2026-05-13 (v0.5.5).
 
-### The CUDA quant kernels form global offsets in uint32 (ceiling ~199,729 rows)
+### The CUDA quant kernels form global offsets in uint32 (ceiling ~199,729 rows) -- FIXED v0.7.17
+
+**Fixed 2026-09-13 in v0.7.17**: the strides are `int64_t` throughout
+`csrc/fused/fused.cu`, and `sageattention/quant.py` refuses at the host, with
+the row count and the ceiling in the message, when the installed build's
+offset width is narrower than the tensor needs. The entry below is kept as
+the record of the defect; its trigger did not fire (no card here exceeds 24
+GB), the fix was taken because the cost turned out to be nil -- see the
+version entry. The exact reading of the ceiling: 199,729 rows is the largest
+S at which every read stays inside uint32; the 199,730th row is the first
+that wraps (`tests/test_quant_offset_overflow.py` pins both).
 
 Same lineage as the v0.7.0 int32 overflow: an upstream defect, in code we
 ship unmodified (`csrc/fused/` is on the upstream-unmodified list in
@@ -1076,6 +1086,70 @@ sufficient.
 > and never confirms an H3 claim. `sage_ffn` and the whole FFN line are
 > LTX-motivated throughout.
 
+
+### v0.7.17 -- 2026-09-13  (int64 strides in the fused CUDA quant kernels, and a guard that can fail)
+
+The latent ceiling recorded under Known kernel bugs on 2026-08-05 is closed.
+Every kernel in `csrc/fused/fused.cu` -- `QuantInt8Kernel` behind the
+per-block, per-warp and fuse-sub-mean entry points, `SubMeanKernel`,
+`TransposePadPermuteKernel`, `MeanScaleKernel` behind both scale-fuse-quant
+entry points -- took its strides as `uint32_t` and summed them in
+`uint32_t`, and the host wrappers narrowed torch's `int64_t` strides to
+`int` before passing them. Both are `int64_t` now. `csrc/fused/` leaves the
+upstream-unmodified list in `docs/whats_ours_vs_upstream.md` for exactly
+this diff.
+
+Taken off-trigger, deliberately. The recorded trigger was a card with more
+than 24 GB or a model with a wider `stride_seq`, and neither exists here.
+What changed the calculus is the cost side: the entry asked for the price of
+64-bit address arithmetic to be measured before the fix was taken, and it was
+(below), and there is none to weigh. A fix with no cost and a silent failure
+mode on the other side does not need its trigger.
+
+**The guard, and why it is keyed the way it is.** `pybind.cpp` stamps
+`ELEMENT_OFFSET_BITS = 64` on the extension, and `sageattention/quant.py`
+reads it at import, defaulting to 32 when the attribute is absent. Every
+wrapper that launches a fused kernel (`per_block_int8`, `per_warp_int8`,
+`sub_mean`, `per_channel_fp8`) bounds the largest element offset the launch
+will form -- the same `max_element_offset` the Triton side uses, on the padded
+grid -- against `2**ELEMENT_OFFSET_BITS`, and raises with the row count, the
+stride, the ceiling and the approximate row ceiling at that stride before
+anything is launched. On the build this commit produces the check can never
+fire, which is the point of keying it on the build rather than on a constant:
+its failure state is a stale `.so` -- another interpreter's tag left in this
+checkout by an interpreter-scoped `clean`, or a checkout from before this
+commit -- and that state is real here (the cpython-313 tag in this checkout
+is the old build until its venv rebuilds). A guard against a fixed constant
+would have had no state that turns it red, which is the defect
+`docs/testing_practices.md` catalogues.
+
+Pinned by `tests/test_quant_offset_overflow.py`: the guard fires past the
+fused-view boundary and not one block below it, names the row count and the
+ceiling, runs before the launch (a meta tensor reaches our `ValueError`, not
+the extension's device check), the installed build reports 64, and the
+recorded 199,729 agrees with both the exact and the padded reading. The
+heavy case drives `per_channel_fp8` past 2**32 elements on a real fused view
+and scores the dequantized tail through the kernel's own permutation; it
+needs ~14 GiB free and skips otherwise.
+
+**Before/after record.** `tests/spikes/spike_fused_quant_offsets.py`, loading
+the pre-change `.so` beside the new one so both builds run in one process on
+the same tensors. MEASUREMENT PENDING as of this commit -- the GPU was held
+by a live render for the whole session that produced it, so the code, the
+guard, its tests and this entry are committed first and the table lands in
+a follow-up commit, dated, with the `build_info()` stamp of the run. If
+that table shows a real price for the int64 arithmetic, the follow-up is a
+revert of the kernel change and this paragraph says so. Until then, treat
+the widening as untimed.
+
+Also in this version: `tests/spikes/spike_h3_qk_quant_gran.py` and per-warp
+arms in `tests/spikes/spike_h3_real_activations.py`, for the open question
+the consumer raised alongside -- whether sm89 should keep the Triton
+per-thread q/k quantization it inherits or move to the CUDA per-warp path
+the dispatcher already selects on sm100. Speed through `sageattn_consume` as
+production calls it, with the quantization step isolated so a whole-call
+delta has its mechanism shown; accuracy on captured activations. Results
+are recorded when they exist, not here.
 
 ### v0.7.16 -- 2026-09-08  (H3 workload profile: attention is 56% and 76%)
 

@@ -1,6 +1,6 @@
 # What's ours vs what's upstream
 
-Last updated: 2026-09-08
+Last updated: 2026-09-13
 
 L3 reference for CLAUDE.md. Load this when editing a file and you
 need to know whether the file is unmodified upstream code (lighter
@@ -10,8 +10,13 @@ additions (we own the contract).
 ## Upstream-from-woct0rdho code (unmodified unless noted)
 
 - `csrc/qattn/{pybind_sm80.cpp, pybind_sm89.cpp, qk_int_sv_f16_cuda_sm80.cu,
-  sm89_qk_int8_sv_f8_*.cu}`, `csrc/fused/`, `pyproject.toml`,
+  sm89_qk_int8_sv_f8_*.cu}`, `pyproject.toml`,
   `tests/test_sageattn.py`, `tests/test_flashattn{2,3}.py`.
+- `csrc/fused/` was on this list until v0.7.17 (2026-09-13). It now
+  differs from upstream in one way: every stride is `int64_t` (kernel
+  parameters and the host locals that read them off the tensors) and
+  `pybind.cpp` stamps `ELEMENT_OFFSET_BITS` on the module. Nothing else
+  moved; a diff against upstream should show only those lines.
 - `sageattention/` mostly unmodified except
   `sageattention/triton/attn_qk_int8_per_block.py` (we added autotune)
   and `sageattention/triton/fused_mlp_fp8.py` (v0.6.0, our addition --

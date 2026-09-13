@@ -1,12 +1,47 @@
 # MiniMax H3 kernel measurements
 
-Last updated: 2026-09-08
+Last updated: 2026-09-13
 
 Every H3 number this repo has, with the conditions that produced it.
 Extracted verbatim from `CLAUDE.md` on 2026-09-08, where it had grown to
 roughly a hundred lines of always-loaded context whose own caption said
 not to quote most of it. Measurements belong in a dated record with
 their conditions attached, not in the routing index.
+
+## Open on 2026-09-13: two measurements drafted, harnesses committed, GPU held by a render
+
+Recorded before the numbers exist so the question and its instrument are
+on file even if the result is a revert. Both run on the RTX 4090 (sm89),
+torch 2.14, the build identified by `build_info()` at the time of the run;
+the tables land in `CHANGELOG.md` under v0.7.17 with that stamp.
+
+1. **Cost and identity of the int64 strides in `csrc/fused/fused.cu`.**
+   `tests/spikes/spike_fused_quant_offsets.py`, loading the pre-change
+   `_fused` `.so` beside the new one so both builds run in one process on
+   the same tensors. Per-kernel wall time for the per-warp q, per-block k
+   and per-channel v launches at 41,822 / 104,030 / 109,126 / 149,000 rows
+   on the fused-QKV view (stride_seq 21504, NHD), plus `torch.equal` on
+   every output pair; then `per_channel_fp8`'s dequantized tail on both
+   builds at a row count past the uint32 ceiling. What turns it red: any
+   `bit-equal: NO` row, or a new/old ratio the noise floor cannot explain.
+   What the entry commits to: if the ratio shows a real price, the record
+   says so and the widening is reverted, not kept.
+2. **per-thread Triton q/k versus per-warp CUDA q/k on sm89**, the
+   dispatcher default sm89 inherits against the one it sets on sm100.
+   Speed: `tests/spikes/spike_h3_qk_quant_gran.py`, whole call through
+   `sageattn_consume` as the consumer calls it (`smooth_k=False`,
+   `fp32+fp16`, fused view, unmasked) at the same four row counts, with
+   the quantization step timed in isolation because it is the only code
+   that differs, so the whole-call delta must be explained by it or it is
+   noise. Accuracy: `tests/spikes/spike_h3_real_activations.py`, which
+   now carries a per-warp arm, on the consumer's 2026-09-03 base16 t2v
+   capture set (S=104,361, 25 cells, retained to 2026-09-20). The
+   synthetic rtol column of the speed spike ranks the two arms and is not
+   an accuracy figure for either, per the rule above. What flips the
+   default: per-warp faster by more than the quantization step's own
+   share can be noise, and real-activation rtol inside what per-thread
+   scores on the same cells. Either way the dispatcher comment at
+   `sageattention/core.py` is made true afterwards.
 
 **Read the header on each block before quoting anything from it.** The
 short version: the synthetic tables are valid for speed and VRAM and are

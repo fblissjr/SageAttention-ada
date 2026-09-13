@@ -30,4 +30,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
   m.def("transpose_pad_permute_cuda", py::overload_cast<torch::Tensor, torch::Tensor, int>(&transpose_pad_permute_cuda), "transpose_pad_permute_cuda");
   m.def("scale_fuse_quant_cuda", py::overload_cast<torch::Tensor, torch::Tensor, torch::Tensor, int, float, int>(&scale_fuse_quant_cuda), "scale_fuse_quant_cuda");
   m.def("mean_scale_fuse_quant_cuda", py::overload_cast<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int, float, int>(&mean_scale_fuse_quant_cuda), "mean_scale_fuse_quant_cuda");
+
+  // Width of the global element offsets the kernels in fused.cu form. A build
+  // without this attribute predates the int64 strides and wraps at 2**32.
+  m.attr("ELEMENT_OFFSET_BITS") = 64;
 }

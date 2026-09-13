@@ -61,12 +61,19 @@ __device__ __forceinline__ T convert_from_float(float val)
   }
 }
 
+// Strides are int64_t in every kernel below, and in the host wrappers that
+// read them off the tensors. Upstream carries them as uint32_t and forms the
+// global offset as a uint32_t sum, which wraps once a tensor exceeds 2**32
+// elements; on a fused-QKV view at MiniMax H3's config that is ~199,729 rows,
+// and the read lands silently at the wrong address. sageattention/quant.py
+// refuses at the host when the installed build reports a narrower offset
+// width than the tensor needs (ELEMENT_OFFSET_BITS in pybind.cpp).
 template <uint32_t head_dim, uint32_t BLOCK_SIZE, uint32_t num_pack_per_thread = 1, bool has_sm_scale = false, bool sub_mean = false, typename T>
 __global__ void QuantInt8Kernel(T *__restrict__ input, T *__restrict__ mean, int8_t *__restrict__ output, float *__restrict__ scale, float sm_scale, const uint32_t num_tokens, 
-                            const uint32_t stride_bz_input, const uint32_t stride_seq_input, const uint32_t stride_h_input,
-                            const uint32_t stride_bz_mean, const uint32_t stride_h_mean,
-                            const uint32_t stride_bz_output, const uint32_t stride_seq_output, const uint32_t stride_h_output,
-                            const uint32_t stride_bz_scale, const uint32_t stride_h_scale)
+                            const int64_t stride_bz_input, const int64_t stride_seq_input, const int64_t stride_h_input,
+                            const int64_t stride_bz_mean, const int64_t stride_h_mean,
+                            const int64_t stride_bz_output, const int64_t stride_seq_output, const int64_t stride_h_output,
+                            const int64_t stride_bz_scale, const int64_t stride_h_scale)
 {
   static_assert(std::is_same<T, half>::value || std::is_same<T, nv_bfloat16>::value, "Only half and bfloat16 are supported");
   static_assert(num_pack_per_thread > 0, "The number of pack per thread must be greater than 0");
@@ -199,9 +206,9 @@ __global__ void QuantInt8Kernel(T *__restrict__ input, T *__restrict__ mean, int
 
 template <uint32_t head_dim, uint32_t BLOCK_SIZE, uint32_t num_pack_per_thread = 1, typename T>
 __global__ void SubMeanKernel(T *__restrict__ input, T *__restrict__ mean, half *__restrict__ output, const uint32_t num_tokens, 
-                            const uint32_t stride_bz_input, const uint32_t stride_seq_input, const uint32_t stride_h_input,
-                            const uint32_t stride_bz_mean, const uint32_t stride_h_mean,
-                            const uint32_t stride_bz_output, const uint32_t stride_seq_output, const uint32_t stride_h_output)
+                            const int64_t stride_bz_input, const int64_t stride_seq_input, const int64_t stride_h_input,
+                            const int64_t stride_bz_mean, const int64_t stride_h_mean,
+                            const int64_t stride_bz_output, const int64_t stride_seq_output, const int64_t stride_h_output)
 {
   static_assert(std::is_same<T, half>::value || std::is_same<T, nv_bfloat16>::value, "Only half and bfloat16 are supported");
   static_assert(num_pack_per_thread > 0, "The number of pack per thread must be greater than 0");
@@ -261,8 +268,8 @@ __global__ void SubMeanKernel(T *__restrict__ input, T *__restrict__ mean, half 
 
 template <uint32_t head_dim, uint32_t CTA_SIZE, bool pad_zero=false, typename T>
 __global__ void TransposePadPermuteKernel(T *__restrict__ input, T *__restrict__ output, const uint32_t num_tokens,
-                            const uint32_t stride_bz_input, const uint32_t stride_seq_input, const uint32_t stride_h_input,
-                            const uint32_t stride_bz_output, const uint32_t stride_d_output, const uint32_t stride_h_output)
+                            const int64_t stride_bz_input, const int64_t stride_seq_input, const int64_t stride_h_input,
+                            const int64_t stride_bz_output, const int64_t stride_d_output, const int64_t stride_h_output)
 {
 
   static_assert(std::is_same<T, half>::value || std::is_same<T, nv_bfloat16>::value, "Only half and bfloat16 are supported");
@@ -315,10 +322,10 @@ __global__ void TransposePadPermuteKernel(T *__restrict__ input, T *__restrict__
 
 template<uint32_t pad_size, bool sub_mean = false, typename T>
 __global__ void MeanScaleKernel(T *__restrict__ input, int8_t *__restrict__ output, float *__restrict__ mean, float *__restrict__ scale, const float scale_max, const uint32_t num_tokens,
-                            const uint32_t stride_bz_input, const uint32_t stride_d_input, const uint32_t stride_h_input,
-                            const uint32_t stride_bz_output, const uint32_t stride_d_output, const uint32_t stride_h_output,
-                            const uint32_t stride_bz_mean, const uint32_t stride_h_mean,
-                            const uint32_t stride_bz_scale, const uint32_t stride_h_scale)
+                            const int64_t stride_bz_input, const int64_t stride_d_input, const int64_t stride_h_input,
+                            const int64_t stride_bz_output, const int64_t stride_d_output, const int64_t stride_h_output,
+                            const int64_t stride_bz_mean, const int64_t stride_h_mean,
+                            const int64_t stride_bz_scale, const int64_t stride_h_scale)
 {
   static_assert(std::is_same<T, half>::value || std::is_same<T, __nv_bfloat16>::value, "Only half and bfloat16 are supported");
 
@@ -452,11 +459,11 @@ void quant_per_block_int8_cuda(
   const int batch_size = input.size(0);
   const int head_dim = input.size(3);
 
-  int stride_bz_input = input.stride(0);
-  int stride_bz_output = output.stride(0);
+  int64_t stride_bz_input = input.stride(0);
+  int64_t stride_bz_output = output.stride(0);
 
   int num_tokens, num_heads;
-  int stride_seq_input, stride_h_input, stride_seq_output, stride_h_output;
+  int64_t stride_seq_input, stride_h_input, stride_seq_output, stride_h_output;
 
   if (tensor_layout == 0)
   {
@@ -534,11 +541,11 @@ void quant_per_block_int8_cuda(
   const int batch_size = input.size(0);
   const int head_dim = input.size(3);
 
-  int stride_bz_input = input.stride(0);
-  int stride_bz_output = output.stride(0);
+  int64_t stride_bz_input = input.stride(0);
+  int64_t stride_bz_output = output.stride(0);
 
   int num_tokens, num_heads;
-  int stride_seq_input, stride_h_input, stride_seq_output, stride_h_output;
+  int64_t stride_seq_input, stride_h_input, stride_seq_output, stride_h_output;
 
   if (tensor_layout == 0)
   {
@@ -620,11 +627,11 @@ void quant_per_block_int8_fuse_sub_mean_cuda(
   const int batch_size = input.size(0);
   const int head_dim = input.size(3);
 
-  int stride_bz_input = input.stride(0);
-  int stride_bz_output = output.stride(0);
+  int64_t stride_bz_input = input.stride(0);
+  int64_t stride_bz_output = output.stride(0);
 
   int num_tokens, num_heads;
-  int stride_seq_input, stride_h_input, stride_seq_output, stride_h_output;
+  int64_t stride_seq_input, stride_h_input, stride_seq_output, stride_h_output;
 
   if (tensor_layout == 0)
   {
@@ -708,11 +715,11 @@ void quant_per_warp_int8_cuda(
   const int batch_size = input.size(0);
   const int head_dim = input.size(3);
 
-  int stride_bz_input = input.stride(0);
-  int stride_bz_output = output.stride(0);
+  int64_t stride_bz_input = input.stride(0);
+  int64_t stride_bz_output = output.stride(0);
 
   int num_tokens, num_heads;
-  int stride_seq_input, stride_h_input, stride_seq_output, stride_h_output;
+  int64_t stride_seq_input, stride_h_input, stride_seq_output, stride_h_output;
 
   if (tensor_layout == 0)
   {
@@ -790,11 +797,11 @@ void sub_mean_cuda(
   const int batch_size = input.size(0);
   const int head_dim = input.size(3);
 
-  int stride_bz_input = input.stride(0);
-  int stride_bz_output = output.stride(0);
+  int64_t stride_bz_input = input.stride(0);
+  int64_t stride_bz_output = output.stride(0);
 
   int num_tokens, num_heads;
-  int stride_seq_input, stride_h_input, stride_seq_output, stride_h_output;
+  int64_t stride_seq_input, stride_h_input, stride_seq_output, stride_h_output;
 
   if (tensor_layout == 0)
   {
@@ -866,11 +873,11 @@ void transpose_pad_permute_cuda(
   const int batch_size = input.size(0);
   const int head_dim = input.size(3);
 
-  int stride_bz_input = input.stride(0);
-  int stride_bz_output = output.stride(0);
+  int64_t stride_bz_input = input.stride(0);
+  int64_t stride_bz_output = output.stride(0);
 
   int num_tokens, padded_num_tokens, num_heads;
-  int stride_seq_input, stride_h_input, stride_d_output, stride_h_output;
+  int64_t stride_seq_input, stride_h_input, stride_d_output, stride_h_output;
 
   if (tensor_layout == 0)
   {
@@ -948,11 +955,11 @@ void scale_fuse_quant_cuda(
   const int batch_size = input.size(0);
   const int num_tokens_padded = input.size(3);
 
-  int stride_bz_input = input.stride(0);
-  int stride_bz_output = output.stride(0);
+  int64_t stride_bz_input = input.stride(0);
+  int64_t stride_bz_output = output.stride(0);
 
   int num_heads, head_dim;
-  int stride_d_input, stride_h_input, stride_d_output, stride_h_output;
+  int64_t stride_d_input, stride_h_input, stride_d_output, stride_h_output;
 
   if (tensor_layout == 0)
   {
@@ -1030,11 +1037,11 @@ void mean_scale_fuse_quant_cuda(
   const int batch_size = input.size(0);
   const int num_tokens_padded = input.size(3);
 
-  int stride_bz_input = input.stride(0);
-  int stride_bz_output = output.stride(0);
+  int64_t stride_bz_input = input.stride(0);
+  int64_t stride_bz_output = output.stride(0);
 
   int num_heads, head_dim;
-  int stride_d_input, stride_h_input, stride_d_output, stride_h_output;
+  int64_t stride_d_input, stride_h_input, stride_d_output, stride_h_output;
 
   if (tensor_layout == 0)
   {
