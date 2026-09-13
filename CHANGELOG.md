@@ -121,6 +121,46 @@ Recorded: 2026-08-05, while validating the Triton fix at 362 frames.
 Real open TODOs. Each has an explicit trigger-to-act; we don't do these
 speculatively.
 
+### Grade `smooth_k` across the trajectory on captures, before 2026-09-20 (added 2026-09-13)
+
+**Trigger to act:** the calendar. The consumer's 2026-09-03 base16 t2v
+capture set (S=104,361, 25 cells: blocks 0/24/32/40/49 x steps
+4/8/12/14/15) is retained to 2026-09-20 and recycled after; once it is
+gone this question cannot be graded until someone captures again. The
+measurement is cheap -- `tests/spikes/spike_h3_real_activations.py` over
+the five step-15 cells plus two or three mid-trajectory ones, minutes of
+GPU per cell -- and is the whole first step.
+
+**What was seen (decision log, "sm89 q/k quantization", seen-in-passing):**
+on block 49 / step 15, `smooth_k=True` improved fp8++ mean rtol by 5.5%
+and fp16 by 7.6%; on block 0 / step 4 it did nothing. The spike's K
+channel-offset readout is much larger on the late cell. The 2026-08-05
+real-activation run found K centred and `smooth_k` inert, on early cells.
+Two points, one direction: a trend, not a finding.
+
+**Why this is not a flag flip, whatever the grade says.** In the Triton
+per-thread path `smooth_k=True` allocates the int8 outputs before it
+evaluates `k = k - km`, so a full bf16 copy of K lands on top of them --
+about 1.5 GB of transient at the frame ceiling, on a card where memory is
+the binding constraint and four models are oversubscribed. It also inverts
+the consumer's clone-v decision (`sageattn_consume` docstring: cloning v
+goes from a saving to a cost with `smooth_k=True`). And the gain seen is
+about a third of the fp8++-to-fp16 gap the owner already accepts, so it is
+not obviously visible in a render, which cannot A/B it anyway.
+
+**Decision tree after the grade:**
+1. Gain flat or noisy across cells: record the table here, close into the
+   Decision log, done.
+2. Gain holds and grows late in the trajectory: the work is making
+   smoothing free, not turning it on -- subtract the mean in place inside
+   the quantizer so no K copy is materialized. Small kernel change, exact
+   oracle (bit-identical int8 output to the copying path), and it is
+   already half of the "drop `per_channel_fp8`'s transpose buffer" item
+   below. Only then can the consumer enable it without paying memory or
+   reversing clone-v. Ship gate is the usual in-pipeline A/B on peak VRAM.
+
+---
+
 ### Drop `per_channel_fp8`'s full-size bf16 transpose buffer -- SUPERSEDED 2026-08-06, but the premise needs re-checking (2026-09-08)
 
 **Read this note before the entry below.** The supersession rests on a
