@@ -73,12 +73,12 @@ def run(path):
     mean_ratio, max_ratio = describe_k(k)
     print(f"\n=== {Path(path).name}  S={S} heads={H} head_dim={D} ===")
     print(f"K channel offset |mean|/std:  mean {mean_ratio:.3f}   max {max_ratio:.3f}")
-    if mean_ratio < 0.1:
-        print("  -> K is essentially centred already; smooth_k has little to remove.")
-    elif mean_ratio > 0.5:
-        print("  -> substantial offset; smooth_k should buy real INT8 headroom.")
-    else:
-        print("  -> moderate offset.")
+    # Reported, not interpreted. Across ten H3 cells (CHANGELOG decision
+    # log, "smooth_k on H3", 2026-09-14) the offset did not predict whether
+    # smooth_k helped: block 0 carried the largest offset of the mid-depth
+    # cells and smoothing hurt there, while the gain tracked block depth.
+    # An earlier version printed "substantial offset; smooth_k should buy
+    # real headroom" here, which the data contradicted.
 
     results = {}
     for label, attr, kw in ARMS:

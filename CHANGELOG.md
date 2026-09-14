@@ -121,46 +121,6 @@ Recorded: 2026-08-05, while validating the Triton fix at 362 frames.
 Real open TODOs. Each has an explicit trigger-to-act; we don't do these
 speculatively.
 
-### Grade `smooth_k` across the trajectory on captures, before 2026-09-20 (added 2026-09-13)
-
-**Trigger to act:** the calendar. The consumer's 2026-09-03 base16 t2v
-capture set (S=104,361, 25 cells: blocks 0/24/32/40/49 x steps
-4/8/12/14/15) is retained to 2026-09-20 and recycled after; once it is
-gone this question cannot be graded until someone captures again. The
-measurement is cheap -- `tests/spikes/spike_h3_real_activations.py` over
-the five step-15 cells plus two or three mid-trajectory ones, minutes of
-GPU per cell -- and is the whole first step.
-
-**What was seen (decision log, "sm89 q/k quantization", seen-in-passing):**
-on block 49 / step 15, `smooth_k=True` improved fp8++ mean rtol by 5.5%
-and fp16 by 7.6%; on block 0 / step 4 it did nothing. The spike's K
-channel-offset readout is much larger on the late cell. The 2026-08-05
-real-activation run found K centred and `smooth_k` inert, on early cells.
-Two points, one direction: a trend, not a finding.
-
-**Why this is not a flag flip, whatever the grade says.** In the Triton
-per-thread path `smooth_k=True` allocates the int8 outputs before it
-evaluates `k = k - km`, so a full bf16 copy of K lands on top of them --
-about 1.5 GB of transient at the frame ceiling, on a card where memory is
-the binding constraint and four models are oversubscribed. It also inverts
-the consumer's clone-v decision (`sageattn_consume` docstring: cloning v
-goes from a saving to a cost with `smooth_k=True`). And the gain seen is
-about a third of the fp8++-to-fp16 gap the owner already accepts, so it is
-not obviously visible in a render, which cannot A/B it anyway.
-
-**Decision tree after the grade:**
-1. Gain flat or noisy across cells: record the table here, close into the
-   Decision log, done.
-2. Gain holds and grows late in the trajectory: the work is making
-   smoothing free, not turning it on -- subtract the mean in place inside
-   the quantizer so no K copy is materialized. Small kernel change, exact
-   oracle (bit-identical int8 output to the copying path), and it is
-   already half of the "drop `per_channel_fp8`'s transpose buffer" item
-   below. Only then can the consumer enable it without paying memory or
-   reversing clone-v. Ship gate is the usual in-pipeline A/B on peak VRAM.
-
----
-
 ### Drop `per_channel_fp8`'s full-size bf16 transpose buffer -- SUPERSEDED 2026-08-06, but the premise needs re-checking (2026-09-08)
 
 **Read this note before the entry below.** The supersession rests on a
@@ -625,6 +585,64 @@ quant"). Today: not load-bearing.
 
 Investigations that closed without action. Recorded so we don't
 re-derive them. Each entry has an explicit reopen-trigger.
+
+### `smooth_k` on H3: graded across the trajectory -- CLOSED 2026-09-14, no flag flip; the gain is real, small, and lives in deep blocks
+
+Opened 2026-09-13 as a backlog item with a deadline (the capture set is
+recycled after 2026-09-20). Graded 2026-09-14: eight more cells of the
+consumer's 2026-09-03 base16 t2v capture (S=104,361), joining the two from
+2026-09-13, `tests/spikes/spike_h3_real_activations.py`, RTX 4090, build
+`f41026e` tree, fp32 `EFFICIENT_ATTENTION` reference over the same captured
+bf16 inputs, mean rtol over 8-head chunks. Full stdout in
+`internal/records/spike_h3_real_activations_smooth_k_2026-09-14.log` and
+`internal/records/spike_h3_real_activations_qk_gran_2026-09-13.log`
+(gitignored; this table is the committed copy). fp8++ is the served mode.
+
+| block | step | K offset (mean abs mean / std) | fp8++ off | fp8++ on | delta | fp16 off | fp16 on | delta |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 4 | 0.839 | 0.0141 | 0.0143 | +1.2% | 0.0101 | 0.0103 | +2.6% |
+| 0 | 12 | 1.003 | 0.0097 | 0.0099 | +1.6% | 0.0069 | 0.0071 | +2.9% |
+| 0 | 15 | 1.051 | 0.0085 | 0.0087 | +2.3% | 0.0063 | 0.0066 | +4.8% |
+| 24 | 8 | 0.461 | 0.0259 | 0.0261 | +0.5% | 0.0202 | 0.0204 | +1.0% |
+| 24 | 15 | 0.466 | 0.0264 | 0.0265 | +0.5% | 0.0200 | 0.0202 | +1.0% |
+| 32 | 12 | 0.599 | 0.0281 | 0.0274 | -2.5% | 0.0221 | 0.0210 | -5.0% |
+| 32 | 15 | 0.595 | 0.0293 | 0.0284 | -3.1% | 0.0225 | 0.0211 | -6.2% |
+| 40 | 12 | 0.567 | 0.0406 | 0.0391 | -3.8% | 0.0324 | 0.0299 | -7.7% |
+| 40 | 15 | 0.580 | 0.0426 | 0.0411 | -3.3% | 0.0334 | 0.0309 | -7.5% |
+| 49 | 15 | 1.520 | 0.0472 | 0.0447 | -5.5% | 0.0409 | 0.0378 | -7.6% |
+
+**Reading.** The axis is block depth, not sampler step: at a given block
+the two steps agree to within a fraction of a percent, and the effect
+walks monotonically from slightly harmful at block 0 to a few percent
+helpful at block 49. It tracks the error magnitude itself (rtol rises
+tenfold from block 0 to block 49), not the K offset the spike reports --
+block 0 has the largest offset ratio of the mid-depth cells and smoothing
+hurts there. So the "substantial offset, smooth_k should help" line the
+spike printed was a wrong inference from a real number; it is reworded in
+this version to report the offset without predicting from it.
+
+**Decision: no flag flip, and the memory-free smoothing branch is not
+created.** The gain where it exists is a few percent of an error that is
+itself a fifth of the fp8++-to-fp16 gap the served mode already accepts;
+the flag as it stands costs a full bf16 K copy at the ceiling and inverts
+the consumer's clone-v choice; and the harm in shallow blocks means a
+global flag is the wrong instrument even if the cost were zero. Sampler
+step does not matter, so nothing about the trajectory argues for
+switching it on late.
+
+**Reopen triggers, either of:** (a) a perceptual-quality question that
+localizes to the deepest blocks, where a per-block toggle in the consumer
+(smoothing on for blocks past ~32, off before) would be the shape of the
+fix and this table is its sizing; (b) the in-place mean subtraction
+lands for another reason (it is half of the transpose-buffer backlog
+item), at which point smoothing is free and the per-block question can be
+asked without the memory cost.
+
+**Per-warp q/k, eight more cells.** Same run: per-warp CUDA q/k is worse
+than per-thread Triton on every cell, +3.2% to +5.5%, all ten cells now in
+the same direction. The sm89 decision above stands with more behind it.
+
+---
 
 ### sm89 q/k quantization: per-thread Triton stays; per-warp CUDA measured slower end to end -- 2026-09-13
 
@@ -1335,9 +1353,11 @@ numbers). A second standalone `--check-regression` run passed as well.
 This is the suite pass the v0.7.17 entry did not have, which was the first
 item on the held-back list.
 
-**`smooth_k` across the trajectory:** eight more cells graded after this
-entry; the result is the next commit, under the backlog entry of the same
-name.
+**`smooth_k` across the trajectory:** graded on ten cells and closed --
+no flag flip; the gain is real, a few percent, and confined to deep blocks
+while shallow blocks lose slightly. Table, reading and reopen triggers in
+the Decision log ("`smooth_k` on H3: graded across the trajectory"). The
+same run put per-warp q/k worse on all ten cells.
 
 ### v0.7.17 -- 2026-09-13  (int64 strides in the fused CUDA quant kernels, and a guard that can fail)
 
