@@ -1252,10 +1252,19 @@ to four decimals where the per-head form costs 6%. The consumer's node
 (`MiniMaxH3ChannelBalance`, off by default) uses the weights-only form: no
 capture, neutral where flat, half the per-head gain, free.
 
+*Sol's kernel benefits too* (consumer's `bench/grade_channel_balance.py`,
+2026-09-14, tau 1.0, first 8 heads, weights-derived factor): its INT8 term
+at block 49 0.0265 -> 0.0231 (-12.9%), sparsity term unchanged, routing
+invariant (eager reference moves exactly as much as exact attention does
+under the bf16 re-rounding of the inputs); block 0 neutral. Read from the
+kitchen source: Sol quantizes K per key row, mean-centred, one scale across
+the row's channels, so the shared-channel-scale mechanism is present there
+at a finer token granularity than sage's. The node ships in the consumer
+pack as `MiniMaxH3ChannelBalance`, off by default.
+
 **What is not established:** whether a fifth less rtol at the last block is
 visible in a clip (nothing here is perceptual); whether blocks 45 and 48
-behave like 49 under the fold; whether Sol's kernel benefits (the
-consumer's `bench/grade_channel_balance.py`); and the remaining
+behave like 49 under the fold; and the remaining
 four-fifths, which the attention shape sets and only finer K granularity in
 a kernel can touch. Not a sage change; recorded so the question is not
 re-derived.
