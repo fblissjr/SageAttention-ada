@@ -1146,6 +1146,87 @@ autotune, and roadmap decisions. Not actionable today; filed so
 they're discoverable when a decision in that space surfaces. Pair
 with `docs/ltx_workload_profile.md` (canonical FML2V breakdown).
 
+### MiniMax H3, block 49: per-channel K balancing cuts INT8 error by a fifth, and it is a weights property the consumer can fold in for free (2026-09-14)
+
+Actionable on the consumer side, not here; filed under intel because no
+sage code changes. `tests/spikes/spike_h3_k_channel_balance.py`, RTX 4090,
+build `069becf`, captured q/k/v (HND, post RMSNorm+RoPE) from the
+consumer's 2026-09-03 base16 t2v set, fp32 `EFFICIENT_ATTENTION` reference
+on the original tensors, mean rtol over 8-head chunks, sage fp8++
+(`fp32+fp16`, `smooth_k=False`) as served. Full stdout in
+`internal/records/spike_h3_k_channel_balance_2026-09-14.log` and
+`..._sweep_2026-09-14.log` (gitignored; these tables are the committed copy).
+
+**The mechanism, and why the two repos' records agree.** The `smooth_k`
+grade above found quantization error rising ~5x from block 0 to block 49
+with mean-subtraction buying a few percent at depth. The consumer's
+2026-08-20 head-magnitude analysis attributes block 49's INT8 error to four
+K channels carrying most of the energy, sitting where the K-norm weight
+peaks -- a property of the released weights. Sage quantizes K per block of
+tokens with one INT8 scale across all 128 channels, so those channels set
+the scale and the other 124 lose resolution. For the dot product,
+`q . k == (q * s) . (k / s)` for any per-(head, channel) `s`, so the
+channels can be rebalanced before quantization at no cost to the math.
+`s = rms_k^a / rms_q^(1-a)`, geometric mean one per head (SmoothQuant's
+form). H3's RoPE is split-half over channels 0..95, rotating (i, i+48)
+together, so an `s` equal within each pair commutes with RoPE and folds
+into `q_norm.weight` / `k_norm.weight` -- zero runtime cost, one weights
+patch per block.
+
+**Where the loud channels are.** Top-4 K channels by energy across heads:
+
+| cell | top-4 | share of K energy | per-head K rms spread |
+|---|---|---|---|
+| block 0, step 15 | 48, 0, 56, 32 | 11.2% | 2.0x |
+| block 32, step 15 | 84, 36, 96, 30 | 5.1% | 1.2x |
+| block 40, step 15 | 36, 84, 94, 106 | 5.7% | 1.1x |
+| block 49, step 15 | **34, 82, 67, 19** | **93.2%** | 3.4x |
+
+Block 49's four are exactly the consumer's four, and they are two RoPE
+pairs (34+48=82, 19+48=67), which is why the pair-equal form loses almost
+nothing.
+
+**What balancing does, by block** (a=0.5 unless stated):
+
+| cell | plain | free a=0.5 | pair a=0.5 | pair a=1.0 |
+|---|---|---|---|---|
+| block 0, step 15 | 0.0085 | 0.0088 (+3.8%) | 0.0088 (+3.5%) | 0.0199 (+135%) |
+| block 32, step 15 | 0.0293 | 0.0295 (+0.8%) | 0.0295 (+0.8%) | 0.0371 (+27%) |
+| block 40, step 15 | 0.0426 | 0.0436 (+2.5%) | 0.0433 (+1.8%) | 0.0533 (+25%) |
+| block 49, step 15 | 0.0472 | **0.0376 (-20.4%)** | **0.0381 (-19.4%)** | 0.0721 (+53%) |
+
+**Alpha, pair-equal form** (the deployable one):
+
+| cell | plain | 0.15 | 0.25 | 0.35 | 0.50 | 0.65 | 0.75 |
+|---|---|---|---|---|---|---|---|
+| block 49, step 15 | 0.0472 | +20.1% | -1.0% | -12.4% | **-19.4%** | -17.3% | -11.9% |
+| block 49, step 4 | 0.0474 | +13.0% | -6.7% | -15.8% | **-22.6%** | -18.9% | -12.6% |
+| block 40, step 12 | 0.0406 | +12.9% | +6.9% | +3.3% | +1.0% | +2.4% | +6.4% |
+
+**Reading.** At block 49 the balanced fp8++ call lands below the fp16
+kernel's unbalanced error on the same cell (0.0409 in the smooth_k table),
+which no accumulator or PV-width setting achieved in any earlier H3
+measurement. It is not a global lever: where no channel is loud (every
+other captured block) it costs a few percent, because moving scale onto Q
+buys nothing and costs Q's own INT8 resolution -- the a=1.0 column is that
+cost undiluted. It is a per-block, static, weights-determined lever, and
+the deciding statistic (K energy share of the top channels, from
+`k_norm.weight` or one capture) is available before any render. Step does
+not matter, as with everything quantization-shaped on this model.
+
+**For the consumer's Sol-Attn stack** this matters twice: their error
+split has Sol's INT8 term equal to its sparsity term at block 49 and only
+there, so halving the quantization term at that block is the cheapest move
+on their board, cheaper than running block 49 dense; and if their CUDA
+kernel quantizes K with a shared scale across channels, the same fold helps
+it -- which they can check with the same balanced q/k through their oracle.
+
+**What is not established:** whether a fifth less rtol at the last block is
+visible in a clip (nothing here is perceptual); whether blocks 41-48, never
+captured, carry the same loud channels; and the exact fold recipe, which
+is theirs to write. Not a sage change; recorded so the question is not
+re-derived.
+
 ### Two-pass tensor-loop workflow: mixed head dims (HEAD-128 + HEAD-64)
 
 Observed 2026-05-19 via cross-clone trace analysis on a consumer-side
