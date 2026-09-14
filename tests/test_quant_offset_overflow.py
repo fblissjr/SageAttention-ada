@@ -47,9 +47,10 @@ width is narrower than the tensor needs. Its cases:
   - cuda_build_is_64bit  : the installed build carries the width. Delete
                            and a checkout from before the fix passes the
                            guard cases while its kernels still wrap.
-  - cuda_tail_correct_*  : the widened kernel, driven past 2**32 elements
-                           on a fused-QKV view. Delete and the guard could
-                           be right while the kernel is still wrong.
+  - cuda_tail_correct_*  : the widened kernels, driven past 2**32 elements
+                           on a fused-QKV view -- the fp8 v path and the
+                           fp16 kernels' sub_mean. Delete and the guard
+                           could be right while the kernel is still wrong.
 
 Standalone script (no pytest); run via $VIRTUAL_ENV/bin/python.
 The tail_correct cases need ~13 GiB of free VRAM (14 GiB for the CUDA one)
@@ -348,6 +349,40 @@ def cuda_fused_view_tail_report(s, tail_rows=4096, fused_mod=None):
     return cos, zero_frac, nan_frac
 
 
+def cuda_fused_view_sub_mean_tail_report(s, tail_rows=4096, fused_mod=None):
+    """Same drive for `sub_mean` (the fp16 kernels' smooth_v path): v as a
+    fused view past the ceiling, output is `v - mean` in fp16, scored on
+    the tail against the same subtraction done in fp32."""
+    buf = torch.zeros((1, s, 3, H, D), dtype=torch.bfloat16, device="cuda")
+    v = buf[:, :, 2]
+    v[:, -tail_rows:].normal_()
+    if fused_mod is None:
+        out, vm = cuda_quant.sub_mean(v, tensor_layout="NHD")
+    else:
+        vm = v.mean(dim=1)
+        out = torch.empty(v.shape, dtype=torch.float16, device=v.device)
+        fused_mod.sub_mean_cuda(v, vm, out, 0)
+    got = out[:, -tail_rows:].float()
+    src = (v[:, -tail_rows:].float() - vm.float()[:, None])
+    nan_frac = torch.isnan(got).float().mean().item()
+    got = torch.nan_to_num(got)
+    zero_frac = (got == 0).float().mean().item()
+    cos = torch.nn.functional.cosine_similarity(got.reshape(-1), src.reshape(-1), dim=0).item()
+    del buf, v, out, vm, got, src
+    torch.cuda.empty_cache()
+    return cos, zero_frac, nan_frac
+
+
+def test_cuda_sub_mean_tail_correct_above_uint32_boundary_fused_view():
+    s = (FUSED_VIEW_UINT32_ROWS + 1024 + 63) // 64 * 64
+    cos, zero_frac, nan_frac = cuda_fused_view_sub_mean_tail_report(s)
+    assert cos > 0.99, (
+        f"sub_mean on a fused view at S={s:,} (past the uint32 ceiling) has tail "
+        f"cosine {cos:.4f} vs the fp32 subtraction, {zero_frac:.1%} zeros, "
+        f"{nan_frac:.1%} NaN; the kernel read or wrote a wrapped address"
+    )
+
+
 def test_cuda_tail_correct_above_uint32_boundary_fused_view():
     s = (FUSED_VIEW_UINT32_ROWS + 1024 + 63) // 64 * 64
     cos, zero_frac, nan_frac = cuda_fused_view_tail_report(s)
@@ -379,6 +414,7 @@ HEAVY_CASES = [
 
 CUDA_HEAVY_CASES = [
     test_cuda_tail_correct_above_uint32_boundary_fused_view,
+    test_cuda_sub_mean_tail_correct_above_uint32_boundary_fused_view,
 ]
 
 

@@ -14,11 +14,12 @@ the bottom; `git log -p CLAUDE.md` shows exactly what moved where.
 
 **MiniMax H3 is the only current target. sm89 / Ada / 4090 only.**
 
-- **LTX 2.3 is parked** (2026-09-08). Nothing is coded or tested *for*
-  it. Its bench still runs and reports, because the kernels are shared
-  and it covers a second head config plus a masked path H3 cannot reach
-  -- but it does not gate `tests/run_all.sh` and does not define the
-  load-bearing metric. Re-blocking is one `exit` away in `run_all.sh`.
+- **LTX 2.3 is parked** (2026-09-08) **and its bench is off by default**
+  (2026-09-14, owner's call). Nothing is coded, tested or benched *for*
+  it; `tests/run_all.sh` skips it unless `RUN_LTX=1`. The file and its
+  baselines stay because the kernels are shared and it covers a second
+  head config plus a masked path H3 cannot reach; run it by hand when that
+  is the question.
 - **The v0.5.5 native-mask kernel is zero priority** -- LTX-motivated,
   and H3 never passes a mask.
 - **`sage_ffn` and the FFN line stay zero priority.** On the path that
@@ -75,13 +76,14 @@ source /path/to/venv/bin/activate
 ## Test
 
 ```bash
-./tests/run_all.sh                     # env snapshot + h3 + ltx + image + spike
+./tests/run_all.sh                     # env snapshot + h3 gate + image + correctness + spike
 VENV=/path/to/venv ./tests/run_all.sh  # explicit venv
+RUN_LTX=1 ./tests/run_all.sh           # also the parked LTX bench (off by default)
 ${VIRTUAL_ENV}/bin/python tests/test_sageattn_h3_shapes.py --check-regression
 ```
 
 - **`tests/test_sageattn_h3_shapes.py` is the gate.** It decides whether
-  the suite passed. The LTX bench runs after it, non-blocking.
+  the suite passed. The LTX bench is skipped unless `RUN_LTX=1`.
 - **The H3 gate covers speed, peak VRAM and cross-kernel fidelity. Not
   accuracy** -- deliberately. Its baselines carry no rtol-vs-SDPA rows,
   so the shared gate skips that check by construction.
@@ -97,6 +99,8 @@ ${VIRTUAL_ENV}/bin/python tests/test_sageattn_h3_shapes.py --check-regression
   triton-autotune-pending rows. Run once without the flag first.
 - GPU OOM mid-test usually means contention. Check `nvidia-smi` before
   debugging.
+- The suite imports `orjson`, which ComfyUI's venv does not ship. A fresh
+  venv fails at import in the LTX helper; `uv pip install orjson` there.
 
 ## Rules
 

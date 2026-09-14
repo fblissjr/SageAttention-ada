@@ -60,8 +60,15 @@ def build_info() -> dict:
                 sends a reader looking for source edits that do not exist.
       describe  "<version> @ <sha>[-dirty]", or just "<version>" with no
                 checkout. The one-line form to put in a log.
+      element_offset_bits
+                Width of the global element offsets the installed fused
+                CUDA quant build forms: 64 from v0.7.17 on, 32 for any
+                build without the attribute. Distinguishes a widened build
+                from a stale one in a record, since `revision` names the
+                source and not the compiled artifact.
     """
     from . import __version__ as version
+    from .quant import ELEMENT_OFFSET_BITS as element_offset_bits
 
     pkg_dir = Path(__file__).resolve().parent
     # --short=12, not bare --short: git auto-scales the abbreviation as a repo
@@ -86,4 +93,5 @@ def build_info() -> dict:
         "revision": sha,
         "dirty": dirty,
         "describe": describe,
+        "element_offset_bits": element_offset_bits,
     }

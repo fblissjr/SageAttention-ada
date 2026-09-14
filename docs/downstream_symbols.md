@@ -78,10 +78,14 @@ contract:
 ## `build_info()` -- a contract with a known consumer
 
 `sageattention.build_info() -> dict` with keys `version`, `revision`,
-`dirty`, `describe`. Added 2026-09-08 because `__version__` is a constant
-that cannot distinguish one build of this fork from another, and a
-downstream consumer's dated evaluation records had identified us by it
-across a full rebuild.
+`dirty`, `describe`, and since v0.7.18 (2026-09-14) `element_offset_bits`.
+Added 2026-09-08 because `__version__` is a constant that cannot
+distinguish one build of this fork from another, and a downstream
+consumer's dated evaluation records had identified us by it across a full
+rebuild. `element_offset_bits` (64 from v0.7.17, 32 for any build without
+the attribute) exists because `revision` names the source and not the
+compiled artifact: a stale extension beside a current checkout is
+invisible in a record without it.
 
 **Treat the key set as a published contract.** That consumer embeds the
 return value verbatim in records it does not rewrite. Adding a key is

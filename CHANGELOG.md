@@ -1263,6 +1263,82 @@ sufficient.
 > LTX-motivated throughout.
 
 
+### v0.7.18 -- 2026-09-14  (the evidence gap closed on the two remaining kernels; `build_info()` names the offset width)
+
+Follow-through on v0.7.17, opened by the owner asking what had been held
+back. Three of the five widened kernels had before/after evidence; the two
+on paths H3 does not run today -- `SubMeanKernel` behind `sub_mean` (the
+fp16 kernels' `smooth_v`) and the fuse-sub-mean `QuantInt8Kernel` behind
+`per_block_int8` with `km` (the `smooth_k` k path on sm80) -- had been
+widened by the same mechanical edit and trusted on that. Now measured,
+same harness, same conditions as the v0.7.17 table, 2026-09-14, build
+`b8ef22a17fc6` plus the uncommitted harness edits, RTX 4090 idle. Full
+stdout in `internal/records/spike_fused_quant_offsets_2026-09-14.log`
+(gitignored; this table is the committed copy). The three original
+kernels re-ran alongside and reproduced the v0.7.17 rows; only the new
+ones are shown.
+
+| S | kernel | new ms | old ms | new/old | bit-equal |
+|---|---|---|---|---|---|
+| 41,822 | fuse_sub_mean k | 4.341 | 4.326 | 1.004 | yes |
+| 41,822 | sub_mean v | 1.997 | 1.997 | 1.000 | yes |
+| 104,030 | fuse_sub_mean k | 10.860 | 10.860 | 1.000 | yes |
+| 104,030 | sub_mean v | 4.999 | 4.997 | 1.000 | yes |
+| 109,126 | fuse_sub_mean k | 11.394 | 11.405 | 0.999 | yes |
+| 109,126 | sub_mean v | 5.221 | 5.234 | 0.998 | yes |
+| 149,000 | fuse_sub_mean k | 15.548 | 15.551 | 1.000 | yes |
+| 149,000 | sub_mean v | 7.173 | 7.226 | 0.993 | yes |
+
+Past the ceiling, `sub_mean` on the fused view at S=200,768, tail scored
+against the same subtraction in fp32:
+
+| build | tail cosine | tail zeros | tail NaN |
+|---|---|---|---|
+| new (int64) | 1.0000 | 0.0% | 0.0% |
+| old (uint32) | 0.8640 | 0.0% | 0.0% |
+
+Note the old build's failure signature differs from `per_channel_fp8`'s:
+no zeros, because the wrapped read lands in the zero-filled head and the
+kernel writes `0 - mean`, a wrong non-zero constant. A zero-fraction check
+alone would have passed it; the cosine is what catches it. The new heavy
+case in `tests/test_quant_offset_overflow.py` scores cosine for that
+reason, and the file now runs 15 of 15 live.
+
+**`build_info()` gains `element_offset_bits`.** The consumer's render
+records embed `build_info()` verbatim and `revision` names the source, not
+the compiled artifact; a stale extension beside a current checkout was
+invisible in a record. The new key is 64 from v0.7.17 on and 32 for any
+build without the attribute. Adding a key is the compatible direction of
+that contract; `tests/test_build_info_contract.py` pins the new key set
+and the value's domain.
+
+Also: `CLAUDE.md` notes that the suite needs `orjson`, which ComfyUI's venv
+does not ship -- the LTX helper failed at import on 2026-09-13 until it
+was added.
+
+**The LTX bench is off by default in `tests/run_all.sh`.** Owner's call on
+2026-09-14, on seeing it run inside the suite: LTX is not a workload here
+and its GPU minutes are not worth spending on every run. It went
+non-blocking in v0.7.12 for the same reason; now it is opt-in with
+`RUN_LTX=1`. The file, its baselines and its masked-path coverage are
+untouched, for the day a second head config or a mask is the question.
+The image bench still runs; Flux and Z-Image are bench shapes, not targets,
+and nobody has asked about it.
+
+**Suite on the served build, 2026-09-14.** `tests/run_all.sh` exit 0 on
+the first run after the v0.7.17 build, H3 gate included with
+`--check-regression`: every (shape, mode) pair inside the mean-rtol bound,
+no regression against `tests/regression_baselines_h3.json`, and the
+fl2va speedup row well above its floor (the gate's own log under
+`internal/log/test_sageattn_h3_shapes_2026-09-14.log` carries the
+numbers). A second standalone `--check-regression` run passed as well.
+This is the suite pass the v0.7.17 entry did not have, which was the first
+item on the held-back list.
+
+**`smooth_k` across the trajectory:** eight more cells graded after this
+entry; the result is the next commit, under the backlog entry of the same
+name.
+
 ### v0.7.17 -- 2026-09-13  (int64 strides in the fused CUDA quant kernels, and a guard that can fail)
 
 The latent ceiling recorded under Known kernel bugs on 2026-08-05 is closed.

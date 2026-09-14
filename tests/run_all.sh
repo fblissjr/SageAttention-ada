@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-command sage-fork validation:
 #   - snapshot the env to internal/bench_env_<today>.txt
-#   - run the LTX-shape accuracy + speed bench
+#   - run the H3 gate (the pass criterion); the LTX bench only with RUN_LTX=1
 #   - run the torch.compile spike
 #   - archive both logs under internal/log/
 #
@@ -92,23 +92,25 @@ if [ "${H3_EXIT}" -ne 0 ]; then
     exit "${H3_EXIT}"
 fi
 
-# 3. LTX-shape bench. NON-BLOCKING as of 2026-09-08: LTX is not a current
-# target, so an LTX regression must not prevent the correctness suites below
-# from running -- which is exactly what a stale LTX baseline did for four
-# months (CHANGELOG v0.7.12). It still runs and still reports, because the
-# kernels are shared: a real numerical regression would surface here first, at
-# a second head config and a masked path H3 never exercises. Re-blocking is
-# one `exit` away if LTX becomes a target again.
+# 3. LTX-shape bench. OFF by default as of 2026-09-14 (owner's call: LTX is
+# not a workload here and its GPU minutes are not worth spending on every
+# run). It went non-blocking on 2026-09-08 for the same reason (CHANGELOG
+# v0.7.12). Opt in with RUN_LTX=1 when a second head config or a masked path
+# is the question; the file and its baselines are untouched.
 echo
-echo "[3/6] running tests/test_sageattn_ltx_shapes.py --check-regression (non-blocking)"
-set +e
-"${PY}" tests/test_sageattn_ltx_shapes.py --check-regression 2>&1 | tee "${BENCH_LOG}"
-LTX_EXIT="${PIPESTATUS[0]}"
-set -e
-if [ "${LTX_EXIT}" -ne 0 ]; then
-    echo "WARNING: LTX bench exited ${LTX_EXIT}. Not a current target, so it does" >&2
-    echo "         not fail the suite -- but read ${BENCH_LOG} before assuming it" >&2
-    echo "         is only LTX: these kernels are shared with the H3 path." >&2
+if [ "${RUN_LTX:-0}" = "1" ]; then
+    echo "[3/6] running tests/test_sageattn_ltx_shapes.py --check-regression (non-blocking, RUN_LTX=1)"
+    set +e
+    "${PY}" tests/test_sageattn_ltx_shapes.py --check-regression 2>&1 | tee "${BENCH_LOG}"
+    LTX_EXIT="${PIPESTATUS[0]}"
+    set -e
+    if [ "${LTX_EXIT}" -ne 0 ]; then
+        echo "WARNING: LTX bench exited ${LTX_EXIT}. Not a current target, so it does" >&2
+        echo "         not fail the suite -- but read ${BENCH_LOG} before assuming it" >&2
+        echo "         is only LTX: these kernels are shared with the H3 path." >&2
+    fi
+else
+    echo "[3/6] LTX bench skipped (not a workload; RUN_LTX=1 to run it)"
 fi
 
 # 4. Image-shape bench (head_dim ∈ {120, 128}). Separate file so the

@@ -41,6 +41,7 @@ import sageattention
 from sageattention import _fused as fused_new  # type: ignore[attr-defined]
 from test_quant_offset_overflow import (
     FUSED_VIEW_UINT32_ROWS,
+    cuda_fused_view_sub_mean_tail_report,
     cuda_fused_view_tail_report,
 )
 from test_sageattn_ltx_shapes import time_and_vram
@@ -102,10 +103,31 @@ def per_channel_v(mod, v):
     return v_fp8, v_scale
 
 
+def fuse_sub_mean_k(mod, k):
+    """`per_block_int8` with `km` given: the smooth_k=True k path on sm80/fp16."""
+    km = k.float().mean(dim=1).to(k.dtype).squeeze(0)[None]        # [1, H, D]
+    k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
+    scale = torch.empty((1, HEADS, (k.shape[1] + 63) // 64), dtype=torch.float32, device=k.device)
+    mod.quant_per_block_int8_fuse_sub_mean_cuda(k, km, k_int8, scale, 64, 0)
+    return k_int8, scale
+
+
+def sub_mean_v(mod, v):
+    """`sub_mean`: the smooth_v path of the fp16 kernels, bf16 in, fp16 out."""
+    vm = v.mean(dim=1)                                              # [1, H, D]
+    out = torch.empty(v.shape, dtype=torch.float16, device=v.device)
+    mod.sub_mean_cuda(v, vm, out, 0)
+    return (out,)
+
+
 KERNELS = [
     ("per_warp q  (quant_per_warp_int8)", per_warp_q, 1),
     ("per_block k (quant_per_block_int8)", per_block_k, 2),
     ("per_channel v (transpose+scale_fuse)", per_channel_v, 3),
+    # Not on the sm89 production path; widened by the same edit, so they
+    # carry the same evidence.
+    ("fuse_sub_mean k (per_block + km)", fuse_sub_mean_k, 2),
+    ("sub_mean v (bf16 -> fp16)", sub_mean_v, 3),
 ]
 
 
@@ -157,14 +179,17 @@ def main():
     if free < PAST_CEILING_VRAM_BYTES:
         print(f"past-ceiling row skipped: need {PAST_CEILING_VRAM_BYTES/2**30:.0f} GiB free, have {free/2**30:.1f} GiB")
         return 0
-    print(f"per_channel_fp8 tail at S={PAST_CEILING_ROWS:,} (fused view; uint32 ceiling is "
-          f"S={FUSED_VIEW_UINT32_ROWS:,})")
-    print(f"{'build':>6}  {'tail cos':>9} {'tail 0s':>8} {'tail NaN':>9}")
-    for label, mod in (("new", None), ("old", old)):
-        if label == "old" and old is None:
-            continue
-        cos, zeros, nans = cuda_fused_view_tail_report(PAST_CEILING_ROWS, fused_mod=mod)
-        print(f"{label:>6}  {cos:>9.4f} {zeros:>8.1%} {nans:>9.1%}")
+    for name, report in (("per_channel_fp8", cuda_fused_view_tail_report),
+                         ("sub_mean", cuda_fused_view_sub_mean_tail_report)):
+        print(f"{name} tail at S={PAST_CEILING_ROWS:,} (fused view; uint32 ceiling is "
+              f"S={FUSED_VIEW_UINT32_ROWS:,})")
+        print(f"{'build':>6}  {'tail cos':>9} {'tail 0s':>8} {'tail NaN':>9}")
+        for label, mod in (("new", None), ("old", old)):
+            if label == "old" and old is None:
+                continue
+            cos, zeros, nans = report(PAST_CEILING_ROWS, fused_mod=mod)
+            print(f"{label:>6}  {cos:>9.4f} {zeros:>8.1%} {nans:>9.1%}")
+        print()
     return 0
 
 

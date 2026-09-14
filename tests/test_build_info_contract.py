@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import sageattention
 
 
-KEYS = {"version", "revision", "dirty", "describe"}
+KEYS = {"version", "revision", "dirty", "describe", "element_offset_bits"}
 
 
 def test_exported_from_package():
@@ -51,6 +51,7 @@ def test_types():
     assert info["revision"] is None or isinstance(info["revision"], str)
     assert info["dirty"] is None or isinstance(info["dirty"], bool)
     assert isinstance(info["describe"], str) and info["describe"]
+    assert info["element_offset_bits"] in (32, 64), info["element_offset_bits"]
 
 
 def test_revision_is_a_pinned_width_prefix_of_head():
