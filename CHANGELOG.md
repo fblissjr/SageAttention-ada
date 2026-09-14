@@ -1221,10 +1221,43 @@ on their board, cheaper than running block 49 dense; and if their CUDA
 kernel quantizes K with a shared scale across channels, the same fold helps
 it -- which they can check with the same balanced q/k through their oracle.
 
+**Same day, three follow-ups (records in `internal/records/`, all
+2026-09-14; harness `tests/spikes/spike_h3_block49_error_anatomy.py`, CPU
+only):**
+
+*Which blocks, from the weights alone.* The checkpoint's `k_norm.weight`
+ranks all 50 blocks with no capture: top-4 channel energy share 70% at
+block 49, 31% at 45, 25% at 48, 4-6% everywhere else
+(`k_norm_weight_ranking_2026-09-14.txt`). The peaks at 49 are channels 82
+and 19; RoPE spreads each into its mate, hence the 34/82 and 19/67 pairs in
+the activations. 45 and 48 were never captured.
+
+*Why, decomposed.* fp32 exact attention on 1,024 sampled query rows over
+all keys, each quantization step simulated alone, block 49 against block 0:
+K int8 alone 0.0645 vs 0.0031 (21x), Q int8 alone 0.0159 vs 0.0052, both
+0.0666 vs 0.0062. K's rounding is the QK error at block 49. The amplifier is
+the block's attention shape: median effective keys per query 165-340 at
+block 49 against 10,000-25,000 at block 0, logit range 16-22 against 7-9,
+and the four worst heads (17, 9, 11, 22) attend to about 5 keys with a
+logit range of 145. Text query rows carry the most (0.11 vs 0.04 video).
+The fp8 P.V side is NOT simulated by that file -- a first attempt overstated
+it several-fold because the kernel scales P before the cast -- and its split
+comes from the kernel records instead (0.0472 fp8++ vs 0.0409 fp16 kernel on
+the same cell).
+
+*Which factor form folds.* Same simulation, block 49 QK error: per-head
+factor 0.0448 (-33%), head-shared 0.0569 (-15%), from the norm weights alone
+0.0587 (-12%); at block 0 the weights-only form reproduces the plain error
+to four decimals where the per-head form costs 6%. The consumer's node
+(`MiniMaxH3ChannelBalance`, off by default) uses the weights-only form: no
+capture, neutral where flat, half the per-head gain, free.
+
 **What is not established:** whether a fifth less rtol at the last block is
-visible in a clip (nothing here is perceptual); whether blocks 41-48, never
-captured, carry the same loud channels; and the exact fold recipe, which
-is theirs to write. Not a sage change; recorded so the question is not
+visible in a clip (nothing here is perceptual); whether blocks 45 and 48
+behave like 49 under the fold; whether Sol's kernel benefits (the
+consumer's `bench/grade_channel_balance.py`); and the remaining
+four-fifths, which the attention shape sets and only finer K granularity in
+a kernel can touch. Not a sage change; recorded so the question is not
 re-derived.
 
 ### Two-pass tensor-loop workflow: mixed head dims (HEAD-128 + HEAD-64)
