@@ -1415,6 +1415,87 @@ sufficient.
 > LTX-motivated throughout.
 
 
+### v0.7.19 -- 2026-09-15  (`qk_balance`: channel rebalancing inside the per-thread quantizer, for the loud-channel blocks)
+
+**Why.** MiniMax H3's last blocks (45, 48, 49 in every checkpoint on the
+box) put an order of magnitude of K-norm gain on four channels, and this
+fork's per-thread quantizer scales K with one INT8 scale per token block
+across all 128 channels, so those four set the scale and the rest keep about
+three bits. Block 49's attention is the peakiest in the model (it is where
+video queries read the text rows), so the coarse K rounding becomes large
+logit error: INT8 error there is ~5x block 0's, almost all on the K side.
+The anatomy and the checkpoint scan are under Workload intel, "MiniMax H3,
+block 49". The consumer's weights-fold node recovers part of it at zero
+cost; the rest of the recoverable part needs a per-head factor, which a
+per-channel weight cannot hold and the quantizer can.
+
+**What.** `per_thread_int8(..., qk_balance=True)` and the same kwarg on
+`sageattn_qk_int8_pv_fp8_cuda` (and so through `sageattn` /
+`sageattn_consume`): the two Triton kernels take a `Factor` pointer,
+`[B, H_kv, C]` fp32, and multiply it in right after the load, before the
+absmax -- Q by `f`, K by `1/f`, `f = rms_k^a / rms_q^(1-a)` per (batch, kv
+head, channel), geometric mean one per head. Exact for the attention math
+(`q . k == (q * f) . (k / f)`); only the INT8 rounding changes. Gated per
+head on the energy share of K's four loudest channels (`balance_min_share`,
+default 0.2, measured below): below it the factor is one and the head's codes are bit-
+identical to the plain path. GQA maps each query head to its kv head's
+factor. The channel norms come from `torch.linalg.vector_norm` with fp32
+accumulation, so no fp32 or bf16 copy of q or k is made -- the reason
+`smooth_k` was rejected on this card does not apply. **Default off** until
+the table below is in and the default question is decided on it.
+
+Pinned by `tests/test_qk_balance.py` (off is untouched; a closed gate is
+bit-identical to plain in both layouts; the gate is per head; the factors
+are exact reciprocals with unit geometric mean; GQA head mapping; a synthetic
+loud-channel case improves through the real kernel). In `run_all.sh`'s
+correctness list.
+
+**Measured, 2026-09-15, RTX 4090, branch build.** Records in
+`internal/records/spike_qk_balance_2026-09-15.log`,
+`..._gate05_2026-09-15.log`, `qk_balance_per_head_gate_2026-09-15.txt`
+(gitignored; these tables are the committed copy).
+
+*Accuracy on captured cells* (`spike_h3_real_activations.py`, fp8++,
+`smooth_k=False`, fp32 `EFFICIENT_ATTENTION` reference, mean rtol over
+8-head chunks; the consumer's 2026-09-03 base16 t2v capture, S=104,361):
+
+| cell | plain | `qk_balance`, gate 0.2 (default) | gate 0.5 |
+|---|---|---|---|
+| block 49, step 15 | 0.0472 | **0.0364 (-22.9%)** | 0.0412 (-12.8%) |
+| block 40, step 15 | 0.0426 | 0.0426 (+0.1%) | (gate opens 3/56 heads at 0.2, none at 0.5) |
+| block 0, step 15 | 0.0085 | 0.0085 (-0.2%) | 0.0085 (+0.0%) |
+
+For comparison on the same block-49 cell: the consumer's weights-fold node
+(per-channel, head-shared) gave 0.0453 on 8 heads, and per-warp CUDA q/k
+0.0486; the per-thread fp16 kernel, which this fork calls the accurate
+mode, gave 0.0409. The balanced fp8++ call is the most accurate INT8 QK
+result recorded on this block.
+
+*Per head, in the CPU simulation of the QK side* (`spike_h3_block49_error_anatomy.py`
+machinery, 512 sampled query rows): at block 49 the per-head factor
+removes a third of the block's QK error at gate 0.2 (49/56 heads open),
+up to 73% on the worst head (17), and 23% at gate 0.5 (14 heads open); at
+block 0 gate 0.2 costs 3.0% and gate 0.5 costs 0.2%. The kernel-level rows
+above show block 0 neutral even at 0.2, because the real kernel's Q
+quantization and fp8 PV error dilute what the simulation isolates -- so
+the default is 0.2, chosen on the kernel rows, which are what ships; 0.5
+was tried on the simulation's warning and halves the gain for nothing.
+
+*Cost* (`spike_h3_qk_quant_gran.py`, factor forced on every head so the
+full price is timed, fused view, `sageattn_consume`, median of 7 / 5):
+
+| S | arm | quant ms | call ms | peak MiB |
+|---|---|---|---|---|
+| 41,822 | per_thread | 2.153 | 110.68 | 1433 |
+| 41,822 | per_thread + qk_balance | 3.465 | 112.53 | 1433 |
+| 104,030 | per_thread | 5.378 | 684.20 | 3563 |
+| 104,030 | per_thread + qk_balance | 8.661 | 689.10 | 3563 |
+
+The two channel norms are the whole cost: +3.3 ms on the quant step at the
+frame ceiling, +0.7% on the call, and no change in peak memory. With the
+gate closed on a block the norms still run (they are the gate's input) and
+the kernels take the plain path.
+
 ### v0.7.18 -- 2026-09-14  (the evidence gap closed on the two remaining kernels; `build_info()` names the offset width)
 
 Follow-through on v0.7.17, opened by the owner asking what had been held

@@ -1030,6 +1030,9 @@ def sageattn_qk_int8_pv_fp8_cuda(
     pv_accum_dtype: str = "fp32+fp16",
     smooth_k: bool = True,
     smooth_v: bool = False,
+    qk_balance: bool = False,
+    balance_alpha: float = 0.5,
+    balance_min_share: float = 0.2,
     return_lse: bool = False,
     _qkv_box: Optional[list] = None,
     **kwargs: Any,
@@ -1083,6 +1086,17 @@ def sageattn_qk_int8_pv_fp8_cuda(
         Whether to smooth the value tensor by subtracting the mean along the sequence dimension.
         smooth_v will be ignored if pv_accum_dtype is "fp32+fp32".
         Default: False.
+
+    qk_balance : bool
+        Rebalance K's channels against Q's inside the per-thread INT8
+        quantizer (exact for the attention math): `f = rms_k^a / rms_q^(1-a)`
+        per (batch, kv head, channel), Q multiplied by f and K divided by
+        it, gated per head on the energy share of K's four loudest channels
+        (`balance_min_share`). Costs two copy-free channel norms; no extra
+        q/k copy. Measured on MiniMax H3's last block, where four K channels
+        carry most of the energy, it removes about a third of the INT8 QK
+        error; on flat heads the gate leaves everything untouched.
+        Per-thread quantization only. Default: False.
 
     return_lse : bool
         Whether to return the log sum of the exponentiated attention weights. Used for cases like Ring Attention.
@@ -1181,7 +1195,9 @@ def sageattn_qk_int8_pv_fp8_cuda(
     if qk_quant_gran == "per_warp":
         q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=32, BLKK=64)
     elif qk_quant_gran == "per_thread":
-        q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64)
+        q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(
+            q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64,
+            qk_balance=qk_balance, balance_alpha=balance_alpha, balance_min_share=balance_min_share)
 
     # Mask validation and its broadcast target shape read q and k, so they
     # have to happen while those are alive: the _qkv_box path below releases

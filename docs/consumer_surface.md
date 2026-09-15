@@ -1,6 +1,6 @@
 # The consumer surface
 
-Last updated: 2026-09-13
+Last updated: 2026-09-15
 
 What this fork exposes to downstream callers, in full. Extracted
 verbatim from `CLAUDE.md` on 2026-09-08.
@@ -78,6 +78,14 @@ Sage exposes three surfaces to downstream consumers:
    mean-subtraction done in place -- either alone leaves the other
    setting the floor. Only the sm89 fp8 path releases early; other
    kernels fall back to the ordinary path, correct but with no saving.
+6. **`qk_balance` keyword** (v0.7.19, 2026-09-15) on
+   `sageattn_qk_int8_pv_fp8_cuda`, and through `sageattn()` /
+   `sageattn_consume()` kwargs: rebalances K's channels against Q's inside
+   the per-thread INT8 quantizer, exact for the attention math, gated per
+   head so flat heads are untouched. Off by default. `balance_alpha`
+   (0.5) and `balance_min_share` (0.2) tune it. Per-thread quantization
+   only; ignored under `qk_quant_gran="per_warp"`. Why and what it buys:
+   CHANGELOG v0.7.19 and Workload intel "MiniMax H3, block 49".
 5. **`sageattention.quant.ELEMENT_OFFSET_BITS`** (v0.7.17, 2026-09-13)
    -- the width of the global element offsets the installed fused CUDA
    quant build can form: 64 on any build from v0.7.17 on, 32 on anything

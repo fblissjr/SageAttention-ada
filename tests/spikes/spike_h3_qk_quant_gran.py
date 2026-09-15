@@ -51,6 +51,7 @@ ROWS = [41_822, 104_030, 109_126, 149_000]
 ARMS = [
     ("per_thread (Triton q/k)", "per_thread"),
     ("per_warp   (CUDA q/k)", "per_warp"),
+    ("per_thread + qk_balance", "balance"),
 ]
 
 QUANT_KW = dict(smooth_k=False, pv_accum_dtype="fp32+fp16")
@@ -59,7 +60,18 @@ QUANT_KW = dict(smooth_k=False, pv_accum_dtype="fp32+fp16")
 def quant_step(gran, q, k):
     if gran == "per_thread":
         return per_thread_int8_triton(q, k, None, tensor_layout="NHD", BLKQ=128, WARPQ=32, BLKK=64, WARPK=64)
+    if gran == "balance":
+        # min_share 0 forces the factor on every head, so this times the
+        # full cost (norms + balanced quant) rather than a gated no-op.
+        return per_thread_int8_triton(q, k, None, tensor_layout="NHD", BLKQ=128, WARPQ=32, BLKK=64, WARPK=64,
+                                      qk_balance=True, balance_min_share=0.0)
     return per_warp_int8_cuda(q, k, None, tensor_layout="NHD", BLKQ=128, WARPQ=32, BLKK=64)
+
+
+def call_kwargs(gran):
+    if gran == "balance":
+        return dict(qk_quant_gran="per_thread", qk_balance=True, balance_min_share=0.0)
+    return dict(qk_quant_gran=gran)
 
 
 @torch.inference_mode()
@@ -92,7 +104,7 @@ def main():
                 # release frees nothing anyway.
                 return sageattention.sageattn_consume(
                     [q, k, v], tensor_layout="NHD", is_causal=False,
-                    qk_quant_gran=gran, **QUANT_KW,
+                    **call_kwargs(gran), **QUANT_KW,
                 )
 
             out = call()
@@ -101,7 +113,7 @@ def main():
             t_rtol, t_cos, _ = tail_report(out, ref)
             outs[gran] = out
             rows.append((label, gran, quant_ms, call_ms, peak, rtol, t_rtol, t_cos))
-        cross = chunked_mean_rtol(outs["per_warp"], outs["per_thread"])
+        cross = chunked_mean_rtol(outs["per_warp"], outs["per_thread"])   # per_warp vs per_thread, as before
         for label, gran, quant_ms, call_ms, peak, rtol, t_rtol, t_cos in rows:
             print(f"{s:>8,}  {label:24s} {quant_ms:>9.3f} {call_ms:>8.2f} {peak:>9.0f} "
                   f"{rtol:>7.4f} {t_rtol:>9.4f} {t_cos:>9.4f}  {cross:>8.4f}")

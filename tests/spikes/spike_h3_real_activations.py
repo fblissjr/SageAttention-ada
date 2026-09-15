@@ -41,6 +41,10 @@ ARMS = [
     # question is tests/spikes/spike_h3_qk_quant_gran.py.
     ("fp8++  smooth_k=False per_warp", "sageattn_qk_int8_pv_fp8_cuda",
      dict(pv_accum_dtype="fp32+fp16", smooth_k=False, qk_quant_gran="per_warp")),
+    # Channel balancing inside the per-thread quantizer (qk-channel-balance
+    # branch): per-head factor, gated on K's loud-channel share.
+    ("fp8++  smooth_k=False qk_balance", "sageattn_qk_int8_pv_fp8_cuda",
+     dict(pv_accum_dtype="fp32+fp16", smooth_k=False, qk_balance=True)),
     ("fp8++  smooth_k=True", "sageattn_qk_int8_pv_fp8_cuda",
      dict(pv_accum_dtype="fp32+fp16", smooth_k=True)),
     ("fp16   smooth_k=False", "sageattn_qk_int8_pv_fp16_cuda",
@@ -109,6 +113,9 @@ def run(path):
         verdict = "helps" if delta < -3 else ("hurts" if delta > 3 else "no effect")
         print(f"  smooth_k on {base.split()[0]:6s}: "
               f"{off_v:.4f} -> {on_v:.4f}  ({delta:+.1f}%, {verdict})")
+    pb = results["fp8++  smooth_k=False qk_balance"]
+    print(f"  qk_balance vs plain (fp8++): {results['fp8++  smooth_k=False']:.4f} -> {pb:.4f}  "
+          f"({100.0 * (pb - results['fp8++  smooth_k=False']) / results['fp8++  smooth_k=False']:+.1f}%)")
     pt, pw = results["fp8++  smooth_k=False"], results["fp8++  smooth_k=False per_warp"]
     delta = 100.0 * (pw - pt) / pt
     verdict = "worse" if delta > 3 else ("better" if delta < -3 else "no effect")
