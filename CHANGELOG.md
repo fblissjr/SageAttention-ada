@@ -1262,6 +1262,19 @@ the row's channels, so the shared-channel-scale mechanism is present there
 at a finer token granularity than sage's. The node ships in the consumer
 pack as `MiniMaxH3ChannelBalance`, off by default.
 
+*Sol's quantizer now carries the per-head factor itself* (2026-09-15, the
+owner's comfy-kitchen fork, branch `h3-qk-balance` merged to `h3-build`;
+`sol_attn(..., qk_balance=True)`, off). Same factor as this fork's
+`qk_balance` (alpha 0.5, gate 0.2), computed in Sol's preprocess from the
+call's own q/k and applied inside its pooled, Q and K quantizers with the
+routing threshold left unbalanced. Graded by the consumer's
+`bench/grade_channel_balance.py` on the same block-49 capture: Sol's INT8
+term 0.0265 -> 0.0193 (-27.0%), against the fold's -12.9%; neutral at
+blocks 0 and 32 (gate shut); off path bit-identical to the previous wheel
+(consumer `bench/results/2026-09-15_channel_balance_kernel_*.json`). With
+that, every INT8 step on the consumer's graphs can be balanced, which is
+the state the exact-tail comparison is re-rendered against.
+
 *The so-what, 2026-09-15, CPU only.* Every full H3 DiT checkpoint on the
 box (fl2va, ref2va, pruned, unpruned, int8 convrot, fp8 scaled, w4a8, the
 hybrids, the VSA distill) carries the identical loud channels at 45/48/49
