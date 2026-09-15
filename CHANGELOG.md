@@ -1262,6 +1262,17 @@ the row's channels, so the shared-channel-scale mechanism is present there
 at a finer token granularity than sage's. The node ships in the consumer
 pack as `MiniMaxH3ChannelBalance`, off by default.
 
+*The so-what, 2026-09-15, CPU only.* Every full H3 DiT checkpoint on the
+box (fl2va, ref2va, pruned, unpruned, int8 convrot, fp8 scaled, w4a8, the
+hybrids, the VSA distill) carries the identical loud channels at 45/48/49
+to the percent, and the LoRA variants carry no norm weights, so it is the
+base model and every variant inherits it. It is not an attention sink (no
+dominant key, flat key norms); block 49 is where video queries read the
+text rows sharply (0.4% of keys taking 12% of mass on the median head,
+38% on some), so the INT8 error lands on the prompt-conditioning read at
+the output head. Consumer record
+`bench/results/2026-09-14_block49_checkpoint_scan_and_targets.txt`.
+
 **What is not established:** whether a fifth less rtol at the last block is
 visible in a clip (nothing here is perceptual); whether blocks 45 and 48
 behave like 49 under the fold; and the remaining
