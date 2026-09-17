@@ -21,16 +21,88 @@ import triton.language as tl
 from ._int_offsets import needs_int64_offsets
 
 
+# ---------------------------------------------------------------------------
+# qk_rotate: a fixed orthogonal rotation of every q and k row, inside the
+# quantizer, before the INT8 rounding.
+#
+# One scale covers a group of rows across all 128 head channels, so a loud
+# channel or a single spiking token spends the INT8 range and starves the
+# rest. R = diag(signs) @ H128 / sqrt(128) spreads each row's energy over every
+# channel first, and (qR).(kR) == q.k because R is orthogonal, so the attention
+# math is unchanged and only the rounding sees the difference. Measured on
+# MiniMax H3 captures by tests/spikes/spike_h3_qk_rotation.py (CHANGELOG,
+# Workload intel, 2026-09-17): about half the block-49 error, where
+# `qk_balance` removes about a third, a few percent better everywhere else, and
+# with rotation on the balance factor changes nothing.
+#
+# The matrix is the one comfy-kitchen's rotated INT8 kernels use (the same four
+# sign words, Sylvester order), so the three kernels rotate identically. It is
+# fused here rather than applied by the caller because a separate pass costs a
+# round trip through memory and a bf16 re-rounding of the rotated tensor, which
+# the spike measured; in the kernel the rotated values exist only in fp32
+# between the load and the rounding. The butterfly is written as
+# reshape/split/join stages, the form vLLM's fused FWHT+quant kernel uses, so
+# Triton emits no matmul. Head dim 128 only.
+# ---------------------------------------------------------------------------
+_ROT_SIGN_WORDS = (0x1035997B, 0x8087F5EE, 0xEE2E4E1A, 0x71132418)
+_ROT_DIM = 128
+_rot_sign_cache = {}
+
+
+def qk_rotate_signs(device):
+    """[128] float32 of +1/-1: channel d is +1 when bit (d & 31) of word d >> 5 is set."""
+    key = str(device)
+    if key not in _rot_sign_cache:
+        bits = [(_ROT_SIGN_WORDS[d >> 5] >> (d & 31)) & 1 for d in range(_ROT_DIM)]
+        _rot_sign_cache[key] = torch.tensor([1.0 if b else -1.0 for b in bits],
+                                            dtype=torch.float32, device=device)
+    return _rot_sign_cache[key]
+
+
+def qk_rotation_matrix(device, dtype=torch.float32):
+    """The rotation as a matrix, x @ R; the oracle the kernel is tested against."""
+    h = torch.ones(1, 1, dtype=torch.float64)
+    while h.shape[0] < _ROT_DIM:
+        h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+    r = qk_rotate_signs("cpu").double()[:, None] * h / _ROT_DIM ** 0.5
+    return r.to(device=device, dtype=dtype)
+
+
+@triton.jit
+def _fwht128_stage(x, ROWS: tl.constexpr, GROUPS: tl.constexpr, STRIDE: tl.constexpr):
+    x4 = tl.reshape(x, (ROWS, GROUPS, 2, STRIDE))
+    x4 = tl.trans(x4, 0, 1, 3, 2)
+    a, b = tl.split(x4)
+    x4 = tl.join(a + b, a - b)
+    x4 = tl.trans(x4, 0, 1, 3, 2)
+    return tl.reshape(x4, (ROWS, 128))
+
+
+@triton.jit
+def _rotate128(x, sign, ROWS: tl.constexpr):
+    """x [ROWS, 128] fp32 -> x @ R, R = diag(sign) @ H128 / sqrt(128)."""
+    x = x * sign[None, :]
+    x = _fwht128_stage(x, ROWS, 64, 1)
+    x = _fwht128_stage(x, ROWS, 32, 2)
+    x = _fwht128_stage(x, ROWS, 16, 4)
+    x = _fwht128_stage(x, ROWS, 8, 8)
+    x = _fwht128_stage(x, ROWS, 4, 16)
+    x = _fwht128_stage(x, ROWS, 2, 32)
+    x = _fwht128_stage(x, ROWS, 1, 64)
+    return x * 0.08838834764831845
+
+
 @triton.jit
 def quant_query_per_thread_int8_kernel(Input, Output, Scale, L,
                                         stride_iz, stride_ih, stride_in,
                                         stride_oz, stride_oh, stride_on,
                                         stride_sz, stride_sh,
-                                        Factor, stride_fz, stride_fh,
+                                        Factor, stride_fz, stride_fh, Sign,
                                         C: tl.constexpr, BLK: tl.constexpr,
                                         USE_I64: tl.constexpr = False,
                                         BALANCE: tl.constexpr = False,
-                                        GROUP: tl.constexpr = 1):
+                                        GROUP: tl.constexpr = 1,
+                                        ROTATE: tl.constexpr = False):
     off_blk = tl.program_id(0) // 8
     off_tld = tl.program_id(0) % 8
     off_h = tl.program_id(1)
@@ -58,12 +130,19 @@ def quant_query_per_thread_int8_kernel(Input, Output, Scale, L,
     output_ptrs = Output + off_b * stride_oz + off_h * stride_oh + offs_n[:, None] * stride_on + offs_k[None, :]
     scale_ptrs = Scale + off_b * stride_sz + off_h * stride_sh + off_blk * 8 + off_tld
 
-    x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
+    if ROTATE:
+        # Rows past L must be zeros, not whatever a masked load leaves: the
+        # rotation is per row, but the scale below is a max over all of them.
+        x = tl.load(input_ptrs, mask=offs_n[:, None] < L, other=0.0)
+    else:
+        x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
     x = x.to(tl.float32)
     if BALANCE:
         # q . k == (q * f) . (k / f): the factor moves INT8 resolution from
         # K's loud channels onto Q at no cost to the attention math.
         x = x * f[None, :]
+    if ROTATE:
+        x = _rotate128(x, tl.load(Sign + tl.arange(0, C)), BLK // 8)
     scale = tl.max(tl.abs(x)) / 127. + 0.0000001
     x_int8 = x / scale
     x_int8 += 0.5 * tl.where(x_int8 >= 0, 1, -1)
@@ -76,10 +155,11 @@ def quant_key_per_thread_int8_kernel(Input, Output, Scale, L,
                                         stride_iz, stride_ih, stride_in,
                                         stride_oz, stride_oh, stride_on,
                                         stride_sz, stride_sh,
-                                        Factor, stride_fz, stride_fh,
+                                        Factor, stride_fz, stride_fh, Sign,
                                         C: tl.constexpr, BLK: tl.constexpr,
                                         USE_I64: tl.constexpr = False,
-                                        BALANCE: tl.constexpr = False):
+                                        BALANCE: tl.constexpr = False,
+                                        ROTATE: tl.constexpr = False):
     off_blk = tl.program_id(0) // 4
     off_tld = tl.program_id(0) % 4
     off_h = tl.program_id(1)
@@ -122,13 +202,21 @@ def quant_key_per_thread_int8_kernel(Input, Output, Scale, L,
     output_ptrs1 = Output + off_b * stride_oz + off_h * stride_oh + offs_n1[:, None] * stride_on + offs_k[None, :]
     scale_ptrs = Scale + off_b * stride_sz + off_h * stride_sh + off_blk * 4 + off_tld
 
-    x0 = tl.load(input_ptrs0, mask=offs_n0[:, None] < L)
-    x1 = tl.load(input_ptrs1, mask=offs_n1[:, None] < L)
+    if ROTATE:
+        x0 = tl.load(input_ptrs0, mask=offs_n0[:, None] < L, other=0.0)
+        x1 = tl.load(input_ptrs1, mask=offs_n1[:, None] < L, other=0.0)
+    else:
+        x0 = tl.load(input_ptrs0, mask=offs_n0[:, None] < L)
+        x1 = tl.load(input_ptrs1, mask=offs_n1[:, None] < L)
     x0 = x0.to(tl.float32)
     x1 = x1.to(tl.float32)
     if BALANCE:
         x0 = x0 * f[None, :]
         x1 = x1 * f[None, :]
+    if ROTATE:
+        sign = tl.load(Sign + tl.arange(0, C))
+        x0 = _rotate128(x0, sign, BLK // 8)
+        x1 = _rotate128(x1, sign, BLK // 8)
     scale = max(tl.max(tl.abs(x0)), tl.max(tl.abs(x1))) / 127. + 0.0000001
     x0_int8 = x0 / scale
     x1_int8 = x1 / scale
@@ -243,7 +331,9 @@ def qk_balance_factor(q, k, tensor_layout="HND", alpha=0.5, min_share=0.2):
 
 
 def per_thread_int8(q, k, km=None, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64, sm_scale=None, tensor_layout="HND",
-                    qk_balance=False, balance_alpha=0.5, balance_min_share=0.2):
+                    qk_balance=False, balance_alpha=0.5, balance_min_share=0.2, qk_rotate=False):
+    if qk_rotate and q.shape[-1] != _ROT_DIM:
+        raise ValueError(f"qk_rotate needs head_dim {_ROT_DIM}, got {q.shape[-1]}")
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
     k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
 
@@ -290,14 +380,16 @@ def per_thread_int8(q, k, km=None, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64, sm_sca
     k_i64 = needs_int64_offsets(k, k_int8, tensor_layout=tensor_layout, blk=BLKK)
 
     f_sz, f_sh = (fq.stride(0), fq.stride(1)) if qk_balance else (0, 0)
+    sign = qk_rotate_signs(q.device) if qk_rotate else q_int8   # placeholder pointer when off
     grid = ((qo_len + BLKQ - 1) // BLKQ * (BLKQ // WARPQ) * 8, h_qo, b)
     quant_query_per_thread_int8_kernel[grid](
         q, q_int8, q_scale, qo_len,
         stride_bz_q, stride_h_q, stride_seq_q,
         stride_bz_qo, stride_h_qo, stride_seq_qo,
         q_scale.stride(0), q_scale.stride(1),
-        fq, f_sz, f_sh,
-        C=head_dim, BLK=WARPQ, USE_I64=q_i64, BALANCE=qk_balance, GROUP=h_qo // h_kv
+        fq, f_sz, f_sh, sign,
+        C=head_dim, BLK=WARPQ, USE_I64=q_i64, BALANCE=qk_balance, GROUP=h_qo // h_kv,
+        ROTATE=qk_rotate
     )
 
     grid = ((kv_len + BLKK - 1) // BLKK * (BLKK // WARPK) * 4, h_kv, b)
@@ -306,8 +398,8 @@ def per_thread_int8(q, k, km=None, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64, sm_sca
         stride_bz_k, stride_h_k, stride_seq_k,
         stride_bz_ko, stride_h_ko, stride_seq_ko,
         k_scale.stride(0), k_scale.stride(1),
-        fk, f_sz, f_sh,
-        C=head_dim, BLK=WARPK, USE_I64=k_i64, BALANCE=qk_balance
+        fk, f_sz, f_sh, sign,
+        C=head_dim, BLK=WARPK, USE_I64=k_i64, BALANCE=qk_balance, ROTATE=qk_rotate
     )
 
     return q_int8, q_scale, k_int8, k_scale

@@ -1466,6 +1466,58 @@ sufficient.
 > LTX-motivated throughout.
 
 
+### v0.7.20 -- 2026-09-17  (`qk_rotate`: a fused Hadamard rotation inside the per-thread quantizer)
+
+`sageattn_qk_int8_pv_fp8_cuda(..., qk_rotate=True)`, and through `sageattn()`
+kwargs. Off by default; the off path is bit-identical (pinned by
+`tests/test_qk_rotate.py::off_is_untouched`). Model: MiniMax H3. Card: RTX 4090.
+
+Every q and k row is multiplied by one fixed orthogonal matrix,
+`diag(signs) @ H128 / sqrt(128)`, between the load and the INT8 rounding in
+`sageattention/triton/quant_per_thread.py`. `(qR).(kR) == q.k`, so the
+attention math is unchanged; what changes is that no loud channel and no
+spiking token sets the scale its group shares. The design input is the
+Workload intel entry of the same date; this is that rotation moved into the
+kernel. The sign words are the ones comfy-kitchen's rotated INT8 kernels use,
+so a consumer's dense, sparse and sage kernels all rotate identically. The
+butterfly is seven reshape/split/join stages, the form vLLM's fused FWHT+quant
+kernel uses, so Triton emits no matmul. Head dim 128 only; refused under
+`qk_quant_gran="per_warp"`, whose CUDA quantizer has no rotation, rather than
+accepted and ignored.
+
+Accuracy, relative L2 against fp32 SDPA on captured q/k/v, all 56 heads, fp8++
+with `smooth_k` off (`tests/spikes/spike_h3_qk_rotation.py`, its
+`kernel qk_rotate` arm; consumer record
+`bench/results/2026-09-17_sage_qk_rotate_kernel.json`):
+
+| cell | plain | `qk_balance` | `qk_rotate` (this kernel) | rotated in PyTorch first |
+|---|---|---|---|---|
+| block 49, step 15 | 0.0549 | 0.0387 | **0.0239** | 0.0258 |
+| block 49, step 4 | 0.0509 | 0.0341 | **0.0203** | 0.0223 |
+| block 40, step 15 | 0.0194 | 0.0195 | **0.0180** | 0.0183 |
+| block 32, step 15 | 0.0128 | 0.0128 | **0.0124** | 0.0125 |
+| block 24, step 15 | 0.0133 | 0.0133 | **0.0128** | 0.0129 |
+| block 0, step 15 | 0.0042 | 0.0042 | **0.0040** | 0.0041 |
+
+The kernel beats its own PyTorch oracle on every cell because the oracle
+re-rounds the rotated tensor to bf16 and the kernel never materialises it.
+With rotation on, `qk_balance` has nothing left to do (same entry), so the two
+are alternatives and `qk_rotate` is the stronger one.
+
+Cost at the H3 shape (1 x 56 x 104361 x 128, round-robin, CUDA events): the
+whole call 655.5 ms plain, 661.8 ms rotated; the quantizer alone 4.9 ms either
+way, against 8.1 ms for `qk_balance`, whose factor needs two channel norms.
+The H3 gate passes on the branch.
+
+Two things learned writing it. The entry point takes `**kwargs` and ignores
+what it does not know, so a caller passing `qk_rotate` to an older build gets a
+plain call and no error; the spike reported "no effect" for exactly that reason
+until it imported the tree it lives in. A consumer should check the signature
+before relying on the option. And an fp32 cuBLAS matmul is not a usable oracle
+for this: it sits about 2e-4 relative from the float64 product, a thousand
+times further than the kernel does, and the first version of the test failed
+on its oracle.
+
 ### v0.7.19 -- 2026-09-15  (`qk_balance`: channel rebalancing inside the per-thread quantizer, for the loud-channel blocks)
 
 **Why.** MiniMax H3's last blocks (45, 48, 49 in every checkpoint on the

@@ -1,6 +1,6 @@
 # The consumer surface
 
-Last updated: 2026-09-15
+Last updated: 2026-09-17
 
 What this fork exposes to downstream callers, in full. Extracted
 verbatim from `CLAUDE.md` on 2026-09-08.
@@ -86,6 +86,17 @@ Sage exposes three surfaces to downstream consumers:
    (0.5) and `balance_min_share` (0.2) tune it. Per-thread quantization
    only; ignored under `qk_quant_gran="per_warp"`. Why and what it buys:
    CHANGELOG v0.7.19 and Workload intel "MiniMax H3, block 49".
+7. **`qk_rotate` keyword** (v0.7.20, 2026-09-17) on
+   `sageattn_qk_int8_pv_fp8_cuda`, and through `sageattn()` /
+   `sageattn_consume()` kwargs: a fixed Hadamard rotation of every q and k
+   row inside the per-thread INT8 quantizer, exact for the attention math,
+   no statistics and no gate. Off by default. Head dim 128 and per-thread
+   quantization only, and it RAISES where it cannot apply rather than being
+   ignored. An alternative to `qk_balance`, and the stronger one. **The
+   entry points swallow unknown keywords**, so against a build older than
+   v0.7.20 the option is silently a plain call: check
+   `inspect.signature(sageattn_qk_int8_pv_fp8_cuda).parameters` first. Why
+   and what it buys: CHANGELOG v0.7.20.
 5. **`sageattention.quant.ELEMENT_OFFSET_BITS`** (v0.7.17, 2026-09-13)
    -- the width of the global element offsets the installed fused CUDA
    quant build can form: 64 on any build from v0.7.17 on, 32 on anything

@@ -1033,6 +1033,7 @@ def sageattn_qk_int8_pv_fp8_cuda(
     qk_balance: bool = False,
     balance_alpha: float = 0.5,
     balance_min_share: float = 0.2,
+    qk_rotate: bool = False,
     return_lse: bool = False,
     _qkv_box: Optional[list] = None,
     **kwargs: Any,
@@ -1097,6 +1098,18 @@ def sageattn_qk_int8_pv_fp8_cuda(
         carry most of the energy, it removes about a third of the INT8 QK
         error; on flat heads the gate leaves everything untouched.
         Per-thread quantization only. Default: False.
+
+    qk_rotate : bool
+        Rotate every q and k row by one fixed orthogonal matrix (a sign
+        diagonal and a normalised 128-wide Hadamard) inside the per-thread
+        INT8 quantizer, before rounding. Exact for the attention math, since
+        (qR).(kR) == q.k; it spreads each row's energy over all channels so
+        neither a loud channel nor a spiking token sets the shared scale.
+        Needs no statistics and no gate. Measured on MiniMax H3 captures it
+        removes about half of the last block's error, where `qk_balance`
+        removes about a third, and with it on `qk_balance` changes nothing,
+        so use one or the other. Head dim 128 and per-thread quantization
+        only. Default: False.
 
     return_lse : bool
         Whether to return the log sum of the exponentiated attention weights. Used for cases like Ring Attention.
@@ -1192,12 +1205,18 @@ def sageattn_qk_int8_pv_fp8_cuda(
     else:
         km = None
 
+    if qk_rotate and qk_quant_gran != "per_thread":
+        # The CUDA per-warp quantizer has no rotation; taking the option and
+        # not applying it would be a silently unrotated call.
+        raise ValueError("qk_rotate is implemented in the per-thread quantizer only; "
+                         f"got qk_quant_gran={qk_quant_gran!r}")
     if qk_quant_gran == "per_warp":
         q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=32, BLKK=64)
     elif qk_quant_gran == "per_thread":
         q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(
             q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64,
-            qk_balance=qk_balance, balance_alpha=balance_alpha, balance_min_share=balance_min_share)
+            qk_balance=qk_balance, balance_alpha=balance_alpha, balance_min_share=balance_min_share,
+            qk_rotate=qk_rotate)
 
     # Mask validation and its broadcast target shape read q and k, so they
     # have to happen while those are alive: the _qkv_box path below releases

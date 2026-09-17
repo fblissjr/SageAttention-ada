@@ -36,9 +36,16 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-import sageattention
+# The tree this file lives in, not whatever is installed: the kernel arm below
+# tests an option, and the entry point swallows unknown keywords, so an older
+# installed build would run it as a plain call and report "no effect".
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+import inspect  # noqa: E402
+
+import sageattention  # noqa: E402
 
 CHUNK = 8
+HAS_KERNEL_ROTATE = "qk_rotate" in inspect.signature(sageattention.sageattn_qk_int8_pv_fp8_cuda).parameters
 SEED = 0x51A6E
 
 
@@ -85,7 +92,11 @@ def run(path):
             "block32+perm": rotation(D, q.device, block=32, permute=True)}
     ortho = max((R @ R.T - torch.eye(D, device=q.device)).abs().max().item() for R in rots.values())
     # arm -> (rotation name or None, qk_balance)
+    # "kernel qk_rotate" is the fused path itself on UNROTATED inputs; every
+    # other rotated arm is the PyTorch oracle. It should land at or a little
+    # below "rotated", which also pays a bf16 re-rounding the kernel does not.
     arms = {"plain": (None, False), "qk_balance": (None, True),
+            **({"kernel qk_rotate": ("KERNEL", False)} if HAS_KERNEL_ROTATE else {}),
             "rotated": ("full", False), "rotated+qk_balance": ("full", True),
             "rotated block32": ("block32", False), "rotated block32+perm": ("block32+perm", False)}
     acc = {a: [] for a in arms}
@@ -95,15 +106,21 @@ def run(path):
         qc, kc, vc = (x[:, sl].contiguous() for x in (q, k, v))
         with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
             ref = F.scaled_dot_product_attention(qc.float(), kc.float(), vc.float())
-        rotated = {n: ((qc.float() @ R).to(qc.dtype), (kc.float() @ R).to(kc.dtype)) for n, R in rots.items()}
+        # float64: an fp32 matmul is itself ~2e-4 off, which would be charged to rotation
+        rotated = {n: ((qc.double() @ R.double()).to(qc.dtype), (kc.double() @ R.double()).to(kc.dtype))
+                   for n, R in rots.items()}
         qr, kr = rotated["full"]
         with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
             reround.append(rel_l2(F.scaled_dot_product_attention(qr.float(), kr.float(), vc.float()), ref))
         for name, (rot, bal) in arms.items():
-            qa, ka = rotated[rot] if rot else (qc, kc)
+            kernel_side = rot == "KERNEL"
+            qa, ka = (qc, kc) if (kernel_side or not rot) else rotated[rot]
+            extra = {"qk_balance": True} if bal else {}
+            if kernel_side:
+                extra["qk_rotate"] = True
             out = sageattention.sageattn_qk_int8_pv_fp8_cuda(
                 qa, ka, vc, tensor_layout="HND", is_causal=False,
-                pv_accum_dtype="fp32+fp16", smooth_k=False, **({"qk_balance": True} if bal else {}))
+                pv_accum_dtype="fp32+fp16", smooth_k=False, **extra)
             acc[name].append(rel_l2(out, ref))
             del out
         del ref, rotated, qr, kr, qc, kc, vc
