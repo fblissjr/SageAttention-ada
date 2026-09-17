@@ -1275,6 +1275,44 @@ blocks 0 and 32 (gate shut); off path bit-identical to the previous wheel
 that, every INT8 step on the consumer's graphs can be balanced, which is
 the state the exact-tail comparison is re-rendered against.
 
+*Rotation before the quantizer beats the per-head factor and makes it
+redundant* (2026-09-17, MiniMax H3, RTX 4090, fp8++ with per-thread INT8 q/k,
+`smooth_k` off, all 56 heads, captured q/k/v from the base 16-step t2v set;
+`tests/spikes/spike_h3_qk_rotation.py`, record in the consumer pack,
+`bench/results/2026-09-17_sage_qk_rotation.json`). The spike changes no
+kernel: it multiplies q and k by one fixed orthogonal matrix in PyTorch and
+calls the kernel as shipped, so it is the design input for a rotation inside
+the quantizer and later its oracle. Relative L2 against fp32 SDPA on the
+unrotated inputs:
+
+| cell | plain | `qk_balance` | rotated (H128) | rotated + `qk_balance` | four H32 blocks | H32 blocks + permutation |
+|---|---|---|---|---|---|---|
+| block 0, step 15 | 0.0042 | 0.0042 | 0.0041 | 0.0041 | 0.0041 | 0.0041 |
+| block 24, step 15 | 0.0133 | 0.0133 | 0.0129 | 0.0129 | 0.0130 | 0.0129 |
+| block 32, step 15 | 0.0128 | 0.0128 | 0.0125 | 0.0125 | 0.0128 | 0.0125 |
+| block 40, step 15 | 0.0194 | 0.0195 | 0.0183 | 0.0183 | 0.0191 | 0.0182 |
+| block 49, step 15 | 0.0549 | 0.0387 | 0.0258 | 0.0258 | 0.0274 | 0.0267 |
+| block 49, step 4 | 0.0509 | 0.0341 | 0.0223 | 0.0223 | 0.0233 | 0.0228 |
+
+Three readings. Rotation roughly halves the block-49 error where the per-head
+factor removes about a third, and with rotation on the factor changes nothing
+(its gate finds no loud channel left), so a rotating quantizer would replace
+`qk_balance` rather than join it. Rotation is never worse and is a few percent
+better on every other captured block, where the factor is inert by design.
+Four 32-wide Hadamard blocks behind a fixed stride permutation track the full
+128-wide transform to within a few percent of it on block 49 and match it
+elsewhere; without the permutation the blocks fall behind on blocks 32 and 40,
+so which channels share a block matters. The rotated arms also pay for
+re-rounding the rotated tensors to bf16 (0.006 on block 49), which a kernel
+that rotates inside the quantizer would not, so these are slightly pessimistic
+for it. What this does not measure: cost. A matmul is not the butterfly a
+quantizer would run. The per-thread quantizer is Triton
+(`sageattention/triton/quant_per_thread.py`), which is where `qk_balance`
+lives and where a rotation would go. For scale, the consumer measured
+comfy-kitchen's rotated INT8 dense kernel at 0.0166 on block 49 step 15 (first
+8 heads, its record of 2026-09-15); rotation closes much of that gap and not
+all of it, and the fp8 value path is the first suspect for the rest.
+
 *The so-what, 2026-09-15, CPU only.* Every full H3 DiT checkpoint on the
 box (fl2va, ref2va, pruned, unpruned, int8 convrot, fp8 scaled, w4a8, the
 hybrids, the VSA distill) carries the identical loud channels at 45/48/49
